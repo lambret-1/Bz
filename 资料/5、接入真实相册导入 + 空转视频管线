@@ -1,0 +1,700 @@
+接入真实相册导入 + 空转视频管线 
+
+这一步的目标是：用系统相册选择视频 → 读取真实元数据 → 跑通 AVAssetReader/Writer 空转管线 → 导出可播放的视频。
+完成后，你就在真机上拥有了完整的“选择 → 处理 → 导出”闭环，只是补帧部分暂时是原帧复制。下一步再替换为 RIFE Lite 模型。
+
+---
+
+1. 新增/更新文件一览
+
+```
+FrameInterpolation/
+├── Features/
+│   └── Home/
+│       ├── HomeView.swift          # 更新：接入 VideoPicker
+│       └── VideoPicker.swift       # 新增：PHPicker 封装
+├── Core/
+│   ├── Import/
+│   │   └── MediaImporter.swift     # 新增：读取真实元数据
+│   └── Pipeline/
+│       └── VideoPipeline.swift     # 新增：空转管线
+├── State/
+│   └── AppState.swift              # 更新：接入导入与处理
+└── Features/
+    └── Result/
+        └── ResultView.swift        # 新增：预览与保存
+```
+
+---
+
+2. VideoPicker.swift（PHPicker 封装）
+
+```swift
+import SwiftUI
+import PhotosUI
+import UniformTypeIdentifiers
+
+struct VideoPicker: UIViewControllerRepresentable {
+    var onPick: (URL) -> Void
+
+    func makeUIViewController(context: Context) -> PHPickerViewController {
+        var config = PHPickerConfiguration(photoLibrary: .shared())
+        config.filter = .videos
+        config.selectionLimit = 1
+        config.preferredAssetRepresentationMode = .current
+
+        let picker = PHPickerViewController(configuration: config)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: PHPickerViewController, context: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    final class Coordinator: NSObject, PHPickerViewControllerDelegate {
+        private let parent: VideoPicker
+
+        init(_ parent: VideoPicker) {
+            self.parent = parent
+        }
+
+        func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+            picker.dismiss(animated: true)
+
+            guard let result = results.first else { return }
+            let provider = result.itemProvider
+
+            guard provider.hasItemConformingToTypeIdentifier(UTType.movie.identifier) else {
+                return
+            }
+
+            provider.loadFileRepresentation(forTypeIdentifier: UTType.movie.identifier) { url, error in
+                guard let url else { return }
+
+                // PHPicker 返回的 URL 是临时文件，必须在闭包内拷贝到自己的临时目录
+                let ext = url.pathExtension.isEmpty ? "mov" : url.pathExtension
+                let tempURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString)
+                    .appendingPathExtension(ext)
+
+                do {
+                    try FileManager.default.copyItem(at: url, to: tempURL)
+                    DispatchQueue.main.async {
+                        self.parent.onPick(tempURL)
+                    }
+                } catch {
+                    print("拷贝视频失败: \(error)")
+                }
+            }
+        }
+    }
+}
+```
+
+---
+
+3. MediaImporter.swift（真实元数据）
+
+```swift
+import AVFoundation
+import UIKit
+
+enum MediaImporter {
+    /// 读取视频元数据：时长、帧率、文件大小、分辨率、缩略图
+    static func loadVideoInfo(from url: URL) async throws -> VideoInfo {
+        let asset = AVURLAsset(url: url)
+
+        // 时长
+        let duration = try await asset.load(.duration)
+
+        // 视频轨道
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        guard let track = tracks.first else {
+            throw NSError(
+                domain: "MediaImporter",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "未找到视频轨道"]
+            )
+        }
+
+        // 帧率
+        let fps = try await track.load(.nominalFrameRate)
+
+        // 分辨率与方向
+        let naturalSize = try await track.load(.naturalSize)
+        let transform = try await track.load(.preferredTransform)
+        let displaySize = naturalSize.applying(transform)
+        let width = abs(displaySize.width)
+        let height = abs(displaySize.height)
+
+        // 文件大小
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attrs?[.size] as? Int64) ?? 0
+        let sizeMB = Double(fileSize) / 1024 / 1024
+
+        // 缩略图
+        let thumbnail = try? await generateThumbnail(asset: asset)
+
+        return VideoInfo(
+            url: url,
+            fileName: url.lastPathComponent,
+            duration: CMTimeGetSeconds(duration),
+            originalFPS: Double(fps),
+            originalSizeMB: sizeMB,
+            width: Int(width),
+            height: Int(height),
+            thumbnail: thumbnail
+        )
+    }
+
+    private static func generateThumbnail(asset: AVAsset) async throws -> UIImage? {
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 320, height: 320)
+
+        let time = CMTime(seconds: 0.5, preferredTimescale: 600)
+        let cgImage = try await generator.image(at: time).image
+        return UIImage(cgImage: cgImage)
+    }
+}
+```
+
+同时更新 Models.swift 中的 VideoInfo：
+
+```swift
+import UIKit
+
+struct VideoInfo: Identifiable, Equatable {
+    let id = UUID()
+    let url: URL
+    let fileName: String
+    let duration: TimeInterval
+    let originalFPS: Double
+    let originalSizeMB: Double
+    let width: Int
+    let height: Int
+    let thumbnail: UIImage?
+
+    static func == (lhs: VideoInfo, rhs: VideoInfo) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+```
+
+---
+
+4. VideoPipeline.swift（空转管线）
+
+```swift
+import AVFoundation
+
+final class VideoPipeline {
+    private var isCancelled = false
+
+    /// 空转处理：只做解码 → 重新编码，不改变帧率
+    /// - Parameters:
+    ///   - inputURL: 输入视频
+    ///   - outputURL: 输出视频
+    ///   - progress: 进度回调 0.0 ~ 1.0
+    ///   - completion: 完成回调
+    func process(
+        inputURL: URL,
+        outputURL: URL,
+        progress: @escaping (Double) -> Void,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try self.run(
+                    inputURL: inputURL,
+                    outputURL: outputURL,
+                    progress: progress,
+                    completion: completion
+                )
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func cancel() {
+        isCancelled = true
+    }
+
+    private func run(
+        inputURL: URL,
+        outputURL: URL,
+        progress: @escaping (Double) -> Void,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) throws {
+        let asset = AVURLAsset(url: inputURL)
+
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            throw NSError(
+                domain: "VideoPipeline",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "输入视频没有视频轨道"]
+            )
+        }
+
+        // 输出尺寸
+        let naturalSize = videoTrack.naturalSize
+        let transform = videoTrack.preferredTransform
+        let displaySize = naturalSize.applying(transform)
+        let outputWidth = abs(displaySize.width)
+        let outputHeight = abs(displaySize.height)
+
+        // Reader
+        let reader = try AVAssetReader(asset: asset)
+        let readerSettings: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        let readerOutput = AVAssetReaderTrackOutput(
+            track: videoTrack,
+            outputSettings: readerSettings
+        )
+        readerOutput.alwaysCopiesSampleData = false
+        reader.add(readerOutput)
+
+        // Writer
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        let writerSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: outputWidth,
+            AVVideoHeightKey: outputHeight
+        ]
+        let writerInput = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: writerSettings
+        )
+        writerInput.expectsMediaDataInRealTime = false
+
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: writerInput,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: outputWidth,
+                kCVPixelBufferHeightKey as String: outputHeight
+            ]
+        )
+        writer.add(writerInput)
+
+        reader.startReading()
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        // 估算总帧数
+        let fps = Double(videoTrack.nominalFrameRate)
+        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        let totalFrames = max(Int(durationSeconds * fps), 1)
+        var frameIndex = 0
+
+        while reader.status == .reading {
+            if isCancelled {
+                reader.cancelReading()
+                writer.cancelWriting()
+                throw NSError(
+                    domain: "VideoPipeline",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "处理已取消"]
+                )
+            }
+
+            guard let sampleBuffer = readerOutput.copyNextSampleBuffer(),
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                break
+            }
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+            // 等待 writer 就绪
+            while !writerInput.isReadyForMoreMediaData {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+
+            adaptor.append(pixelBuffer, withPresentationTime: pts)
+
+            frameIndex += 1
+            let progressValue = min(Double(frameIndex) / Double(totalFrames), 0.99)
+            DispatchQueue.main.async { progress(progressValue) }
+        }
+
+        writerInput.markAsFinished()
+
+        writer.finishWriting {
+            DispatchQueue.main.async {
+                if writer.status == .completed {
+                    progress(1.0)
+                    completion(.success(outputURL))
+                } else {
+                    let error = writer.error ?? NSError(
+                        domain: "VideoPipeline",
+                        code: -3,
+                        userInfo: [NSLocalizedDescriptionKey: "写入失败"]
+                    )
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+}
+```
+
+说明：这个空转版本只处理视频轨道，不包含音频。下一步在接入 RIFE 之后，再补上音频透传。
+
+---
+
+5. ResultView.swift（预览与保存）
+
+```swift
+import SwiftUI
+import AVKit
+import Photos
+
+struct ResultView: View {
+    let outputURL: URL
+    @EnvironmentObject var appState: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var player: AVPlayer?
+    @State private var isSaving = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
+                CardView {
+                    VideoPlayer(player: player)
+                        .frame(height: 220)
+                        .cornerRadius(DesignTokens.Radius.m)
+                        .onAppear {
+                            player = AVPlayer(url: outputURL)
+                        }
+                }
+
+                CardView {
+                    VStack(spacing: DesignTokens.Spacing.s) {
+                        infoRow("输出文件", outputURL.lastPathComponent)
+                        Divider()
+                        infoRow("状态", "处理完成", highlight: true)
+                    }
+                }
+
+                HStack(spacing: DesignTokens.Spacing.m) {
+                    PrimaryButton(title: isSaving ? "保存中…" : "保存到相册", isLoading: isSaving) {
+                        saveToPhotoLibrary()
+                    }
+
+                    Button {
+                        shareVideo()
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.title3)
+                            .frame(width: 52, height: 52)
+                            .background(DesignTokens.Colors.bgSecondary)
+                            .cornerRadius(DesignTokens.Radius.m)
+                    }
+                }
+
+                Button("返回首页") {
+                    dismiss()
+                }
+                .font(.subheadline)
+                .foregroundColor(DesignTokens.Colors.accent)
+            }
+            .padding(DesignTokens.Spacing.m)
+        }
+        .background(DesignTokens.Colors.bgPrimary)
+        .navigationTitle("处理结果")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func infoRow(_ title: String, _ value: String, highlight: Bool = false) -> some View {
+        HStack {
+            Text(title)
+                .font(.subheadline)
+                .foregroundColor(DesignTokens.Colors.textSecondary)
+            Spacer()
+            Text(value)
+                .font(.subheadline.weight(.medium))
+                .foregroundColor(highlight ? DesignTokens.Colors.accent : DesignTokens.Colors.textPrimary)
+        }
+    }
+
+    private func saveToPhotoLibrary() {
+        isSaving = true
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    isSaving = false
+                    appState.showToast("没有相册权限", style: .error)
+                }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)
+            } completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    isSaving = false
+                    if success {
+                        appState.showToast("已保存到相册")
+                    } else {
+                        appState.showToast(error?.localizedDescription ?? "保存失败", style: .error)
+                    }
+                }
+            }
+        }
+    }
+
+    private func shareVideo() {
+        let activity = UIActivityViewController(
+            activityItems: [outputURL],
+            applicationActivities: nil
+        )
+        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+           let root = windowScene.keyWindow?.rootViewController {
+            root.present(activity, animated: true)
+        }
+    }
+}
+```
+
+---
+
+6. 更新 AppState.swift
+
+```swift
+import SwiftUI
+
+@MainActor
+final class AppState: ObservableObject {
+    // 首页
+    @Published var recentRecords: [RecentRecord] = []
+
+    // 参数设置
+    @Published var selectedVideo: VideoInfo?
+    @Published var frameMultiplier: FrameMultiplier = .x2
+    @Published var outputResolution: OutputResolution = .auto
+    @Published var fastMode: Bool = false
+
+    // 处理中
+    @Published var isProcessing = false
+    @Published var progress: Double = 0
+    @Published var processedFrames: Int = 0
+    @Published var totalFrames: Int = 0
+    @Published var stage: ProcessingStage = .idle
+
+    // 结果
+    @Published var outputURL: URL?
+
+    // Toast
+    @Published var toastMessage: String?
+    @Published var toastStyle: ToastStyle = .success
+
+    private let pipeline = VideoPipeline()
+
+    // MARK: - Import
+    func importVideo(from url: URL) {
+        Task {
+            do {
+                let info = try await MediaImporter.loadVideoInfo(from: url)
+                await MainActor.run {
+                    self.selectedVideo = info
+                }
+            } catch {
+                await MainActor.run {
+                    self.showToast(error.localizedDescription, style: .error)
+                }
+            }
+        }
+    }
+
+    // MARK: - Process
+    func startProcessing() {
+        guard let video = selectedVideo else { return }
+
+        isProcessing = true
+        progress = 0
+        stage = .decoding
+
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("output_\(UUID().uuidString).mp4")
+
+        self.outputURL = outputURL
+
+        pipeline.process(
+            inputURL: video.url,
+            outputURL: outputURL,
+            progress: { [weak self] value in
+                self?.progress = value
+                self?.stage = value < 0.9 ? .encoding : .finished
+            },
+            completion: { [weak self] result in
+                guard let self else { return }
+                self.isProcessing = false
+                switch result {
+                case .success(let url):
+                    self.stage = .finished
+                    self.outputURL = url
+                    self.showToast("处理完成")
+                case .failure(let error):
+                    self.stage = .failed
+                    self.showToast(error.localizedDescription, style: .error)
+                }
+            }
+        )
+    }
+
+    func cancelProcessing() {
+        pipeline.cancel()
+        isProcessing = false
+        stage = .idle
+        progress = 0
+    }
+
+    // MARK: - Toast
+    func showToast(_ message: String, style: ToastStyle = .success) {
+        toastMessage = message
+        toastStyle = style
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            withAnimation { toastMessage = nil }
+        }
+    }
+}
+
+enum ToastStyle {
+    case success, error, warning
+}
+```
+
+---
+
+7. 更新 HomeView.swift
+
+```swift
+import SwiftUI
+
+struct HomeView: View {
+    @EnvironmentObject var appState: AppState
+    @State private var showPicker = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
+                Text("补帧")
+                    .font(.largeTitle.bold())
+
+                CardView {
+                    VStack(spacing: DesignTokens.Spacing.m) {
+                        Image(systemName: "photo.on.rectangle.angled")
+                            .font(.system(size: 48))
+                            .foregroundColor(DesignTokens.Colors.accent)
+
+                        Text("导入视频开始补帧")
+                            .font(.headline)
+
+                        Text("支持 30fps → 60fps，完全本地处理")
+                            .font(.subheadline)
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                            .multilineTextAlignment(.center)
+
+                        PrimaryButton(title: "从相册选择") {
+                            showPicker = true
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(DesignTokens.Spacing.m)
+        }
+        .background(DesignTokens.Colors.bgPrimary)
+        .sheet(isPresented: $showPicker) {
+            VideoPicker { url in
+                showPicker = false
+                appState.importVideo(from: url)
+            }
+        }
+        .navigationDestination(isPresented: Binding(
+            get: { appState.selectedVideo != nil },
+            set: { if !$0 { appState.selectedVideo = nil } }
+        )) {
+            SettingsView()
+                .environmentObject(appState)
+        }
+        .overlay(alignment: .top) {
+            if let message = appState.toastMessage {
+                ToastView(message: message, style: appState.toastStyle)
+                    .padding(.top, DesignTokens.Spacing.s)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+    }
+}
+```
+
+---
+
+8. 更新 SettingsView.swift 的“开始补帧”按钮
+
+将底部按钮改为：
+
+```swift
+.safeAreaInset(edge: .bottom) {
+    PrimaryButton(title: "开始补帧", isLoading: appState.isProcessing) {
+        appState.startProcessing()
+    }
+    .padding(DesignTokens.Spacing.m)
+    .background(DesignTokens.Colors.bgPrimary)
+}
+.fullScreenCover(isPresented: $appState.isProcessing) {
+    ProcessingView()
+        .environmentObject(appState)
+}
+```
+
+并且在 ProcessingView 中监听 appState.outputURL，当有输出时跳转结果页。或者简化：在 SettingsView 中通过 .navigationDestination(isPresented: Binding(get: { appState.outputURL != nil }, set: { if !$0 { appState.outputURL = nil } })) 跳转 ResultView。
+
+---
+
+9. 真机验证步骤
+
+1. 推送到 GitHub，等待 Actions 构建成功。
+2. 下载未签名 IPA，通过 AltStore / SideStore 安装。
+3. 打开 App，点击「从相册选择」。
+4. 选一个 10 秒左右的视频。
+5. 应该自动跳转到参数设置页，显示真实文件名、时长、原始帧率、分辨率、文件大小、缩略图。
+6. 点击「开始补帧」。
+7. 出现处理进度页，进度条走满。
+8. 自动跳转到结果页，可播放输出的视频。
+9. 点击「保存到相册」，检查相册中是否有输出视频。
+10. 输出视频应该与输入视频内容一致、时长一致、可正常播放（因为目前是空转，帧率未变）。
+
+---
+
+10. 常见问题
+
+问题 原因 解决
+选择视频后无反应 loadFileRepresentation 失败 检查是否在闭包内拷贝文件；确保 Info.plist 有相册权限
+处理中途崩溃 内存峰值过高 空转版本占用低，若崩溃检查 CVPixelBufferPool 未使用
+输出视频无法播放 Writer 配置错误 确认 AVVideoCodecKey 和宽高正确
+保存到相册失败 权限未申请 确认 NSPhotoLibraryAddUsageDescription 已配置
+构建失败 XcodeGen 路径错误 检查 project.yml 中 sources 路径与实际一致
+
+---
+
+11. 下一步预告
+
+空转跑通后，下一步就是：
+
+1. 接入 RIFE Lite Core ML 模型，替换 VideoPipeline 中的原帧复制逻辑。
+2. 实现 FrameInterpolator：Metal 预处理 → Core ML 推理 → Metal 后处理。
+3. 加入音频透传：在 Writer 中同时写入原始音频轨道。
+4. 加入进度细化：区分解码、推理、编码三个阶段。
+5. 性能优化：异步流水线、CVPixelBufferPool、设备降级。
+
+完成后，你就拥有了一个真正能补帧的 iOS App。
