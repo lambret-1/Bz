@@ -27,6 +27,16 @@ jobs:
           cd Scripts
           python convert_rife.py
 
+      - name: 验证模型文件
+        run: |
+          if [ -d "Scripts/RIFE_Lite.mlpackage" ]; then
+            echo "✅ 模型转换成功"
+            find Scripts/RIFE_Lite.mlpackage -type f | head -20
+          else
+            echo "❌ 模型转换失败，未找到 RIFE_Lite.mlpackage"
+            exit 1
+          fi
+
       - name: 上传 mlpackage
         uses: actions/upload-artifact@v4
         with:
