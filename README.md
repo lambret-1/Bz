@@ -1,3 +1,43 @@
+# Bz — iOS 端侧视频补帧 App
+
+> 纯原生 Swift + SwiftUI，最低 iOS 16.0，完全端侧 AI 补帧（30fps → 60fps / 120fps），不上架 App Store，通过侧载分发。
+
+## 快速开始
+
+### 构建方式
+
+推送到 `main` 分支后，GitHub Actions 自动在 macOS Runner 上构建未签名 IPA。
+
+### 下载 IPA
+
+1. 进入仓库 → **Actions** 标签页
+2. 选择最新一次成功的 **iOS Build** 运行
+3. 滚到底部 **Artifacts**，下载 `FrameInterpolation-unsigned-ipa`
+4. 解压得到 `FrameInterpolation-unsigned.ipa`
+
+### 侧载到 iPhone
+
+**AltStore / SideStore 方式：**
+1. 确保 iPhone 已安装 AltStore 或 SideStore
+2. 将 IPA 传到手机文件 App 或电脑
+3. 打开 AltStore → My Apps → 左上角 `+`
+4. 选择 IPA 文件，输入 Apple ID 完成签名与安装
+5. 首次打开前：设置 → 通用 → VPN与设备管理 → 信任开发者证书
+
+**TrollStore 方式（特定 iOS 版本）：** 直接在 TrollStore 中安装 IPA，永久签名无需刷新。
+
+### 验证
+
+打开 App，看到「补帧」首页，点击「从相册选择」按钮弹出 Toast，即代表云端构建 → 侧载 → 真机运行全链路打通。
+
+### 注意事项
+
+- 免费 Apple ID 侧载有效期 7 天，需在 AltStore 中刷新
+- Bundle ID：`com.lambret.bz`，如需修改请编辑 `project.yml`
+- App Icon 暂为占位，不影响构建，后续补充 1024×1024 图标
+
+---
+
 # iOS 视频补帧 App 开发大纲
 
 ## 1. 项目概述

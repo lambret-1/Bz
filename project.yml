@@ -1,0 +1,38 @@
+name: FrameInterpolation
+options:
+  bundleIdPrefix: com.lambret
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+
+targets:
+  FrameInterpolation:
+    type: application
+    platform: iOS
+    sources:
+      - path: FrameInterpolation
+    info:
+      path: FrameInterpolation/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: 补帧
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen:
+          UIColorName: BgPrimary
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSPhotoLibraryUsageDescription: 需要访问相册以导入和保存视频
+        NSPhotoLibraryAddUsageDescription: 需要保存补帧后的视频到相册
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lambret.bz
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

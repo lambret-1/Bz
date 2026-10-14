@@ -1,0 +1,59 @@
+name: iOS Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 显示 Xcode 版本
+        run: xcodebuild -version
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 缓存 Swift Packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: 生成 Xcode 工程
+        run: xcodegen generate
+
+      - name: 归档（未签名）
+        run: |
+          xcodebuild archive \
+            -project FrameInterpolation.xcodeproj \
+            -scheme FrameInterpolation \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/FrameInterpolation.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: 导出未签名 IPA
+        run: |
+          mkdir -p build/Payload
+          cp -r build/FrameInterpolation.xcarchive/Products/Applications/FrameInterpolation.app build/Payload/
+          cd build && zip -r FrameInterpolation-unsigned.ipa Payload/
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FrameInterpolation-unsigned-ipa
+          path: build/FrameInterpolation-unsigned.ipa
+          retention-days: 30
