@@ -8,6 +8,20 @@
 
 推送到 `main` 分支后，GitHub Actions 自动在 macOS Runner 上构建未签名 IPA。
 
+### AI 模型（RIFE Lite）
+
+App 使用 RIFE 4.22 Lite 模型进行端侧补帧。模型文件（`RIFE_Lite.mlpackage`）需通过以下步骤生成：
+
+1. 进入仓库 → **Actions** 标签页
+2. 选择 **Convert RIFE Lite to Core ML** 工作流
+3. 点击 **Run workflow** 手动触发
+4. 等待转换完成，下载 Artifact 中的 `RIFE_Lite`
+5. 将 `RIFE_Lite.mlpackage` 放入 `FrameInterpolation/Resources/` 目录
+6. 提交并推送，触发 iOS Build
+
+> 模型来源：[Practical-RIFE](https://github.com/hzwer/Practical-RIFE)（MIT 许可证），权重镜像：[Hugging Face](https://huggingface.co/anon0077/RIFE-Models)
+> 模型缺失时 App 自动降级为空转管线（帧率不变），不影响基础功能。
+
 ### 下载 IPA
 
 1. 进入仓库 → **Actions** 标签页

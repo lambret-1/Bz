@@ -4,8 +4,9 @@ import Metal
 import Accelerate
 import OSLog
 
-/// 帧插值器：Metal 预处理 → Core ML 推理 → Metal 后处理
-/// 输入前后两帧，输出中间帧
+/// 帧插值器：预处理 → Core ML 推理 → 后处理
+/// RIFE 4.22 Lite 模型直接输出中间帧，无需额外 Metal Warp/Blend
+/// 输入前后两帧，输出中间帧（尺寸与输入一致）
 /// 模型文件缺失时 init 返回 nil，VideoPipeline 自动降级为空转
 final class FrameInterpolator {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "FrameInterpolator")
@@ -13,18 +14,12 @@ final class FrameInterpolator {
     // MARK: - 模型与 Metal 资源
     private let model: MLModel
     private let context: MetalContext
-    private let preprocessPipeline: MTLComputePipelineState
-    private let sigmoidPipeline: MTLComputePipelineState
-    private let warpPipeline: MTLComputePipelineState
-    private let blendPipeline: MTLComputePipelineState
 
     // MARK: - 配置
     /// 模型固定输入宽度
-    let inputWidth: Int
+    let modelInputWidth = 512
     /// 模型固定输入高度
-    let inputHeight: Int
-    /// 输出缓冲区池
-    private let outputPool: PixelBufferPool
+    let modelInputHeight = 512
 
     // MARK: - 初始化
     init?() {
@@ -40,29 +35,10 @@ final class FrameInterpolator {
         }
         self.model = model
 
-        // 2. 初始化 Metal 上下文与计算管线
-        let context = MetalContext.shared
-        guard let pre = context.makePipeline(named: "bgra_to_nchw"),
-              let sig = context.makePipeline(named: "sigmoid_mask"),
-              let warp = context.makePipeline(named: "warp_frame"),
-              let blend = context.makePipeline(named: "blend_frames") else {
-            return nil
-        }
-        self.context = context
-        self.preprocessPipeline = pre
-        self.sigmoidPipeline = sig
-        self.warpPipeline = warp
-        self.blendPipeline = blend
+        // 2. 初始化 Metal 上下文（预处理/后处理后续可优化为 Metal）
+        self.context = MetalContext.shared
 
-        // 3. 模型固定输入尺寸（需与转换脚本一致）
-        self.inputWidth = 512
-        self.inputHeight = 512
-
-        // 4. 输出缓冲区池
-        self.outputPool = PixelBufferPool()
-        outputPool.configure(width: inputWidth, height: inputHeight)
-
-        logger.info("FrameInterpolator 初始化成功，模型输入: \(self.inputWidth)x\(self.inputHeight)")
+        logger.info("FrameInterpolator 初始化成功，模型输入: \(modelInputWidth)x\(modelInputHeight)")
     }
 
     // MARK: - 公开方法
@@ -70,9 +46,12 @@ final class FrameInterpolator {
     /// - Parameters:
     ///   - frame0: 前一帧（CVPixelBuffer，32BGRA）
     ///   - frame1: 后一帧（CVPixelBuffer，32BGRA）
-    /// - Returns: 中间帧（CVPixelBuffer，32BGRA），失败返回 nil
+    /// - Returns: 中间帧（CVPixelBuffer，32BGRA，尺寸与输入一致），失败返回 nil
     func interpolate(frame0: CVPixelBuffer, frame1: CVPixelBuffer) -> CVPixelBuffer? {
-        // 1. 预处理：缩放到模型输入尺寸 + BGRA → NCHW Float16
+        let originalWidth = CVPixelBufferGetWidth(frame0)
+        let originalHeight = CVPixelBufferGetHeight(frame0)
+
+        // 1. 预处理：缩放到 512x512 + BGRA → NCHW Float16
         guard let input0 = makeInputArray(from: frame0),
               let input1 = makeInputArray(from: frame1) else {
             logger.error("预处理失败")
@@ -88,32 +67,25 @@ final class FrameInterpolator {
             return nil
         }
 
-        guard let flowArray = output.featureValue(for: "flow")?.multiArrayValue,
-              let maskArray = output.featureValue(for: "mask")?.multiArrayValue else {
-            logger.error("模型输出缺少 flow 或 mask")
+        guard let outputArray = output.featureValue(for: "interpolatedFrame")?.multiArrayValue else {
+            logger.error("模型输出缺少 interpolatedFrame")
             return nil
         }
 
-        // 3. Metal 后处理：Sigmoid → Warp → Blend
-        return postprocess(
-            frame0: frame0,
-            frame1: frame1,
-            flow: flowArray,
-            mask: maskArray
-        )
+        // 3. 后处理：NCHW Float16 → BGRA + 缩放到原始尺寸
+        return makeOutputPixelBuffer(from: outputArray, width: originalWidth, height: originalHeight)
     }
 
     // MARK: - 预处理
-    /// 将 CVPixelBuffer 转换为模型输入的 MLMultiArray（NCHW Float16）
-    /// 当前使用 CPU 循环实现，后续可优化为 Metal 零拷贝
+    /// 将 CVPixelBuffer 转换为模型输入的 MLMultiArray（NCHW Float16，512x512）
     private func makeInputArray(from pixelBuffer: CVPixelBuffer) -> MLMultiArray? {
         // 缩放到模型输入尺寸
-        guard let resized = resize(pixelBuffer: pixelBuffer, width: inputWidth, height: inputHeight) else {
+        guard let resized = resize(pixelBuffer: pixelBuffer, width: modelInputWidth, height: modelInputHeight) else {
             return nil
         }
 
         guard let array = try? MLMultiArray(
-            shape: [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)],
+            shape: [1, 3, NSNumber(value: modelInputHeight), NSNumber(value: modelInputWidth)],
             dataType: .float16
         ) else {
             return nil
@@ -126,16 +98,16 @@ final class FrameInterpolator {
         let bytesPerRow = CVPixelBufferGetBytesPerRow(resized)
 
         // BGRA → NCHW Float16，归一化到 [0, 1]
-        let ptr = array.dataPointer.bindMemory(to: Float16.self, capacity: inputWidth * inputHeight * 3)
-        let planeSize = inputWidth * inputHeight
+        let ptr = array.dataPointer.bindMemory(to: Float16.self, capacity: modelInputWidth * modelInputHeight * 3)
+        let planeSize = modelInputWidth * modelInputHeight
 
-        for y in 0..<inputHeight {
-            for x in 0..<inputWidth {
+        for y in 0..<modelInputHeight {
+            for x in 0..<modelInputWidth {
                 let offset = y * bytesPerRow + x * 4
                 let b = Float16(base.load(fromByteOffset: offset, as: UInt8.self)) / 255.0
                 let g = Float16(base.load(fromByteOffset: offset + 1, as: UInt8.self)) / 255.0
                 let r = Float16(base.load(fromByteOffset: offset + 2, as: UInt8.self)) / 255.0
-                let idx = y * inputWidth + x
+                let idx = y * modelInputWidth + x
                 ptr[idx] = r
                 ptr[planeSize + idx] = g
                 ptr[2 * planeSize + idx] = b
@@ -146,37 +118,62 @@ final class FrameInterpolator {
     }
 
     // MARK: - 后处理
-    /// Metal 后处理：对掩码执行 Sigmoid，分别 Warp 前后帧，按掩码混合
-    /// 当前为占位实现：直接返回第二帧，验证管线连通性
-    /// 完整 Metal Warp + Blend 实现见资料7
-    private func postprocess(
-        frame0: CVPixelBuffer,
-        frame1: CVPixelBuffer,
-        flow: MLMultiArray,
-        mask: MLMultiArray
-    ) -> CVPixelBuffer? {
-        // TODO: 资料7补全完整 Metal 后处理
-        // 1. 将 mask 从 MLMultiArray 拷贝到 Metal 缓冲区
-        // 2. sigmoid_mask 着色器：对掩码执行 Sigmoid
-        // 3. warp_frame 着色器：用 flow 对 frame0 做前向 warp，对 frame1 做反向 warp
-        // 4. blend_frames 着色器：按掩码混合两个 warp 后的帧
-        // 5. 输出到 outputPool 的缓冲区
+    /// 将模型输出的 MLMultiArray（NCHW Float16）转换为 BGRA CVPixelBuffer，并缩放到指定尺寸
+    private func makeOutputPixelBuffer(from array: MLMultiArray, width: Int, height: Int) -> CVPixelBuffer? {
+        // 先创建 512x512 的 BGRA 缓冲区
+        var modelOutputBuffer: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: modelInputWidth,
+            kCVPixelBufferHeightKey as String: modelInputHeight,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        let status = CVPixelBufferCreate(nil, modelInputWidth, modelInputHeight, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &modelOutputBuffer)
+        guard status == kCVReturnSuccess, let outputBuffer = modelOutputBuffer else {
+            logger.error("创建输出缓冲区失败")
+            return nil
+        }
 
-        // 占位：返回第二帧，确保管线可运行
-        return frame1
+        CVPixelBufferLockBaseAddress(outputBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(outputBuffer, []) }
+
+        guard let base = CVPixelBufferGetBaseAddress(outputBuffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
+
+        // NCHW Float16 → BGRA，反归一化到 [0, 255]
+        let ptr = array.dataPointer.bindMemory(to: Float16.self, capacity: modelInputWidth * modelInputHeight * 3)
+        let planeSize = modelInputWidth * modelInputHeight
+
+        for y in 0..<modelInputHeight {
+            for x in 0..<modelInputWidth {
+                let idx = y * modelInputWidth + x
+                let r = min(max(Int(Float(ptr[idx]) * 255.0), 0), 255)
+                let g = min(max(Int(Float(ptr[planeSize + idx]) * 255.0), 0), 255)
+                let b = min(max(Int(Float(ptr[2 * planeSize + idx]) * 255.0), 0), 255)
+                let offset = y * bytesPerRow + x * 4
+                base.storeBytes(of: UInt8(b), toByteOffset: offset, as: UInt8.self)
+                base.storeBytes(of: UInt8(g), toByteOffset: offset + 1, as: UInt8.self)
+                base.storeBytes(of: UInt8(r), toByteOffset: offset + 2, as: UInt8.self)
+                base.storeBytes(of: UInt8(255), toByteOffset: offset + 3, as: UInt8.self) // Alpha
+            }
+        }
+
+        // 如果目标尺寸与模型输出尺寸不同，缩放
+        if width == modelInputWidth && height == modelInputHeight {
+            return outputBuffer
+        }
+
+        return resize(pixelBuffer: outputBuffer, width: width, height: height)
     }
 
     // MARK: - 缩放
-    /// 将 CVPixelBuffer 缩放到指定尺寸
-    /// 当前使用 vImage 实现，后续可优化为 Metal
+    /// 使用 vImage 将 CVPixelBuffer 缩放到指定尺寸
     private func resize(pixelBuffer: CVPixelBuffer, width: Int, height: Int) -> CVPixelBuffer? {
-        // 如果尺寸一致，直接返回
         if CVPixelBufferGetWidth(pixelBuffer) == width &&
            CVPixelBufferGetHeight(pixelBuffer) == height {
             return pixelBuffer
         }
 
-        // 创建输出缓冲区
         var outputBuffer: CVPixelBuffer?
         let attrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
@@ -186,10 +183,10 @@ final class FrameInterpolator {
         ]
         let status = CVPixelBufferCreate(nil, width, height, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &outputBuffer)
         guard status == kCVReturnSuccess, let output = outputBuffer else {
+            logger.error("创建缩放缓冲区失败")
             return nil
         }
 
-        // 使用 vImage 缩放
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         CVPixelBufferLockBaseAddress(output, [])
         defer {
