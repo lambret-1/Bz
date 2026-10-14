@@ -84,7 +84,9 @@ struct ResultView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("完成") {
-                        dismiss()
+                        // 关闭结果页，同时关闭处理页，回到参数设置页
+                        appState.outputURL = nil
+                        appState.isProcessing = false
                     }
                 }
             }

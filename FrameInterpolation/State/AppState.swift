@@ -94,7 +94,6 @@ final class AppState: ObservableObject {
             },
             completion: { [weak self] result in
                 guard let self = self else { return }
-                self.isProcessing = false
 
                 switch result {
                 case .success(let url):
@@ -103,8 +102,13 @@ final class AppState: ObservableObject {
                     self.outputURL = url
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
+                    // 注意：成功时不设置 isProcessing = false
+                    // 保持 ProcessingView 在后台，ResultView 通过 fullScreenCover 覆盖在上
+                    // 避免 ProcessingView 被 dismiss 时连带移除 ResultView
+                    // 用户从结果页返回时再统一设置 isProcessing = false
 
                 case .failure(let error):
+                    self.isProcessing = false
                     self.stage = .failed
                     self.outputURL = nil
                     if case PipelineError.cancelled = error {
