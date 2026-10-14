@@ -1,6 +1,7 @@
 import CoreML
 import CoreVideo
 import Metal
+import Accelerate
 import OSLog
 
 /// 帧插值器：Metal 预处理 → Core ML 推理 → Metal 后处理
@@ -61,7 +62,7 @@ final class FrameInterpolator {
         self.outputPool = PixelBufferPool()
         outputPool.configure(width: inputWidth, height: inputHeight)
 
-        logger.info("FrameInterpolator 初始化成功，模型输入: \(inputWidth)x\(inputHeight)")
+        logger.info("FrameInterpolator 初始化成功，模型输入: \(self.inputWidth)x\(self.inputHeight)")
     }
 
     // MARK: - 公开方法
@@ -79,10 +80,10 @@ final class FrameInterpolator {
         }
 
         // 2. Core ML 推理
-        guard let output = try? model.prediction(from: [
+        guard let featureProvider = try? MLDictionaryFeatureProvider(dictionary: [
             "frame0": input0,
             "frame1": input1
-        ]) else {
+        ]), let output = try? model.prediction(from: featureProvider) else {
             logger.error("Core ML 推理失败")
             return nil
         }
