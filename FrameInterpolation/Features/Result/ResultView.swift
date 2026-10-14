@@ -41,7 +41,7 @@ struct ResultView: View {
                                 Divider()
                                 infoRow("处理状态", "处理完成", highlight: true)
                                 Divider()
-                                infoRow("当前模式", "空转管线（帧率不变）")
+                                infoRow("当前模式", appState.processingMode.isEmpty ? "未知" : appState.processingMode)
                             }
                         }
                     }
@@ -68,17 +68,6 @@ struct ResultView: View {
                                 .cornerRadius(DesignTokens.Radius.m)
                         }
                         .accessibilityLabel("分享视频")
-                    }
-
-                    Button {
-                        appState.resetAll()
-                    } label: {
-                        HStack(spacing: DesignTokens.Spacing.xs) {
-                            Image(systemName: "house.fill")
-                            Text("返回首页")
-                        }
-                        .font(.subheadline)
-                        .foregroundColor(DesignTokens.Colors.accent)
                     }
                 }
                 .padding(.horizontal, DesignTokens.Spacing.m)

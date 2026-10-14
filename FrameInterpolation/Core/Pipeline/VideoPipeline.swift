@@ -12,6 +12,9 @@ final class VideoPipeline {
     /// 后台处理队列
     private let processingQueue = DispatchQueue(label: "com.lambret.bz.pipeline", qos: .userInitiated)
 
+    /// 是否使用 AI 补帧（模型加载成功为 true，缺失为 false）
+    var isUsingAIInterpolation: Bool { interpolator != nil }
+
     init() {
         self.interpolator = FrameInterpolator()
         if interpolator == nil {
