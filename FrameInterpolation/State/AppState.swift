@@ -60,7 +60,7 @@ final class AppState: ObservableObject {
 
     // MARK: - 开始处理
 
-    /// 启动视频处理管线（当前为空转：解码→编码透传）
+    /// 启动视频处理管线（补帧 + 音频透传，模型缺失时自动降级为空转）
     func startProcessing() {
         guard let video = selectedVideo else {
             showToast("未选择视频", style: .error)
@@ -82,15 +82,11 @@ final class AppState: ObservableObject {
         pipeline.process(
             inputURL: video.url,
             outputURL: outputURL,
-            progress: { [weak self] value in
+            multiplier: frameMultiplier.rawValue,
+            progress: { [weak self] value, stage in
                 guard let self = self else { return }
                 self.progress = value
-                // 空转版本只有解码+编码，阶段随进度切换
-                if value < 0.8 {
-                    self.stage = .decoding
-                } else {
-                    self.stage = .encoding
-                }
+                self.stage = stage
             },
             completion: { [weak self] result in
                 guard let self = self else { return }

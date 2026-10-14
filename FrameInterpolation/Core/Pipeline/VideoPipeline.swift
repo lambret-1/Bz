@@ -2,31 +2,44 @@ import AVFoundation
 import CoreVideo
 import OSLog
 
-/// 视频处理管线（空转版本）
-/// 当前阶段仅做 解码 → 编码 透传，不改变帧率与内容，用于验证 AVFoundation 管线稳定性
-/// 后续阶段将在此基础上接入 RIFE Lite 补帧与音频透传
+/// 视频处理管线：解码 → 补帧 → 编码 + 音频透传
+/// 支持 2x/4x 补帧，模型缺失时自动降级为空转（帧率不变）
 final class VideoPipeline {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "VideoPipeline")
     private var isCancelled = false
-    /// 后台处理队列，避免阻塞主线程
+    /// 帧插值器，模型缺失时为 nil（降级为空转）
+    private let interpolator: FrameInterpolator?
+    /// 后台处理队列
     private let processingQueue = DispatchQueue(label: "com.lambret.bz.pipeline", qos: .userInitiated)
+
+    init() {
+        self.interpolator = FrameInterpolator()
+        if interpolator == nil {
+            logger.warning("RIFE Lite 模型未加载，管线将以空转模式运行（帧率不变）")
+        } else {
+            logger.info("RIFE Lite 模型加载成功，补帧功能已启用")
+        }
+    }
 
     // MARK: - 公开方法
 
-    /// 开始处理视频（空转：解码后直接编码，帧率不变）
+    /// 开始处理视频
     /// - Parameters:
     ///   - inputURL: 输入视频文件 URL
     ///   - outputURL: 输出视频文件 URL
-    ///   - progress: 进度回调（0.0 ~ 1.0），主线程调用
+    ///   - multiplier: 补帧倍数（2 或 4），模型缺失时此参数无效
+    ///   - progress: 进度回调（0.0~1.0, 当前阶段），主线程调用
     ///   - completion: 完成回调，主线程调用
     func process(
         inputURL: URL,
         outputURL: URL,
-        progress: @escaping @MainActor (Double) -> Void,
+        multiplier: Int,
+        progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
         completion: @escaping @MainActor (Result<URL, Error>) -> Void
     ) {
         isCancelled = false
-        logger.info("开始处理视频: \(inputURL.lastPathComponent, privacy: .public)")
+        let effectiveMultiplier = interpolator != nil ? multiplier : 1
+        logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 倍数\(effectiveMultiplier)x")
 
         processingQueue.async { [weak self] in
             guard let self = self else { return }
@@ -34,6 +47,7 @@ final class VideoPipeline {
                 try self.runPipeline(
                     inputURL: inputURL,
                     outputURL: outputURL,
+                    multiplier: effectiveMultiplier,
                     progress: progress,
                     completion: completion
                 )
@@ -57,17 +71,27 @@ final class VideoPipeline {
     private func runPipeline(
         inputURL: URL,
         outputURL: URL,
-        progress: @escaping @MainActor (Double) -> Void,
+        multiplier: Int,
+        progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
         completion: @escaping @MainActor (Result<URL, Error>) -> Void
     ) throws {
         let asset = AVURLAsset(url: inputURL)
 
-        // 获取视频轨道（同步 API，在后台线程调用安全）
+        // 获取视频轨道
         guard let videoTrack = asset.tracks(withMediaType: .video).first else {
             throw PipelineError.noVideoTrack
         }
 
-        // 视频编码尺寸与方向
+        // 帧率与帧数计算
+        let inputFPS = Double(videoTrack.nominalFrameRate)
+        guard inputFPS > 0 else {
+            throw PipelineError.invalidFrameRate
+        }
+        let outputFPS = inputFPS * Double(multiplier)
+        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        let totalInputFrames = max(Int(durationSeconds * inputFPS), 1)
+
+        // 输出尺寸（编码尺寸，保留原始 transform）
         let naturalSize = videoTrack.naturalSize
         let transform = videoTrack.preferredTransform
         let outputWidth = Int(naturalSize.width)
@@ -77,45 +101,54 @@ final class VideoPipeline {
             throw PipelineError.invalidVideoSize
         }
 
-        logger.info("视频尺寸: \(outputWidth)x\(outputHeight), 变换矩阵: \(String(describing: transform))")
+        logger.info("输入: \(outputWidth)x\(outputHeight), \(inputFPS)fps, 时长\(durationSeconds)s, 总帧数\(totalInputFrames)")
+        logger.info("输出: \(outputFPS)fps, 倍数\(multiplier)x")
 
-        // 如果输出文件已存在则删除
+        // 删除已存在的输出文件
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try? FileManager.default.removeItem(at: outputURL)
         }
 
         // MARK: 配置 Reader
         let reader = try AVAssetReader(asset: asset)
-        let readerOutputSettings: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-        let readerOutput = AVAssetReaderTrackOutput(
+
+        let videoReaderOutput = AVAssetReaderTrackOutput(
             track: videoTrack,
-            outputSettings: readerOutputSettings
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
         )
-        readerOutput.alwaysCopiesSampleData = false
-        guard reader.canAdd(readerOutput) else {
+        videoReaderOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(videoReaderOutput) else {
             throw PipelineError.readerConfigurationFailed
         }
-        reader.add(readerOutput)
+        reader.add(videoReaderOutput)
+
+        // 音频轨道
+        var audioReaderOutput: AVAssetReaderTrackOutput?
+        if let audioTrack = asset.tracks(withMediaType: .audio).first {
+            let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+            if reader.canAdd(audioOutput) {
+                reader.add(audioOutput)
+                audioReaderOutput = audioOutput
+                logger.info("检测到音频轨道，将透传音频")
+            }
+        }
 
         // MARK: 配置 Writer
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        let writerSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: outputWidth,
-            AVVideoHeightKey: outputHeight
-        ]
-        let writerInput = AVAssetWriterInput(
+
+        let videoWriterInput = AVAssetWriterInput(
             mediaType: .video,
-            outputSettings: writerSettings
+            outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264,
+                AVVideoWidthKey: outputWidth,
+                AVVideoHeightKey: outputHeight
+            ]
         )
-        writerInput.expectsMediaDataInRealTime = false
-        // 保留原始视频方向
-        writerInput.transform = transform
+        videoWriterInput.expectsMediaDataInRealTime = false
+        videoWriterInput.transform = transform
 
         let pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: writerInput,
+            assetWriterInput: videoWriterInput,
             sourcePixelBufferAttributes: [
                 kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
                 kCVPixelBufferWidthKey as String: outputWidth,
@@ -123,11 +156,21 @@ final class VideoPipeline {
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
         )
-
-        guard writer.canAdd(writerInput) else {
+        guard writer.canAdd(videoWriterInput) else {
             throw PipelineError.writerConfigurationFailed
         }
-        writer.add(writerInput)
+        writer.add(videoWriterInput)
+
+        // 音频写入
+        var audioWriterInput: AVAssetWriterInput?
+        if audioReaderOutput != nil {
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            audioInput.expectsMediaDataInRealTime = false
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
+                audioWriterInput = audioInput
+            }
+        }
 
         // MARK: 启动读写
         guard reader.startReading() else {
@@ -136,67 +179,64 @@ final class VideoPipeline {
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
 
-        // 估算总帧数用于进度计算
-        let fps = Double(videoTrack.nominalFrameRate)
-        let durationSeconds = CMTimeGetSeconds(asset.duration)
-        let totalFrames = max(Int(durationSeconds * fps), 1)
-        var frameIndex = 0
+        // MARK: 视频处理循环
+        var outputFrameIndex = 0
+        var previousPixelBuffer: CVPixelBuffer?
         var lastProgressReport = 0.0
 
-        logger.info("预计总帧数: \(totalFrames), 帧率: \(fps)fps, 时长: \(durationSeconds)s")
-
-        // MARK: 逐帧处理
         while reader.status == .reading {
-            // 检查取消
             if isCancelled {
                 reader.cancelReading()
                 writer.cancelWriting()
                 throw PipelineError.cancelled
             }
 
-            guard let sampleBuffer = readerOutput.copyNextSampleBuffer(),
+            guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
                   let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                 break
             }
 
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-
-            // 等待 writer 就绪（有界背压，避免内存堆积）
-            var waitCount = 0
-            while !writerInput.isReadyForMoreMediaData {
-                if isCancelled {
-                    reader.cancelReading()
-                    writer.cancelWriting()
-                    throw PipelineError.cancelled
-                }
-                Thread.sleep(forTimeInterval: 0.005)
-                waitCount += 1
-                if waitCount > 200 { // 超过 1 秒未就绪，视为异常
-                    logger.error("Writer 超过 1 秒未就绪，终止处理")
-                    reader.cancelReading()
-                    writer.cancelWriting()
-                    throw PipelineError.writerNotReady
-                }
-            }
-
-            // 自动释放池包裹每帧，降低内存峰值
-            autoreleasepool {
-                let appendSuccess = pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: pts)
-                if !appendSuccess {
-                    self.logger.warning("第 \(frameIndex) 帧写入失败，writer 状态: \(writer.status.rawValue)")
-                }
-            }
-
-            frameIndex += 1
-
-            // 进度回调（每 1% 上报一次，减少主线程压力）
-            let currentProgress = min(Double(frameIndex) / Double(totalFrames), 0.99)
-            if currentProgress - lastProgressReport >= 0.01 || frameIndex == totalFrames {
-                lastProgressReport = currentProgress
+            // 进度计算（基于输入帧数）
+            let inputFrameIndex = outputFrameIndex / max(multiplier, 1)
+            let progressValue = min(Double(inputFrameIndex) / Double(totalInputFrames), 0.99)
+            if progressValue - lastProgressReport >= 0.01 {
+                lastProgressReport = progressValue
+                let stage: ProcessingStage = interpolator != nil ? .inferring : .decoding
                 Task { @MainActor in
-                    progress(currentProgress)
+                    progress(progressValue, stage)
                 }
             }
+
+            autoreleasepool {
+                // 如果有前一帧且插值器可用，生成中间帧
+                if let prev = previousPixelBuffer, let interpolator = self.interpolator, multiplier > 1 {
+                    for midIndex in 1..<multiplier {
+                        if self.isCancelled { return }
+
+                        // 生成中间帧
+                        if let midFrame = interpolator.interpolate(frame0: prev, frame1: pixelBuffer) {
+                            let midPTS = CMTime(
+                                value: Int64(outputFrameIndex),
+                                timescale: Int32(outputFPS)
+                            )
+                            self.waitForWriterReady(videoWriterInput)
+                            pixelBufferAdaptor.append(midFrame, withPresentationTime: midPTS)
+                            outputFrameIndex += 1
+                        }
+                    }
+                }
+
+                // 写入当前原始帧
+                let currentPTS = CMTime(
+                    value: Int64(outputFrameIndex),
+                    timescale: Int32(outputFPS)
+                )
+                self.waitForWriterReady(videoWriterInput)
+                pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: currentPTS)
+                outputFrameIndex += 1
+            }
+
+            previousPixelBuffer = pixelBuffer
         }
 
         // 检查 reader 最终状态
@@ -207,12 +247,37 @@ final class VideoPipeline {
             throw PipelineError.readerFailed
         }
 
-        logger.info("解码完成，共处理 \(frameIndex) 帧，等待编码完成")
+        videoWriterInput.markAsFinished()
+        logger.info("视频处理完成，输出帧数: \(outputFrameIndex)")
+
+        // MARK: 音频透传
+        if let audioReaderOutput = audioReaderOutput, let audioWriterInput = audioWriterInput {
+            logger.info("开始音频透传")
+            var audioFrameCount = 0
+
+            while reader.status == .reading {
+                if isCancelled {
+                    reader.cancelReading()
+                    writer.cancelWriting()
+                    throw PipelineError.cancelled
+                }
+
+                guard let audioSample = audioReaderOutput.copyNextSampleBuffer() else {
+                    break
+                }
+
+                autoreleasepool {
+                    self.waitForWriterReady(audioWriterInput)
+                    audioWriterInput.append(audioSample)
+                    audioFrameCount += 1
+                }
+            }
+
+            audioWriterInput.markAsFinished()
+            logger.info("音频透传完成，音频帧数: \(audioFrameCount)")
+        }
 
         // MARK: 完成写入
-        writerInput.markAsFinished()
-
-        // 使用信号量同步等待 finishWriting（在后台线程中安全）
         let semaphore = DispatchSemaphore(value: 0)
         writer.finishWriting {
             semaphore.signal()
@@ -220,9 +285,9 @@ final class VideoPipeline {
         semaphore.wait()
 
         if writer.status == .completed {
-            logger.info("视频编码完成，输出文件: \(outputURL.lastPathComponent, privacy: .public)")
+            logger.info("视频编码完成: \(outputURL.lastPathComponent, privacy: .public)")
             Task { @MainActor in
-                progress(1.0)
+                progress(1.0, .finished)
                 completion(.success(outputURL))
             }
         } else {
@@ -231,11 +296,26 @@ final class VideoPipeline {
             throw error
         }
     }
+
+    // MARK: - 等待 Writer 就绪（有界背压）
+    private func waitForWriterReady(_ input: AVAssetWriterInput) {
+        var waitCount = 0
+        while !input.isReadyForMoreMediaData {
+            if isCancelled { return }
+            Thread.sleep(forTimeInterval: 0.005)
+            waitCount += 1
+            if waitCount > 200 { // 超过 1 秒未就绪
+                logger.warning("Writer 超过 1 秒未就绪，等待次数: \(waitCount)")
+                break
+            }
+        }
+    }
 }
 
 // MARK: - 错误定义
 enum PipelineError: LocalizedError {
     case noVideoTrack
+    case invalidFrameRate
     case invalidVideoSize
     case readerConfigurationFailed
     case writerConfigurationFailed
@@ -250,6 +330,8 @@ enum PipelineError: LocalizedError {
         switch self {
         case .noVideoTrack:
             return "输入视频没有视频轨道"
+        case .invalidFrameRate:
+            return "无法获取视频帧率"
         case .invalidVideoSize:
             return "视频尺寸无效"
         case .readerConfigurationFailed:
