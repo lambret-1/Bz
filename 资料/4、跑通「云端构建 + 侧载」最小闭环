@@ -1,0 +1,643 @@
+跑通「云端构建 + 侧载」最小闭环
+
+这一步的目标很明确：可运行的 App 壳子在 GitHub Actions 上自动构建，并侧载到你的 iPhone 上。完成后，你就有了一个可迭代的工程底座，后续填入视频管线即可。
+
+---
+
+1. 你需要准备什么
+
+项目 要求
+GitHub 账号 免费即可，建议用公共仓库（macOS Runner 完全免费）
+iPhone iOS 16.0 及以上
+侧载工具 AltStore / SideStore / TrollStore 任一（建议先装 AltStore）
+电脑 Windows / Linux 均可（本文以 Windows 为例）
+Git 已安装并配置好 SSH 或 Token
+
+如果你还没有 Apple ID 用于 AltStore，先安装 AltStore 并完成一次「用 Apple ID 签名」的流程，确保它能正常工作。
+
+---
+
+2. 最终仓库结构
+
+```
+frame-interpolation/
+├── .github/
+│   └── workflows/
+│       └── ios-build.yml
+├── project.yml                  # XcodeGen 配置
+├── FrameInterpolation/
+│   ├── App/
+│   │   ├── FrameInterpolationApp.swift
+│   │   └── ContentView.swift
+│   ├── DesignSystem/
+│   │   ├── DesignTokens.swift
+│   │   └── Components.swift
+│   ├── Features/
+│   │   └── Home/
+│   │       └── HomeView.swift
+│   ├── Core/
+│   │   └── (后续填入 VideoPipeline 等)
+│   ├── Models/
+│   │   └── Models.swift
+│   ├── State/
+│   │   └── AppState.swift
+│   └── Resources/
+│       ├── Assets.xcassets/
+│       │   ├── Contents.json
+│       │   ├── AppIcon.appiconset/
+│       │   │   └── Contents.json
+│       │   ├── AccentColor.colorset/
+│       │   │   └── Contents.json
+│       │   └── BgPrimary.colorset/
+│       │       └── Contents.json
+│       └── Info.plist
+├── .gitignore
+└── README.md
+```
+
+---
+
+3. 关键文件内容
+
+3.1 project.yml（XcodeGen 配置）
+
+```yaml
+name: FrameInterpolation
+options:
+  bundleIdPrefix: com.yourname
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: NO
+    CODE_SIGNING_ALLOWED: NO
+
+targets:
+  FrameInterpolation:
+    type: application
+    platform: iOS
+    sources:
+      - path: FrameInterpolation
+    info:
+      path: FrameInterpolation/Resources/Info.plist
+      properties:
+        CFBundleDisplayName: 补帧
+        CFBundleShortVersionString: "1.0.0"
+        CFBundleVersion: "1"
+        UILaunchScreen:
+          UIColorName: BgPrimary
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSPhotoLibraryUsageDescription: 需要访问相册以导入和保存视频
+        NSPhotoLibraryAddUsageDescription: 需要保存补帧后的视频到相册
+        NSMicrophoneUsageDescription: 处理视频时不需要麦克风权限
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourname.frameinterpolation
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+```
+
+bundleIdPrefix 和 PRODUCT_BUNDLE_IDENTIFIER 改成你自己的，AltStore 侧载时 Bundle ID 必须唯一。
+
+3.2 FrameInterpolation/App/FrameInterpolationApp.swift
+
+```swift
+import SwiftUI
+
+@main
+struct FrameInterpolationApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+        }
+    }
+}
+```
+
+3.3 FrameInterpolation/App/ContentView.swift
+
+```swift
+import SwiftUI
+
+struct ContentView: View {
+    @StateObject private var appState = AppState()
+
+    var body: some View {
+        NavigationStack {
+            HomeView()
+                .environmentObject(appState)
+        }
+    }
+}
+```
+
+3.4 FrameInterpolation/DesignSystem/DesignTokens.swift
+
+```swift
+import SwiftUI
+
+enum DesignTokens {
+    enum Colors {
+        static let bgPrimary = Color("BgPrimary")
+        static let bgSecondary = Color(uiColor: .secondarySystemBackground)
+        static let bgTertiary = Color(uiColor: .tertiarySystemBackground)
+        static let textPrimary = Color.primary
+        static let textSecondary = Color.secondary
+        static let accent = Color.accentColor
+        static let success = Color.green
+        static let warning = Color.orange
+        static let error = Color.red
+    }
+
+    enum Spacing {
+        static let xs: CGFloat = 4
+        static let s: CGFloat = 8
+        static let m: CGFloat = 16
+        static let l: CGFloat = 24
+        static let xl: CGFloat = 32
+    }
+
+    enum Radius {
+        static let s: CGFloat = 8
+        static let m: CGFloat = 12
+        static let l: CGFloat = 16
+        static let xl: CGFloat = 24
+    }
+
+    static let buttonHeight: CGFloat = 52
+    static let minTapArea: CGFloat = 44
+}
+```
+
+3.5 FrameInterpolation/Features/Home/HomeView.swift
+
+```swift
+import SwiftUI
+
+struct HomeView: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
+                Text("补帧")
+                    .font(.largeTitle.bold())
+
+                CardView {
+                    VStack(spacing: DesignTokens.Spacing.m) {
+                        Image(systemName: "photo.on.rectangle.angled")
+                            .font(.system(size: 48))
+                            .foregroundColor(DesignTokens.Colors.accent)
+                        Text("导入视频开始补帧")
+                            .font(.headline)
+                        Text("支持 30fps → 60fps，完全本地处理")
+                            .font(.subheadline)
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                            .multilineTextAlignment(.center)
+
+                        PrimaryButton(title: "从相册选择") {
+                            appState.showToast("构建成功 🎉", style: .success)
+                        }
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(DesignTokens.Spacing.m)
+        }
+        .background(DesignTokens.Colors.bgPrimary)
+        .overlay(alignment: .top) {
+            if let message = appState.toastMessage {
+                ToastView(message: message, style: appState.toastStyle)
+                    .padding(.top, DesignTokens.Spacing.s)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+    }
+}
+```
+
+3.6 FrameInterpolation/DesignSystem/Components.swift
+
+```swift
+import SwiftUI
+
+struct PrimaryButton: View {
+    let title: String
+    var isLoading: Bool = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: DesignTokens.Spacing.s) {
+                if isLoading { ProgressView().tint(.white) }
+                Text(title).font(.headline)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: DesignTokens.buttonHeight)
+            .background(DesignTokens.Colors.accent)
+            .foregroundColor(.white)
+            .cornerRadius(DesignTokens.Radius.m)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct CardView<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        content
+            .padding(DesignTokens.Spacing.m)
+            .background(DesignTokens.Colors.bgSecondary)
+            .cornerRadius(DesignTokens.Radius.l)
+    }
+}
+
+struct ToastView: View {
+    let message: String
+    let style: ToastStyle
+
+    var iconName: String {
+        switch style {
+        case .success: return "checkmark.circle.fill"
+        case .error: return "xmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        }
+    }
+
+    var iconColor: Color {
+        switch style {
+        case .success: return DesignTokens.Colors.success
+        case .error: return DesignTokens.Colors.error
+        case .warning: return DesignTokens.Colors.warning
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: DesignTokens.Spacing.s) {
+            Image(systemName: iconName).foregroundColor(iconColor)
+            Text(message).font(.subheadline)
+        }
+        .padding(.horizontal, DesignTokens.Spacing.m)
+        .padding(.vertical, DesignTokens.Spacing.s + 4)
+        .background(DesignTokens.Colors.bgSecondary)
+        .cornerRadius(DesignTokens.Radius.m)
+        .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
+    }
+}
+```
+
+3.7 FrameInterpolation/State/AppState.swift
+
+```swift
+import SwiftUI
+
+@MainActor
+final class AppState: ObservableObject {
+    @Published var toastMessage: String?
+    @Published var toastStyle: ToastStyle = .success
+
+    func showToast(_ message: String, style: ToastStyle = .success) {
+        toastMessage = message
+        toastStyle = style
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            withAnimation { toastMessage = nil }
+        }
+    }
+}
+
+enum ToastStyle {
+    case success, error, warning
+}
+```
+
+3.8 FrameInterpolation/Models/Models.swift
+
+```swift
+import Foundation
+
+struct VideoInfo: Identifiable, Equatable {
+    let id = UUID()
+    let url: URL
+    let fileName: String
+    let duration: TimeInterval
+    let originalFPS: Double
+    let originalSizeMB: Double
+}
+```
+
+3.9 FrameInterpolation/Resources/Info.plist
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>zh_CN</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UILaunchScreen</key>
+    <dict>
+        <key>UIColorName</key>
+        <string>BgPrimary</string>
+    </dict>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+</dict>
+</plist>
+```
+
+3.10 Assets 目录
+
+Assets.xcassets/Contents.json
+
+```json
+{
+  "info" : { "author" : "xcode", "version" : 1 }
+}
+```
+
+Assets.xcassets/AccentColor.colorset/Contents.json
+
+```json
+{
+  "colors" : [
+    {
+      "color" : {
+        "color-space" : "srgb",
+        "components" : {
+          "alpha" : "1.000",
+          "blue" : "1.000",
+          "green" : "0.518",
+          "red" : "0.039"
+        }
+      },
+      "idiom" : "universal"
+    }
+  ],
+  "info" : { "author" : "xcode", "version" : 1 }
+}
+```
+
+Assets.xcassets/BgPrimary.colorset/Contents.json
+
+```json
+{
+  "colors" : [
+    {
+      "color" : {
+        "color-space" : "srgb",
+        "components" : { "alpha" : "1.000", "blue" : "0.000", "green" : "0.000", "red" : "0.000" }
+      },
+      "idiom" : "universal"
+    },
+    {
+      "appearances" : [
+        { "appearance" : "luminosity", "value" : "light" }
+      ],
+      "color" : {
+        "color-space" : "srgb",
+        "components" : { "alpha" : "1.000", "blue" : "0.969", "green" : "0.949", "red" : "0.949" }
+      },
+      "idiom" : "universal"
+    }
+  ],
+  "info" : { "author" : "xcode", "version" : 1 }
+}
+```
+
+Assets.xcassets/AppIcon.appiconset/Contents.json
+
+```json
+{
+  "images" : [
+    {
+      "idiom" : "universal",
+      "platform" : "ios",
+      "size" : "1024x1024"
+    }
+  ],
+  "info" : { "author" : "xcode", "version" : 1 }
+}
+```
+
+AppIcon 缺图片不影响构建，构建会给出警告，可后续补上 1024x1024 图标。
+
+3.11 .gitignore
+
+```
+.DS_Store
+xcuserdata/
+*.xcodeproj
+*.xcworkspace
+build/
+DerivedData/
+.swiftpm/
+```
+
+*.xcodeproj 被忽略，因为它由 XcodeGen 在 CI 中生成。
+
+3.12 .github/workflows/ios-build.yml
+
+```yaml
+name: iOS Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Cache Swift Packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/project.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (Unsigned)
+        run: |
+          xcodebuild archive \
+            -project FrameInterpolation.xcodeproj \
+            -scheme FrameInterpolation \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/FrameInterpolation.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Export Unsigned IPA
+        run: |
+          mkdir -p build/Payload
+          cp -r build/FrameInterpolation.xcarchive/Products/Applications/FrameInterpolation.app build/Payload/
+          cd build && zip -r FrameInterpolation-unsigned.ipa Payload/
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: FrameInterpolation-unsigned-ipa
+          path: build/FrameInterpolation-unsigned.ipa
+          retention-days: 30
+```
+
+3.13 README.md
+
+```markdown
+# FrameInterpolation
+
+iOS 端侧视频补帧 App（个人侧载版）。
+
+## 构建方式
+
+推送到 `main` 分支后，GitHub Actions 自动构建未签名 IPA。
+
+## 下载 IPA
+
+进入 GitHub 仓库 → Actions → 选择最新一次运行 → Artifacts → 下载 `FrameInterpolation-unsigned-ipa`。
+
+## 侧载到 iPhone
+
+1. 解压得到 `FrameInterpolation-unsigned.ipa`
+2. 打开 AltStore / SideStore
+3. 选择 `+` → 选择 IPA → 安装
+4. 信任开发者证书（设置 → 通用 → VPN与设备管理）
+
+## 注意事项
+
+- 免费侧载 7 天过期，需在 AltStore 中刷新
+- Bundle ID 唯一，避免与已安装应用冲突
+```
+
+---
+
+4. 操作步骤（Windows / Linux）
+
+Step 1：初始化本地仓库
+
+```bash
+mkdir frame-interpolation && cd frame-interpolation
+git init
+git branch -M main
+```
+
+将上面所有文件按目录结构创建好。
+
+Step 2：创建 GitHub 仓库
+
+在 GitHub 上新建一个 Public 仓库（公共仓库 macOS Runner 免费），命名为 frame-interpolation。
+
+Step 3：推送到 GitHub
+
+```bash
+git add .
+git commit -m "chore: initial project skeleton"
+git remote add origin git@github.com:<your-username>/frame-interpolation.git
+git push -u origin main
+```
+
+Step 4：等待 CI 构建
+
+· 打开仓库 → Actions 标签页
+· 看到 iOS Build 工作流自动运行
+· 首次构建约 15–20 分钟（后续因为有缓存会更快）
+
+Step 5：下载 IPA
+
+构建成功后：
+
+1. 点击最新的 workflow run
+2. 滚到底部 Artifacts
+3. 下载 FrameInterpolation-unsigned-ipa.zip
+4. 解压得到 FrameInterpolation-unsigned.ipa
+
+Step 6：侧载到 iPhone
+
+AltStore 方式：
+
+1. 确保 iPhone 已安装 AltStore，且 AltServer 在同一 Wi-Fi 下运行
+2. 将 IPA 传到电脑（或 iPhone 文件 App）
+3. 打开 AltStore → My Apps → 左上角 +
+4. 选择 IPA 文件
+5. 输入 Apple ID 完成签名与安装
+
+SideStore 方式：
+
+1. 打开 SideStore → My Apps → +
+2. 选择 IPA 文件
+3. 自动无线签名并安装
+
+Step 7：验证
+
+打开 App，看到「补帧」首页，点击按钮弹出「构建成功 🎉」Toast，即代表云端构建 → 侧载 → 真机运行全链路打通。
+
+---
+
+5. 常见问题
+
+问题 原因 解决
+Actions 报错 xcodegen: command not found brew 安装失败 检查 workflow 中 brew install xcodegen 是否在 Generate 之前
+构建成功但 AltStore 安装失败 Bundle ID 冲突 改 project.yml 中的 PRODUCT_BUNDLE_IDENTIFIER
+App 启动后闪退 Info.plist 缺字段 检查 UILaunchScreen 是否配置
+IPA 安装后 7 天过期 免费签名限制 用 AltStore 刷新，或改用 TrollStore（视 iOS 版本）
+构建耗时过长 无缓存 检查 actions/cache 是否正确命中
+
+---
+
+6. 下一步预告
+
+当这个闭环跑通后，下一步就是：
+
+1. 接入 PHPickerViewController，让「从相册选择」真正能选视频
+2. 实现 MediaImporter，读取视频的真实元数据
+3. 实现 VideoPipeline 的空转版本（不调用 AI，仅复制视频），验证 AVAssetReader / AVAssetWriter 管线
+4. 实现 FrameInterpolator 的占位版（返回原帧），验证 Metal 上下文
+5. 最后替换为真实 RIFE Lite 模型
+
+每一步都可以在真机上验证，确保不累积风险。
+
+---
