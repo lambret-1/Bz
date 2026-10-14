@@ -16,34 +16,40 @@ struct ResultView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
-                    // 视频播放器
-                    CardView {
-                        VideoPlayer(player: player)
-                            .frame(height: 220)
-                            .cornerRadius(DesignTokens.Radius.m)
-                            .onAppear {
-                                player = AVPlayer(url: outputURL)
-                                player?.play()
-                            }
-                            .onDisappear {
-                                player?.pause()
-                            }
-                    }
+            VStack(spacing: 0) {
+                // 可滚动内容区
+                ScrollView {
+                    VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
+                        // 视频播放器（16:9 自适应）
+                        CardView {
+                            VideoPlayer(player: player)
+                                .aspectRatio(16/9, contentMode: .fit)
+                                .cornerRadius(DesignTokens.Radius.m)
+                                .onAppear {
+                                    player = AVPlayer(url: outputURL)
+                                    player?.play()
+                                }
+                                .onDisappear {
+                                    player?.pause()
+                                }
+                        }
 
-                    // 文件信息
-                    CardView {
-                        VStack(spacing: DesignTokens.Spacing.s) {
-                            infoRow("输出文件", outputURL.lastPathComponent)
-                            Divider()
-                            infoRow("处理状态", "处理完成", highlight: true)
-                            Divider()
-                            infoRow("当前模式", "空转管线（帧率不变）")
+                        // 文件信息
+                        CardView {
+                            VStack(spacing: DesignTokens.Spacing.s) {
+                                infoRow("输出文件", outputURL.lastPathComponent)
+                                Divider()
+                                infoRow("处理状态", "处理完成", highlight: true)
+                                Divider()
+                                infoRow("当前模式", "空转管线（帧率不变）")
+                            }
                         }
                     }
+                    .padding(DesignTokens.Spacing.m)
+                }
 
-                    // 操作按钮
+                // 底部固定操作区
+                VStack(spacing: DesignTokens.Spacing.m) {
                     HStack(spacing: DesignTokens.Spacing.m) {
                         PrimaryButton(
                             title: isSaving ? "保存中…" : "保存到相册",
@@ -64,7 +70,6 @@ struct ResultView: View {
                         .accessibilityLabel("分享视频")
                     }
 
-                    // 返回首页
                     Button {
                         appState.resetAll()
                     } label: {
@@ -76,7 +81,10 @@ struct ResultView: View {
                         .foregroundColor(DesignTokens.Colors.accent)
                     }
                 }
-                .padding(DesignTokens.Spacing.m)
+                .padding(.horizontal, DesignTokens.Spacing.m)
+                .padding(.top, DesignTokens.Spacing.m)
+                .padding(.bottom, DesignTokens.Spacing.m)
+                .background(DesignTokens.Colors.bgPrimary)
             }
             .background(DesignTokens.Colors.bgPrimary)
             .navigationTitle("处理结果")
