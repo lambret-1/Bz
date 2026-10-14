@@ -45,15 +45,17 @@ OUTPUT_PACKAGE = os.path.join(SCRIPT_DIR, "RIFE_Lite.mlpackage")
 # ==================== 模型包装器 ====================
 class RIFEWrapper(nn.Module):
     """
-    RIFE 推理包装器：固定 timestep=0.5 和 scale_list，输出中间帧
+    RIFE 推理包装器：固定 timestep=0.5 和 scale_list，输出光流与掩码
     输入：img0 [B, 3, H, W], img1 [B, 3, H, W]（归一化到 [0, 1]）
-    输出：merged [B, 3, H, W]（中间帧，归一化到 [0, 1]）
+    输出：flow [B, 4, H, W]（前2通道=正向光流, 后2通道=反向光流）
+          mask [B, 1, H, W]（混合掩码 logits，需 Sigmoid）
+    说明：warp 和 blend 由 iOS 端 Metal 后处理完成，提升 ANE 利用率
     """
     def __init__(self, flownet: IFNet):
         super().__init__()
         self.flownet = flownet
 
-    def forward(self, img0: torch.Tensor, img1: torch.Tensor) -> torch.Tensor:
+    def forward(self, img0: torch.Tensor, img1: torch.Tensor):
         # 拼接前后帧
         imgs = torch.cat((img0, img1), dim=1)
         # 固定时间步（0.5 = 正中间）
@@ -62,8 +64,8 @@ class RIFEWrapper(nn.Module):
         scale_list = [8.0, 4.0, 2.0, 1.0]
         # 推理
         flow_list, mask, merged = self.flownet(imgs, timestep, scale_list)
-        # merged[3] 是最终融合的中间帧
-        return merged[3]
+        # 返回最终光流（4通道）和掩码 logits（1通道），warp/blend 交由 Metal
+        return flow_list[3], mask
 
 
 # ==================== 下载权重 ====================
@@ -162,9 +164,10 @@ def convert_to_coreml(model: RIFEWrapper) -> ct.models.MLModel:
 
     # 验证输出形状
     with torch.no_grad():
-        output = traced(example_input_0, example_input_1)
-    print(f"   输出形状: {output.shape}")
-    assert output.shape == (1, 3, INPUT_HEIGHT, INPUT_WIDTH), f"输出形状异常: {output.shape}"
+        flow, mask = traced(example_input_0, example_input_1)
+    print(f"   输出形状: flow={flow.shape}, mask={mask.shape}")
+    assert flow.shape == (1, 4, INPUT_HEIGHT, INPUT_WIDTH), f"光流形状异常: {flow.shape}"
+    assert mask.shape == (1, 1, INPUT_HEIGHT, INPUT_WIDTH), f"掩码形状异常: {mask.shape}"
 
     print(f"🔄 正在转换为 Core ML...")
     mlmodel = ct.convert(
@@ -174,7 +177,8 @@ def convert_to_coreml(model: RIFEWrapper) -> ct.models.MLModel:
             ct.TensorType(name="frame1", shape=(1, 3, INPUT_HEIGHT, INPUT_WIDTH)),
         ],
         outputs=[
-            ct.TensorType(name="interpolatedFrame"),
+            ct.TensorType(name="flow"),
+            ct.TensorType(name="mask"),
         ],
         minimum_deployment_target=ct.target.iOS16,
         compute_precision=ct.precision.FLOAT16,
@@ -183,11 +187,12 @@ def convert_to_coreml(model: RIFEWrapper) -> ct.models.MLModel:
 
     # 设置模型元数据
     mlmodel.author = "Bz"
-    mlmodel.short_description = "RIFE 4.22 Lite 视频帧插值模型，输入前后两帧，输出中间帧"
+    mlmodel.short_description = "RIFE 4.22 Lite 光流估计模型，输入前后两帧，输出光流与掩码，warp/blend 由 Metal 后处理完成"
     mlmodel.versionString = "4.22.lite"
     mlmodel.input_description["frame0"] = "前一帧，RGB 归一化到 [0, 1]，NCHW 布局，512x512"
     mlmodel.input_description["frame1"] = "后一帧，RGB 归一化到 [0, 1]，NCHW 布局，512x512"
-    mlmodel.output_description["interpolatedFrame"] = "中间帧，RGB 归一化到 [0, 1]，NCHW 布局，512x512"
+    mlmodel.output_description["flow"] = "光流 [1,4,512,512]，前2通道正向(dx,dy)，后2通道反向(dx,dy)"
+    mlmodel.output_description["mask"] = "混合掩码 logits [1,1,512,512]，需 Sigmoid 后用于 blend"
 
     print(f"✅ Core ML 转换完成")
     return mlmodel
@@ -219,10 +224,11 @@ def main():
     # 6. 验证
     print(f"\n🔍 验证模型规格:")
     print(f"   输入: frame0 [1, 3, {INPUT_HEIGHT}, {INPUT_WIDTH}], frame1 [1, 3, {INPUT_HEIGHT}, {INPUT_WIDTH}]")
-    print(f"   输出: interpolatedFrame [1, 3, {INPUT_HEIGHT}, {INPUT_WIDTH}]")
+    print(f"   输出: flow [1, 4, {INPUT_HEIGHT}, {INPUT_WIDTH}], mask [1, 1, {INPUT_HEIGHT}, {INPUT_WIDTH}]")
     print(f"   精度: Float16")
     print(f"   最低系统: iOS 16")
     print(f"   格式: mlprogram")
+    print(f"   后处理: warp + blend 由 iOS 端 Metal Compute 完成")
 
     print(f"\n🎉 转换完成！")
     print(f"   将 {OUTPUT_PACKAGE} 复制到 FrameInterpolation/Resources/ 目录")
