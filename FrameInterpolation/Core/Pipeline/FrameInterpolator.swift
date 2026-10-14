@@ -38,7 +38,7 @@ final class FrameInterpolator {
         // 2. 初始化 Metal 上下文（预处理/后处理后续可优化为 Metal）
         self.context = MetalContext.shared
 
-        logger.info("FrameInterpolator 初始化成功，模型输入: \(modelInputWidth)x\(modelInputHeight)")
+        logger.info("FrameInterpolator 初始化成功，模型输入: \(self.modelInputWidth)x\(self.modelInputHeight)")
     }
 
     // MARK: - 公开方法
