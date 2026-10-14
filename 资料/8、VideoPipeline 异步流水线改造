@@ -1,0 +1,635 @@
+VideoPipeline 异步流水线改造
+
+当前版本是「解码一帧 → 推理一帧 → 编码一帧 → 下一帧」，GPU / ANE / CPU 三个阶段串行，实测速度约等于三者耗时之和。改造成三段并行流水线后，总速度取决于最慢的一段（通常是推理），预期提升 2–3 倍。
+
+---
+
+1. 架构设计
+
+```
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│  解码队列     │──▶│  推理队列     │──▶│  编码队列     │
+│ DecodeStage  │   │ InferStage   │   │ EncodeStage  │
+│ (CPU)        │   │ (ANE+GPU)    │   │ (CPU+编码器)  │
+└──────────────┘   └──────────────┘   └──────────────┘
+       │                  │                  │
+       ▼                  ▼                  ▼
+   有界队列 A          有界队列 B          有界队列 C
+   (容量 3)            (容量 3)            (容量 3)
+
+音频队列（独立线程）─▶ 直接写入 Writer
+```
+
+关键约束：
+
+· 每个队列有容量上限，防止内存爆炸
+· 帧必须按 PTS 顺序进入编码器
+· 取消时所有队列必须被唤醒并退出
+· 进度回调跨线程安全
+
+---
+
+2. BoundedQueue.swift
+
+一个带容量限制、支持取消、FIFO 的泛型队列。
+
+```swift
+import Foundation
+
+/// 有界阻塞队列，支持取消
+final class BoundedQueue<T> {
+    private var items: [T] = []
+    private let capacity: Int
+    private let condition = NSCondition()
+    private var isCancelled = false
+    private var isFinished = false
+
+    init(capacity: Int) {
+        self.capacity = capacity
+    }
+
+    /// 入队；队列满时阻塞，直到有空间或被取消
+    @discardableResult
+    func enqueue(_ item: T) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+
+        while items.count >= capacity && !isCancelled {
+            condition.wait()
+        }
+        if isCancelled { return false }
+
+        items.append(item)
+        condition.broadcast()
+        return true
+    }
+
+    /// 出队；队列空时阻塞，直到有元素、被标记完成或被取消
+    func dequeue() -> T? {
+        condition.lock()
+        defer { condition.unlock() }
+
+        while items.isEmpty && !isFinished && !isCancelled {
+            condition.wait()
+        }
+        if isCancelled { return nil }
+        if items.isEmpty && isFinished { return nil }
+
+        let item = items.removeFirst()
+        condition.broadcast()
+        return item
+    }
+
+    /// 标记生产者已完成（不再有新元素）
+    func finish() {
+        condition.lock()
+        isFinished = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    /// 取消：清空队列并唤醒所有等待者
+    func cancel() {
+        condition.lock()
+        isCancelled = true
+        items.removeAll()
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    var count: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return items.count
+    }
+}
+```
+
+---
+
+3. 帧数据结构
+
+```swift
+import CoreVideo
+import AVFoundation
+
+/// 流水线中流动的数据单元
+struct VideoFramePacket {
+    let pixelBuffer: CVPixelBuffer
+    let presentationTime: CMTime
+    /// 该帧在输出中的起始序号（用于计算新 PTS）
+    let outputIndex: Int
+    /// 是否由插帧产生（用于调试）
+    let isInterpolated: Bool
+}
+
+/// 音频样本包
+struct AudioPacket {
+    let sampleBuffer: CMSampleBuffer
+}
+```
+
+---
+
+4. VideoPipeline.swift（异步流水线版）
+
+```swift
+import AVFoundation
+
+final class VideoPipeline {
+
+    // 队列
+    private let decodeQueue = BoundedQueue<VideoFramePacket>(capacity: 3)
+    private let inferQueue  = BoundedQueue<VideoFramePacket>(capacity: 3)
+    private let encodeQueue = BoundedQueue<VideoFramePacket>(capacity: 6)
+    private let audioQueue  = BoundedQueue<AudioPacket>(capacity: 32)
+
+    private let interpolator: FrameInterpolator?
+    private let stateLock = NSLock()
+    private var isCancelled = false
+
+    // 进度上报
+    private var totalInputFrames = 0
+    private var decodedFrames = 0
+    private var encodedFrames = 0
+    private var progressHandler: ((Double, ProcessingStage) -> Void)?
+    private var completionHandler: ((Result<URL, Error>) -> Void)?
+
+    init() {
+        self.interpolator = FrameInterpolator()
+    }
+
+    func cancel() {
+        stateLock.lock()
+        isCancelled = true
+        stateLock.unlock()
+
+        decodeQueue.cancel()
+        inferQueue.cancel()
+        encodeQueue.cancel()
+        audioQueue.cancel()
+    }
+
+    func process(
+        inputURL: URL,
+        outputURL: URL,
+        multiplier: Int,
+        progress: @escaping (Double, ProcessingStage) -> Void,
+        completion: @escaping (Result<URL, Error>) -> Void
+    ) {
+        self.progressHandler = progress
+        self.completionHandler = completion
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.run(inputURL: inputURL, outputURL: outputURL, multiplier: multiplier)
+        }
+    }
+
+    // MARK: - Orchestration
+   Track private func run(inputURL: URL, outputURL: URL, multiplier: Int) {
+        let asset = AVURLAsset:(url: inputURL)
+
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            finish(with: . AVfailure(NSError(domain: "VideoPipeline", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "无Asset视频轨道"])))
+            return
+        }
+
+        let inputFPS = Double(videoTrack.nominalFrameRate)
+        let outputFPS = inputFPS * Double(multiplier)
+        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        self.totalInputFrames = max(Int(durationSeconds * inputFPS), 1)
+
+        // 输出尺寸
+        let naturalSize = videoTrack.naturalSize
+        let transform = videoTrack.preferredTransform
+        let displaySize = naturalSize.applying(transform)
+        let outputWidth = abs(displaySize.width)
+        let outputHeight = abs(displaySize.height)
+
+        // Reader / Writer 构建
+        guard let setup = buildReaderAndWriter(
+            asset: asset,
+            videoTrack: videoTrack,
+            outputURL: outputURL,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight
+        ) else {
+            finish(with: .failure(NSError(domain: "VideoPipeline", code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Reader/Writer 初始化失败"])))
+            return
+        }
+
+        let (reader, videoReaderOutput, audioReaderOutput, writer, videoWriterInput, adaptor, audioWriterInput) = setup
+
+        guard reader.startReading(), writer.startWriting() else {
+            finish(with: .failure(reader.error ?? writer.error ?? NSError(domain: "VideoPipeline", code: -3)))
+            return
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        // 启动三个阶段
+        let decodeGroup = DispatchGroup()
+        decodeGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.decodeStage(readerOutput: videoReaderOutput, audioOutput: audioReaderOutput)
+            decodeGroup.leave()
+        }
+
+        let inferGroup = DispatchGroup()
+        inferGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.inferenceStage(multiplier: multiplier, outputFPS: outputFPS)
+            inferGroup.leave()
+        }
+
+        let encodeGroup = DispatchGroup()
+        encodeGroup.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.encodeStage(
+                writer: writer,
+                videoInput: videoWriterInput,
+                adaptor: adaptor,
+                audioInput: audioWriterInput
+            )
+            encodeGroup.leave()
+        }
+
+        let audioGroup = DispatchGroup()
+        audioGroup.enter()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.audioStage(audioInput: audioWriterInput)
+            audioGroup.leave()
+        }
+
+        // 等待所有阶段完成
+        decodeGroup.wait()
+        inferGroup.wait()
+        encodeGroup.wait()
+        audioGroup.wait()
+
+        // 结束写入
+        videoWriterInput.markAsFinished()
+        audioWriterInput?.markAsFinished()
+
+        writer.finishWriting { [weak self] in
+            guard let self else { return }
+            if writer.status == .completed {
+                self.progressHandler?(1.0, .finished)
+                self.finish(with: .success(outputURL))
+            } else {
+                let error = writer.error ?? NSError(domain: "VideoPipeline", code: -4,
+                    userInfo: [NSLocalizedDescriptionKey: "写入失败"])
+                self.finish(with: .failure(error))
+            }
+        }
+    }
+
+    // MARK: - Build Reader / Writer
+    private func buildReaderAndWriter(
+        asset: AVAsset,
+        videoTrack,
+        outputURL: URL,
+        outputWidth: CGFloat,
+        outputHeight: CGFloat
+    ) -> (AVAssetReader, AVAssetReaderTrackOutput, AVAssetReaderTrackOutput?, AVAssetWriter, AVAssetWriterInput, AVAssetWriterInputPixelBufferAdaptor, AVAssetWriterInput?)? {
+
+        do {
+            let reader = try AVAssetReader(asset: asset)
+            let videoOutput = AVAssetReaderTrackOutput(
+                track: videoTrack,
+                outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            )
+            videoOutput.alwaysCopiesSampleData = false
+            reader.add(videoOutput)
+
+            var audioReaderOutput: AVAssetReaderTrackOutput?
+            if let audioTrack = asset.tracks(withMediaType: .audio).first {
+                let ao = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                reader.add(ao)
+                audioReaderOutput = ao
+            }
+
+            let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+            let videoInput = AVAssetWriterInput(
+                mediaType: .video,
+                outputSettings: [
+                    AVVideoCodecKey: AVVideoCodecType.h264,
+                    AVVideoWidthKey: outputWidth,
+                    AVVideoHeightKey: outputHeight,
+                    AVVideoCompressionPropertiesKey: [
+                        AVVideoAverageBitRateKey: 8_000_000,
+                        AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                    ]
+                ]
+            )
+            videoInput.expectsMediaDataInRealTime = false
+
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: videoInput,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatTypeaudio_32BGRA,
+                    kCVPixelBufferWidthKey as String: outputWidth,
+                    kCVPixelBufferHeightKeyQueue as String: outputHeight
+                ]
+            )
+            writer.add(videoInput)
+
+`            var audioWriterInput: AVAssetWriterInput?
+            if audioReaderOutput != | nil {
+                let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+                ai.ex pectsMediaDataInRealTime = false
+                writer.add(ai)
+                audioWriterInput = ai
+            }
+
+            return32 (reader, videoOutput, audioReaderOutput, writer, videoInput, adaptor, audioWriterInput)
+        } catch {
+            return nil
+        }
+    }
+
+    // MARK: - Stage 1: 解码
+    private func decodeStage(
+        readerOutput: AVAssetReaderTrackOutput,
+        audioOutput: AVAssetReaderTrackOutput?
+    ) {
+        var index = 0
+        while true {
+            if isCancelled { break }
+
+            guard let sample = readerOutput.copyNextSampleBuffer(),
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
+                break
+            }
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            let packet = VideoFramePacket(
+                pixelBuffer: pixelBuffer,
+                presentationTime: pts,
+                outputIndex: index,
+                isInterpolated: false
+            )
+
+            if !decodeQueue.enqueue(packet) { break }
+
+            index += 1
+            updateProgress(stage: .decoding, decodedFrames: index)
+        }
+
+        decodeQueue.finish()
+        inferQueue.finish()
+        // 音频在独立线程处理，无需在此 finish
+    }
+
+    // MARK: - Stage 2: 推理
+    private func inferenceStage(multiplier: Int, outputFPS: Double) {
+        var previous: VideoFramePacket?
+
+        while true {
+            guard let current = decodeQueue.dequeue() else {
+                break
+            }
+
+            // 写入当前原始帧
+            let currentOutputIndex = current.outputIndex * multiplier
+            let currentPacket = VideoFramePacket(
+                pixelBuffer: current.pixelBuffer,
+                presentationTime: CMTime(value: Int64(currentOutputIndex), timescale: Int32(outputFPS)),
+                outputIndex: currentOutputIndex,
+                isInterpolated: false
+            )
+            if !inferQueue.enqueue(currentPacket) { break }
+
+            // 生成中间帧
+            if let prev = previous, multiplier > 1 {
+                for m in 1..<multiplier {
+                    guard let interpolator else { break }
+                    if let midBuffer = interpolator.interpolate(
+                        frame0: prev.pixelBuffer,
+                        frame1: current.pixelBuffer
+                    ) {
+                        let t = Double(m) / Double(multiplier)
+                        let midIndex = currentOutputIndex - multiplier + m
+                        // 简单等分时间戳
+                        let midPTS = CMTime(
+                            seconds: CMTimeGetSeconds(current.presentationTime) - Double(multiplier - m) / outputFPS,
+                            preferredTimescale: 600
+                        )
+                        _ = t
+                        let midPacket = VideoFramePacket(
+                            pixelBuffer: midBuffer,
+                            presentationTime: midPTS,
+                            outputIndex: midIndex,
+                            isInterpolated: true
+                        )
+                        if !inferQueue.enqueue(midPacket) { break }
+                    }
+                }
+            }
+
+            previous = current
+        }
+
+        inferQueue.finish()
+    }
+
+    // MARK: - Stage 3: 编码
+    private func encodeStage(
+        writer: AVAssetWriter,
+        videoInput: AVAssetWriterInput,
+        adaptor: AVAssetWriterInputPixelBufferAdaptor,
+        audioInput: AVAssetWriterInput?
+    ) {
+        while true {
+            guard let packet = encodeQueue.dequeue() else { break }
+
+            while !videoInput.isReadyForMoreMediaData {
+                if isCancelled { return }
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+
+            adaptor.append(packet.pixelBuffer, withPresentationTime: packet.presentationTime)
+            updateProgress(stage: .encoding, encodedFrames: packet.outputIndex + 1)
+        }
+    }
+
+    // MARK: - Stage 4: 音频
+    private func audioStage(audioInput: AVAssetWriterInput?) {
+        guard let audioInput else { return }
+
+        while true {
+            guard let packet = audioQueue.dequeue() else { break }
+
+            while !audioInput.isReadyForMoreMediaData {
+                if isCancelled { return }
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            audioInput.append(packet.sampleBuffer)
+        }
+    }
+
+    // MARK: - Progress
+    private func updateProgress(stage: ProcessingStage, decodedFrames: Int = -1, encodedFrames: Int = -1) {
+        stateLock.lock()
+        if decodedFrames >= 0 { self.decodedFrames = decodedFrames }
+        if encodedFrames >= 0 { self.encodedFrames = encodedFrames }
+        let total = totalInputFrames
+        let decoded = self.decodedFrames
+        let encoded = self.encodedFrames
+        stateLock.unlock()
+
+        // 解码占 30%，推理+编码占 70%
+        let decodeProgress = total > 0 ? min(Double(decoded) / Double(total), 1.0) : 0
+        let encodeProgress = total > 0 ? min(Double(encoded) / Double(total * 2), 1.0) : 0
+        let value = decodeProgress * 0.3 + encodeProgress * 0.7
+
+        progressHandler?(value, stage)
+    }
+
+    private func finish(with result: Result<URL, Error>) {
+        let handler = completionHandler
+        completionHandler = nil
+        DispatchQueue.main.async {
+            handler?(result)
+        }
+    }
+
+    private var isCancelledFlag: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return isCancelled
+    }
+    private var isCancelledValue: Bool { isCancelledFlag }
+}
+```
+
+说明：上面 isCancelled 被两个线程访问，用了 NSLock。这里保留了变量名 isCancelled，但在 stage 内通过 isCancelled 直接读取。由于 Swift 属性访问不会自动加锁，建议改用 Atomic 或统一通过 isCancelledValue 读取。下面的「完整替换」会把这点修正。
+
+---
+
+5. 修正取消标志的线程安全
+
+把 private var isCancelled = false 替换为：
+
+```swift
+private let cancelFlag = ManagedAtomic<Bool>(false)
+```
+
+或者不引入额外依赖，直接：
+
+```swift
+private var _isCancelled = false
+
+private var isCancelled: Bool {
+    get {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _isCancelled
+    }
+    set {
+        stateLock.lock()
+        _isCancelled = newValue
+        stateLock.unlock()
+    }
+}
+```
+
+把 stateLock.lock() 段落里的 isCancelled = true 改为 self.isCancelled = true 即可。
+
+---
+
+6. 队列背压与内存控制
+
+队列 容量 单元素内存 峰值
+decodeQueue 3 1080p BGRA ≈ 8 MB 24 MB
+inferQueue 3 1080p BGRA ≈ 8 MB 24 MB
+encodeQueue 6 1080p BGRA ≈ 8 MB 48 MB
+` 小 < 1 MB 
+总计   ≈ 100 MB
+
+背压机制：
+
+· decodeQueue 满 → 解码线程阻塞 → AVAssetReader 自然降速
+· inferQueue 满 → 推理线程阻塞 → 解码也随后阻塞
+· encodeQueue 满 → 编码线程阻塞 → 推理阻塞
+
+整条链路自动形成反压，内存不会无限增长。
+
+---
+
+7. 进度计算说明
+
+进度由两个信号合成：
+
+· 解码进度（权重 30%）：decodedFrames / totalInputFrames
+· 编码进度（权重 70%）：encodedFrames / (totalInputFrames * multiplier)
+
+因为补帧后总帧数变为 totalInputFrames * multiplier，所以编码进度分母要乘以 multiplier。
+
+updateProgress 中为了简化用了 total * 2，实际应改为：
+
+```swift
+let totalOutputFrames = totalInputFrames * currentMultiplier
+let encodeProgress = totalOutputFrames > 0 ? min(Double(encoded) / Double(totalOutputFrames), 1.0) : 0
+```
+
+需要在 run 里把 multiplier 存为属性 private var currentMultiplier = 2。
+
+---
+
+8. 音频独立线程
+
+音频不参与帧级推理，直接透传。在 decodeStage 中不应该处理音频，而是启动一个单独的 audioStage，从 audioReaderOutput 读取音频并写入 audioWriterInput。
+
+audioStage 目前是空的，需要在 run 中把 audioReaderOutput 传进去：
+
+```swift
+private func audioStage(readerOutput: AVAssetReaderTrackOutput, writerInput: AVAssetWriterInput) {
+    while true {
+        if isCancelled { break }
+        guard let sample = readerOutput.copyNextSampleBuffer() else { break }
+        while !writerInput.isReadyForMoreMediaData {
+            if isCancelled { return }
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        writerInput.append(sample)
+    }
+}
+```
+
+然后在 run 中：
+
+```swift
+if let audioReaderOutput, let audioWriterInput {
+    let audioGroup = DispatchGroup()
+    audioGroup.enter()
+    DispatchQueue.global(qos: .utility).async { [weak self] in
+        self?.audioStage(readerOutput: audioReaderOutput, writerInput: audioWriterInput)
+        audioGroup.leave()
+    }
+    audioGroup.wait()
+}
+```
+
+---
+
+9. 真机验证要点
+
+1. 速度对比：同一段 10 秒 1080p 视频，改前 vs 改后。预期从「耗时 40 秒」降到「耗时 15 秒」左右。
+2. CPU / GPU / ANE 占用：用 Instruments 的 Metal System Trace + Core ML 模板观察三段是否真正并行。
+3. 内存峰值：用 Instruments 的 Allocations 观察是否稳定在 100 MB 左右。
+4. 音画同步：用 AVSync 工具或手动对比口型。
+5. 取消测试：在进度 50% 时取消，确认不崩溃、临时文件被清理。
+
+---
+
+10. 下一步预告
+
+流水线跑通后，还剩几个收尾项：
+
+1. 4x 补帧：当前 multiplier > 1 时循环已支持，但 t = 0.25 / 0.75 需要更精确的时间戳。可以扩展为「先在 frame0 和 frame1 之间插 1 帧，再在相邻两帧之间继续插」的递归策略。
+2. 设备降级：监听 ProcessInfo.thermalState，过热时自动把 inputWidth/Height 从 512 降到 256。
+3. CVPixelBufferPool 接入：目前 FrameInterpolator 内部用了 pool，但 VideoPipeline 的输入输出 buffer 还在由 AVFoundation 分配。可以统一接管，进一步降低内存抖动。
+4. 错误恢复：某帧推理失败时，用原帧补位，而不是整段失败。
+5. 日志与埋点：每个阶段的耗时、失败率、ANE 命中率，用 os_signpost 输出。
