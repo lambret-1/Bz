@@ -1,0 +1,905 @@
+错误恢复 + os_signpost 埋点 + 长视频分段
+
+到这里功能已基本完整，剩余风险集中在稳定性（单帧失败导致整段失败）、可观测性（无法定位瓶颈）和长视频压力（内存 / 热 / 耗时失控）。这一步一次把这三件事补齐。
+
+---
+
+1. 错误恢复：单帧失败用原帧补位
+
+1.1 问题
+
+当前 FrameInterpolator.interpolate 返回 Optional，一旦返回 nil，inferenceStage 会静默跳过该中间帧，导致输出帧数不足、PTS 错位、音画不同步。更严重的是，如果模型加载失败或 Metal 管线失效，整段处理会直接失败。
+
+1.2 设计
+
+分层错误恢复策略：
+
+层级 失败场景 恢复策略
+帧级 单次推理失败 用前一帧或后一帧直接复制，保证时间轴完整
+段级 连续 N 帧推理失败 该段跳过插帧，只输出原帧
+任务级 模型加载失败 / Metal 初始化失败 降级为「帧率不变的空转」，保证输出可播放
+系统级 内存警告 / 热临界 降低模型输入尺寸或暂停插帧
+
+1.3 新增 InterpolationError.swift
+
+```swift
+import Foundation
+
+enum InterpolationError: LocalizedError {
+    case modelNotLoaded
+    case metalPipelineFailed
+    case preprocessFailed
+    case inferenceFailed
+    case postprocessFailed
+    case bufferPoolExhausted
+
+    var errorDescription: String? {
+        switch self {
+        case .modelNotLoaded: return "AI 模型未加载"
+        case .metalPipelineFailed: return "Metal 管线初始化失败"
+        case .preprocessFailed: return "预处理失败"
+        case .inferenceFailed: return "推理失败"
+        case .postprocessFailed: return "后处理失败"
+        case .bufferPoolExhausted: return "缓冲区耗尽"
+        }
+    }
+}
+```
+
+1.4 FrameInterpolator 返回 Result
+
+```swift
+func interpolate(
+    frame0: CVPixelBuffer,
+    frame1: CVPixelBuffer,
+    t: Float = 0.5
+) -> Result<CVPixelBuffer, InterpolationError> {
+
+    guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+        return .failure(.metalPipelineFailed)
+    }
+
+    guard let tex0 = helper.makeTexture(from: frame0),
+          let tex1 = helper.makeTexture(from: frame1) else {
+        return .failure(.preprocessFailed)
+    }
+
+    encodePreprocess(commandBuffer: commandBuffer, source: tex0, dstBuffer: frame0Buffer)
+    encodePreprocess(commandBuffer: commandBuffer, source: tex1, dstBuffer: frame1Buffer)
+
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+
+    guard let prediction = try? model.prediction(from: [
+        "frame0": makeMultiArray(from: frame0Buffer, shape: [1, 3, inputHeight, inputWidth]),
+        "frame1": makeMultiArray(from: frame1Buffer, shape: [1, 3, inputHeight, inputWidth])
+    ]) else {
+        return .failure(.inferenceFailed)
+    }
+
+    guard let flowArray = prediction.featureValue(for: "flow")?.multiArrayValue,
+          let maskArray = prediction.featureValue(for: "mask")?.multiArrayValue else {
+        return .failure(.inferenceFailed)
+    }
+
+    copyToBuffer(multiArray: flowArray, buffer: flowBuffer)
+    copyToBuffer(multiArray: maskArray, buffer: maskBuffer)
+
+    guard let postCommandBuffer = commandQueue.makeCommandBuffer(),
+          let output = postprocess(
+              commandBuffer: postCommandBuffer,
+              originalFrame0: tex0,
+              originalFrame1: tex1,
+              t: t,
+              outputWidth: CVPixelBufferGetWidth(frame0),
+              outputHeight: CVPixelBufferGetHeight(frame0)
+          ) else {
+        return .failure(.postprocessFailed)
+    }
+
+    return .success(output)
+}
+```
+
+1.5 VideoPipeline 中的帧级恢复
+
+在 inferenceStage 中引入失败计数器：
+
+```swift
+private var consecutiveFrameFailures = 0
+private let maxConsecutiveFailures = 8
+private var segmentSkipInterpolation = false
+```
+
+```swift
+private func inferenceStage() {
+    var previous: VideoFramePacket?
+
+    while true {
+        guard let current = decodeQueue.dequeue() else { break }
+
+        let thermal = ThermalMonitor.shared
+        let effectiveMultiplier = thermal.shouldDegrade ? 1 : currentMultiplier
+
+        // 写入原帧
+        let currentOutputIndex = current.outputIndex * effectiveMultiplier
+        let currentPacket = VideoFramePacket(
+            pixelBuffer: current.pixelBuffer,
+            presentationTime: CMTime(value: Int64(currentOutputIndex), timescale: Int32(currentOutputFPS)),
+            outputIndex: currentOutputIndex,
+            isInterpolated: false
+        )
+        if !inferQueue.enqueue(currentPacket) { break }
+
+        // 中间帧
+        if let prev = previous, effectiveMultiplier > 1, !segmentSkipInterpolation, let interpolator {
+            let offsets = InterpolationStrategy.timeOffsets(
+                multiplier: effectiveMultiplier,
+                outputFPS: currentOutputFPS
+            )
+            let baseTime = CMTimeGetSeconds(prev.presentationTime)
+
+            for (idx, offset) in offsets.enumerated() {
+                let midIndex = prev.outputIndex * effectiveMultiplier + idx + 1
+                let midSeconds = baseTime + offset
+
+                let result = interpolator.interpolate(
+                    frame0: prev.pixelBuffer,
+                    frame1: current.pixelBuffer,
+                    t: Float(offset * currentOutputFPS) // 相对 t
+                )
+
+                switch result {
+                case .success(let midBuffer):
+                    consecutiveFrameFailures = 0
+                    let midPacket = VideoFramePacket(
+                        pixelBuffer: midBuffer,
+                        presentationTime: CMTime(seconds: midSeconds, preferredTimescale: 600),
+                        outputIndex: midIndex,
+                        isInterpolated: true
+                    )
+                    if !inferQueue.enqueue(midPacket) { break }
+
+                case .failure(let error):
+                    consecutiveFrameFailures += 1
+                    PipelineMetrics.shared.recordFrameFailure(error)
+
+                    // 用前一帧复制补位，保证时间轴完整
+                    if let fallback = duplicateBuffer(prev.pixelBuffer) {
+                        let fallbackPacket = VideoFramePacket(
+                            pixelBuffer: fallback,
+                            presentationTime: CMTime(seconds: midSeconds, preferredTimescale: 600),
+                            outputIndex: midIndex,
+                            isInterpolated: false
+                        )
+                        if !inferQueue.enqueue(fallbackPacket) { break }
+                    }
+
+                    // 连续失败超过阈值 → 本段跳过插帧
+                    if consecutiveFrameFailures >= maxConsecutiveFailures {
+                        segmentSkipInterpolation = true
+                    }
+                }
+            }
+        }
+
+        previous = current
+    }
+
+    inferQueue.finish()
+}
+
+/// 复制一份 CVPixelBuffer（用于失败回退）
+private func duplicateBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+    var destination: CVPixelBuffer?
+    let attrs: [String: Any] = [
+        kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+    ]
+    CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        CVPixelBufferGetWidth(source),
+        CVPixelBufferGetHeight(source),
+        CVPixelBufferGetPixelFormatType(source),
+        attrs as CFDictionary,
+        &destination
+    )
+    guard let destination else { return nil }
+
+    CVPixelBufferLockBaseAddress(source, .readOnly)
+    CVPixelBufferLockBaseAddress(destination, [])
+    defer {
+        CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        CVPixelBufferUnlockBaseAddress(destination, [])
+    }
+
+    let srcBytes = CVPixelBufferGetBaseAddress(source)
+    let dstBytes = CVPixelBufferGetBaseAddress(destination)
+    let height = CVPixelBufferGetHeight(source)
+    let srcStride = CVPixelBufferGetBytesPerRow(source)
+    let dstStride = CVPixelBufferGetBytesPerRow(destination)
+    let copyBytes = min(srcStride, dstStride)
+
+    for row in 0..<height {
+        memcpy(
+            dstBytes!.advanced(by: row * dstStride),
+            srcBytes!.advanced(by: row * srcStride),
+            copyBytes
+        )
+    }
+    return destination
+}
+```
+
+1.6 任务级降级：模型加载失败也能出片
+
+在 VideoPipeline.run 开头：
+
+```swift
+guard interpolator != nil else {
+    // 降级：直接空转复制
+    runPassthrough(inputURL: inputURL, outputURL: outputURL)
+    return
+}
+```
+
+runPassthrough 就是上一版 VideoPipeline 的空转实现，保证输出文件可播放。
+
+---
+
+2. os_signpost 埋点
+
+2.1 新增 PipelineMetrics.swift
+
+集中管理 signpost 与计数，避免散落各处。
+
+```swift
+import Foundation
+import os
+
+final class PipelineMetrics {
+    static let shared = PipelineMetrics()
+
+    private let subsystem = "com.yourapp.frameinterpolation"
+
+    let pipelineLog = OSLog(subsystem: "com.yourapp.frameinterpolation", category: "pipeline")
+    let inferenceLog = OSLog(subsystem: "com.yourapp.frameinterpolation", category: "inference")
+    let ioLog = OSLog(subsystem: "com.yourapp.frameinterpolation", category: "io")
+
+    // iOS 16+ 推荐用 OSSignposter
+    private let pipelineSignposter: OSSignposter
+    private let inferenceSignposter: OSSignposter
+    private let ioSignposter: OSSignposter
+
+    // 计数
+    private let lock = NSLock()
+    private var _totalFrames: Int = 0
+    private var _interpolatedFrames: Int = 0
+    private var _failedFrames: Int = 0
+    private var _decodeTime: Double = 0
+    private var _inferenceTime: Double = 0
+    private var _encodeTime: Double = 0
+
+    private init() {
+        pipelineSignposter = OSSignposter(subsystem: subsystem, category: "pipeline")
+        inferenceSignposter = OSSignposter(subsystem: subsystem, category: "inference")
+        ioSignposter = OSSignposter(subsystem: subsystem, category: "io")
+    }
+
+    // MARK: - Signpost
+    func beginPipeline() -> OSSignpostIntervalState {
+        pipelineSignposter.beginInterval("Pipeline")
+    }
+
+    func endPipeline(_ state: OSSignpostIntervalState) {
+        pipelineSignposter.endInterval("Pipeline", state)
+    }
+
+    func beginDecode() -> OSSignpostIntervalState {
+        ioSignposter.beginInterval("Decode")
+    }
+
+    func endDecode(_ state: OSSignpostIntervalState, frameCount: Int) {
+        ioSignposter.endInterval("Decode", state, "\(frameCount)")
+    }
+
+    func beginInference() -> OSSignpostIntervalState {
+        inferenceSignposter.beginInterval("Inference")
+    }
+
+    func endInference(_ state: OSSignpostIntervalState) {
+        inferenceSignposter.endInterval("Inference", state)
+    }
+
+    func beginEncode() -> OSSignpostIntervalState {
+        ioSignposter.beginInterval("Encode")
+    }
+
+    func endEncode(_ state: OSSignpostIntervalState, frameCount: Int) {
+        ioSignposter.endInterval("Encode", state, "\(frameCount)")
+    }
+
+    // MARK: - Counters
+    func recordFrame() {
+        lock.lock(); _totalFrames += 1; lock.unlock()
+    }
+
+    func recordInterpolatedFrame() {
+        lock.lock(); _interpolatedFrames += 1; lock.unlock()
+    }
+
+    func recordFrameFailure(_ error: InterpolationError) {
+        lock.lock(); _failedFrames += 1; lock.unlock()
+        // 用 event 标记失败，可在 Instruments 中筛选
+        inferenceSignposter.emitEvent("FrameFailure", "\(error.errorDescription ?? "unknown")")
+    }
+
+    func recordDecodeTime(_ seconds: Double) {
+        lock.lock(); _decodeTime += seconds; lock.unlock()
+    }
+
+    func recordInferenceTime(_ seconds: Double) {
+        lock.lock(); _inferenceTime += seconds; lock.unlock()
+    }
+
+    func recordEncodeTime(_ seconds: Double) {
+        lock.lock(); _encodeTime += seconds; lock.unlock()
+    }
+
+    // MARK: - Report
+    func summary() -> String {
+        lock.lock(); defer { lock.unlock() }
+        return """
+        [Pipeline] frames=\(_totalFrames) interpolated=\(_interpolatedFrames) failed=\(_failedFrames)
+        decode=\(String(format: "%.2f", _decodeTime))s
+        inference=\(String(format: "%.2f", _inferenceTime))s
+        encode=\(String(format: "%.2f", _encodeTime))s
+        """
+    }
+
+    func reset() {
+        lock.lock()
+        _totalFrames = 0
+        _interpolatedFrames = 0
+        _failedFrames = 0
+        _decodeTime = 0
+        _inferenceTime = 0
+        _encodeTime = 0
+        lock.unlock()
+    }
+}
+```
+
+2.2 在 VideoPipeline 中接入
+
+```swift
+private func run(inputURL: URL, outputURL: URL, multiplier: Int) {
+    let pipelineState = PipelineMetrics.shared.beginPipeline()
+    defer {
+        PipelineMetrics.shared.endPipeline(pipelineState)
+        print(PipelineMetrics.shared.summary())
+    }
+
+    // ... 原有逻辑 ...
+}
+```
+
+decodeStage：
+
+```swift
+private func decodeStage(readerOutput: AVAssetReaderTrackOutput, audioOutput: AVAssetReaderTrackOutput?) {
+    let decodeState = PipelineMetrics.shared.beginDecode()
+    var index = 0
+    let start = CFAbsoluteTimeGetCurrent()
+
+    while true {
+        if isCancelled { break }
+        guard let sample = readerOutput.copyNextSampleBuffer(),
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { break }
+
+        let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+        let packet = VideoFramePacket(pixelBuffer: pixelBuffer, presentationTime: pts, outputIndex: index, isInterpolated: false)
+        if !decodeQueue.enqueue(packet) { break }
+        PipelineMetrics.shared.recordFrame()
+        index += 1
+        updateProgress(stage: .decoding, decodedFrames: index)
+    }
+
+    let elapsed = CFAbsoluteTimeGetCurrent() - start
+    PipelineMetrics.shared.recordDecodeTime(elapsed)
+    PipelineMetrics.shared.endDecode(decodeState, frameCount: index)
+    decodeQueue.finish()
+    inferQueue.finish()
+}
+```
+
+inferenceStage 中每个插帧调用：
+
+```swift
+let inferState = PipelineMetrics.shared.beginInference()
+let result = interpolator.interpolate(frame0: prev.pixelBuffer, frame1: current.pixelBuffer, t: t)
+PipelineMetrics.shared.endInference(inferState)
+
+switch result {
+case .success(let midBuffer):
+    PipelineMetrics.shared.recordInterpolatedFrame()
+    // ...
+case .failure(let error):
+    PipelineMetrics.shared.recordFrameFailure(error)
+    // ...
+}
+```
+
+encodeStage：
+
+```swift
+private func encodeStage(writer: AVAssetWriter, videoInput: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor, audioInput: AVAssetWriterInput?) {
+    let encodeState = PipelineMetrics.shared.beginEncode()
+    var count = 0
+    let start = CFAbsoluteTimeGetCurrent()
+
+    while true {
+        guard let packet = encodeQueue.dequeue() else { break }
+        while !videoInput.isReadyForMoreMediaData {
+            if isCancelled { break }
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        adaptor.append(packet.pixelBuffer, withPresentationTime: packet.presentationTime)
+        count += 1
+        updateProgress(stage: .encoding, encodedFrames: packet.outputIndex + 1)
+    }
+
+    let elapsed = CFAbsoluteTimeGetCurrent() - start
+    PipelineMetrics.shared.recordEncodeTime(elapsed)
+    PipelineMetrics.shared.endEncode(encodeState, frameCount: count)
+}
+```
+
+2.3 在 Instruments 中查看
+
+1. Xcode → Open Developer Tool → Instruments
+2. 选择 os_signpost 模板
+3. 连接真机，运行 App，处理一段视频
+4. 在时间轴上筛选 com.yourapp.frameinterpolation，即可看到：
+   · Pipeline 区间（整体）
+   · Decode / Inference / Encode 三段重叠情况
+   · FrameFailure 事件散点
+
+判断是否真正并行：三段区间应该在时间轴上大部分重叠，而非依次排列。
+
+---
+
+3. 长视频分段处理
+
+3.1 问题
+
+超过 3 分钟的视频如果一次性处理：
+
+风险 后果
+内存持续增长 解码器缓存、纹理池、Writer 缓冲区累积 → Jetsam 崩溃
+热持续累积 中途进入 critical，处理质量骤降
+单次失败 整段重来，用户等待白费
+进度反馈粗糙 长时间无进展，用户以为卡死
+
+3.2 设计：分段读取，单 Writer 连续写
+
+推荐方案：保持单个 AVAssetReader 与 AVAssetWriter，但把读取按时间段切成多段。每段之间：
+
+· 检查热状态，动态调整模型输入
+· 检查内存水位，必要时 autoreleasepool 清空
+· 更新进度
+· 允许取消
+
+这样做避免了「多段文件再合并」的复杂性（AVMutableComposition 合并会重新编码，损失质量且慢）。
+
+3.3 新增 SegmentPlanner.swift
+
+```swift
+import AVFoundation
+
+struct Segment {
+    let index: Int
+    let timeRange: CMTimeRange
+    let expectedInputFrames: Int
+}
+
+enum SegmentPlanner {
+    /// 把视频切成不超过 segmentDuration 秒的段
+    static func plan(
+        asset: AVAsset,
+        videoTrack: AVAssetTrack,
+        segmentDuration: Double = 30
+    ) -> [Segment] {
+        let totalDuration = CMTimeGetSeconds(asset.duration)
+        let fps = Double(videoTrack.nominalFrameRate)
+        let segmentCount = Int(ceil(totalDuration / segmentDuration))
+
+        var segments: [Segment] = []
+        for i in 0..<segmentCount {
+            let start = Double(i) * segmentDuration
+            let end = min(start + segmentDuration, totalDuration)
+            let range = CMTimeRange(
+                start: CMTime(seconds: start, preferredTimescale: 600),
+                end: CMTime(seconds: end, preferredTimescale: 600)
+            )
+            let frameCount = Int((end - start) * fps)
+            segments.append(Segment(index: i, timeRange: range, expectedInputFrames: frameCount))
+        }
+        return segments
+    }
+}
+```
+
+3.4 修改 VideoPipeline.run 使用分段
+
+关键在于：AVAssetReader.timeRange 可设置多次，但同一个 Reader 只能设置一次。所以正确做法是每段创建一个新的 Reader，但 Writer 保持单例，PTS 全局连续。
+
+```swift
+private func run(inputURL: URL, outputURL: URL, multiplier: Int) {
+    let pipelineState = PipelineMetrics.shared.beginPipeline()
+    defer {
+        PipelineMetrics.shared.endPipeline(pipelineState)
+        print(PipelineMetrics.shared.summary())
+    }
+
+    let asset = AVURLAsset(url: inputURL)
+    guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+        finish(with: .failure(NSError(domain: "VideoPipeline", code: -1, userInfo: [NSLocalizedDescriptionKey: "无视频轨道"])))
+        return
+    }
+
+    let inputFPS = Double(videoTrack.nominalFrameRate)
+    let outputFPS = inputFPS * Double(multiplier)
+    self.currentMultiplier = multiplier
+    self.currentOutputFPS = outputFPS
+
+    let naturalSize = videoTrack.naturalSize
+    let transform = videoTrack.preferredTransform
+    let displaySize = naturalSize.applying(transform)
+    let outputWidth = abs(displaySize.width)
+    let outputHeight = abs(displaySize.height)
+
+    // 全局 Writer（单例，跨段连续）
+    guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mp4) else {
+        finish(with: .failure(NSError(domain: "VideoPipeline", code: -2)))
+        return
+    }
+
+    let videoWriterInput = AVAssetWriterInput(
+        mediaType: .video,
+        outputSettings: [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: outputWidth,
+            AVVideoHeightKey: outputHeight,
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: 8_000_000,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+            ]
+        ]
+    )
+    videoWriterInput.expectsMediaDataInRealTime = false
+
+    let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+        assetWriterInput: videoWriterInput,
+        sourcePixelBufferAttributes: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: outputWidth,
+            kCVPixelBufferHeightKey as String: outputHeight
+        ]
+    )
+    writer.add(videoWriterInput)
+
+    var audioWriterInput: AVAssetWriterInput?
+    if asset.tracks(withMediaType: .audio).first != nil {
+        let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+        ai.expectsMediaDataInRealTime = false
+        writer.add(ai)
+        audioWriterInput = ai
+    }
+
+    guard writer.startWriting() else {
+        finish(with: .failure(writer.error ?? NSError(domain: "VideoPipeline", code: -3)))
+        return
+    }
+    writer.startSession(atSourceTime: .zero)
+
+    // 分段执行
+    let segments = SegmentPlanner.plan(asset: asset, videoTrack: videoTrack)
+    var globalOutputIndex = 0
+    var previousFrame: VideoFramePacket?
+
+    for segment in segments {
+        if isCancelled { break }
+
+        // 段间热降级检查
+        let thermal = ThermalMonitor.shared
+        if thermal.shouldPause {
+            Thread.sleep(forTimeInterval: 2.0) // 等待降温
+        }
+
+        // 每段创建新 Reader，设置 timeRange
+        do {
+            try processSegment(
+                asset: asset,
+                videoTrack: videoTrack,
+                segment: segment,
+                writer: writer,
+                videoWriterInput: videoWriterInput,
+                adaptor: adaptor,
+                audioWriterInput: audioWriterInput,
+                multiplier: multiplier,
+                outputFPS: outputFPS,
+                globalOutputIndex: &globalOutputIndex,
+                previousFrame: &previousFrame
+            )
+        } catch {
+            finish(with: .failure(error))
+            return
+        }
+
+        // 段间内存清理
+        autoreleasepool {
+            // 让 ARC 及时释放上一段的临时对象
+        }
+    }
+
+    videoWriterInput.markAsFinished()
+    audioWriterInput?.markAsFinished()
+
+    writer.finishWriting { [weak self] in
+        guard let self else { return }
+        if writer.status == .completed {
+            self.progressHandler?(1.0, .finished)
+            self.finish(with: .success(outputURL))
+        } else {
+            let error = writer.error ?? NSError(domain: "VideoPipeline", code: -4)
+            self.finish(with: .failure(error))
+        }
+    }
+}
+```
+
+3.5 processSegment：段内串行处理
+
+段内可以使用简化版串行流程（不用四队列，避免复杂度）：
+
+```swift
+private func processSegment(
+    asset: AVAsset,
+    videoTrack: AVAssetTrack,
+    segment: Segment,
+    writer: AVAssetWriter,
+    videoWriterInput: AVAssetWriterInput,
+    adaptor: AVAssetWriterInputPixelBufferAdaptor,
+    audioWriterInput: AVAssetWriterInput?,
+    multiplier: Int,
+    outputFPS: Double,
+    globalOutputIndex: inout Int,
+    previousFrame: inout VideoFramePacket?
+) throws {
+
+    let reader = try AVAssetReader(asset: asset)
+    reader.timeRange = segment.timeRange
+
+    let videoOutput = AVAssetReaderTrackOutput(
+        track: videoTrack,
+        outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+    )
+    videoOutput.alwaysCopiesSampleData = false
+    reader.add(videoOutput)
+
+    var audioOutput: AVAssetReaderTrackOutput?
+    if let audioTrack = asset.tracks(withMediaType: .audio).first, audioWriterInput != nil {
+        let ao = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+        reader.add(ao)
+        audioOutput = ao
+    }
+
+    guard reader.startReading() else {
+        throw reader.error ?? NSError(domain: "VideoPipeline", code: -10)
+    }
+
+    let thermal = ThermalMonitor.shared
+    let effectiveMultiplier = thermal.shouldDegrade ? 1 : multiplier
+
+    while reader.status == .reading {
+        if isCancelled {
+            reader.cancelReading()
+            break
+        }
+
+        guard let sample = videoOutput.copyNextSampleBuffer(),
+              let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else {
+            break
+        }
+
+        // 写入原帧
+        let currentPTS = CMTime(value: Int64(globalOutputIndex), timescale: Int32(outputFPS))
+        while !videoWriterInput.isReadyForMoreMediaData {
+            if isCancelled { return }
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+        adaptor.append(pixelBuffer, withPresentationTime: currentPTS)
+        globalOutputIndex += 1
+
+        // 生成中间帧
+        if let prev = previousFrame,
+           effectiveMultiplier > 1,
+           let interpolator {
+
+            let offsets = InterpolationStrategy.timeOffsets(
+                multiplier: effectiveMultiplier,
+                outputFPS: outputFPS
+            )
+
+            for (idx, offset) in offsets.enumerated() {
+                let inferState = PipelineMetrics.shared.beginInference()
+                let result = interpolator.interpolate(
+                    frame0: prev.pixelBuffer,
+                    frame1: pixelBuffer,
+                    t: Float(offset * outputFPS)
+                )
+                PipelineMetrics.shared.endInference(inferState)
+
+                let midPTS = CMTime(value: Int64(globalOutputIndex), timescale: Int32(outputFPS))
+
+                switch result {
+                case .success(let midBuffer):
+                    while !videoWriterInput.isReadyForMoreMediaData {
+                        if isCancelled { return }
+                        Thread.sleep(forTimeInterval: 0.002)
+                    }
+                    adaptor.append(midBuffer, withPresentationTime: midPTS)
+                    PipelineMetrics.shared.recordInterpolatedFrame()
+
+                case .failure(let error):
+                    PipelineMetrics.shared.recordFrameFailure(error)
+                    // 用前一帧复制补位
+                    if let dup = duplicateBuffer(prev.pixelBuffer) {
+                        while !videoWriterInput.isReadyForMoreMediaData {
+                            if isCancelled { return }
+                            Thread.sleep(forTimeInterval: 0.002)
+                        }
+                        adaptor.append(dup, withPresentationTime: midPTS)
+                    }
+                }
+
+                globalOutputIndex += 1
+                _ = idx
+            }
+        }
+
+        previousFrame = VideoFramePacket(
+            pixelBuffer: pixelBuffer,
+            presentationTime: currentPTS,
+            outputIndex: globalOutputIndex - 1,
+            isInterpolated: false
+        )
+
+        PipelineMetrics.shared.recordFrame()
+        updateProgress(
+            stage: .inferring,
+            decodedFrames: segment.index * segment.expectedInputFrames + 1,
+            encodedFrames: globalOutputIndex
+        )
+    }
+
+    // 音频透传
+    if let audioOutput, let audioWriterInput {
+        while reader.status == .reading {
+            if isCancelled { break }
+            guard let audioSample = audioOutput.copyNextSampleBuffer() else { break }
+            while !audioWriterInput.isReadyForMoreMediaData {
+                if isCancelled { return }
+                Thread.sleep(forTimeInterval: 0.002)
+            }
+            audioWriterInput.append(audioSample)
+        }
+    }
+}
+```
+
+注意：音频分段透传时，PTS 是相对于整段的，AVAssetWriter 会自动处理，只要时间戳连续即可。如果出现音画错位，需要手动将音频样本 PTS 平移到全局时间轴。
+
+---
+
+4. 内存水位监控
+
+4.1 新增 MemoryWatcher.swift
+
+```swift
+import Foundation
+import os
+
+final class MemoryWatcher {
+    static let shared = MemoryWatcher()
+
+    private let log = OSLog(subsystem: "com.yourapp.frameinterpolation", category: "memory")
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(didReceiveMemoryWarning),
+            name: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil
+        )
+    }
+
+    @objc private func didReceiveMemoryWarning() {
+        os_log("⚠️ Memory warning received", log: log, type: .error)
+        NotificationCenter.default.post(name: .memoryWarningReceived, object: nil)
+    }
+
+    /// 当前进程占用（MB）
+    var usedMemoryMB: Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        if result == KERN_SUCCESS {
+            return Double(info.resident_size) / 1024 / 1024
+        }
+        return 0
+    }
+}
+
+extension Notification.Name {
+    static let memoryWarningReceived = Notification.Name("memoryWarningReceived")
+}
+```
+
+4.2 在 run 中监听
+
+```swift
+NotificationCenter.default.addObserver(
+    forName: .memoryWarningReceived,
+    object: nil,
+    queue: .main
+) { [weak self] _ in
+    guard let self else { return }
+    // 降低模型输入尺寸
+    self.interpolator?.reduceModelInput()
+    self.progressHandler?(self.currentProgress, .inferring)
+}
+```
+
+FrameInterpolator 增加：
+
+```swift
+private var currentInputSize: Int = 512
+
+func reduceModelInput() {
+    currentInputSize = max(currentInputSize / 2, 256)
+    // 重建 pool
+    pool.configure(width: currentInputSize, height: currentInputSize)
+}
+```
+
+---
+
+5. 真机验证清单
+
+测试 方法 预期
+单帧失败恢复 临时让 interpolate 每 10 帧返回一次失败 输出视频仍完整，帧数正确
+连续失败降级 让 interpolate 持续失败 该段跳过插帧，输出原帧率
+模型加载失败 删除 .mlpackage 输出空转视频，不崩溃
+长视频 处理 5 分钟 1080p 视频 内存稳定在 200 MB 内，不崩溃
+分段边界 处理 30 秒视频（1 段边界） 音画同步，无黑帧
+热降级 边充电边处理，直到 thermal serious 自动降低模型输入尺寸或跳过插帧
+内存警告 用 Instruments 模拟 memory warning 模型输入尺寸减半，处理继续
+signpost Instruments 打开 os_signpost 看到 Pipeline / Decode / Inference / Encode 区间
+指标输出 处理结束后看 Xcode console 打印 [Pipeline] frames=... failed=...
+
+---
+
+6. 下一步预告
+
+到这里，App 的功能、性能、稳定性、可观测性已经完整。剩余可选的收尾：
+
+1. UI 打磨：结果页对比、分享、错误提示细化、暗黑模式。
+2. 多语言与无障碍：本地化、VoiceOver、动态字体。
+3. 首次启动引导：权限说明、隐私承诺。
+4. CI/CD 完整化：Release 自动打包、版本号管理、变更日志。
+5. 代码清理与文档：README、架构图、关键决策记录。
