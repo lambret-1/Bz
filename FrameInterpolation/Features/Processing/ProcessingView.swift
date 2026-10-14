@@ -79,9 +79,14 @@ struct ProcessingView: View {
             Text("已处理的部分将被丢弃，无法恢复。")
         }
         // 处理完成后展示结果页（独立全屏，覆盖在处理页之上）
-        .fullScreenCover(item: $appState.outputURL) { url in
-            ResultView(outputURL: url)
-                .environmentObject(appState)
+        .fullScreenCover(isPresented: Binding(
+            get: { appState.outputURL != nil },
+            set: { if !$0 { appState.outputURL = nil } }
+        )) {
+            if let url = appState.outputURL {
+                ResultView(outputURL: url)
+                    .environmentObject(appState)
+            }
         }
     }
 }

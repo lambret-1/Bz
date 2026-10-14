@@ -77,7 +77,7 @@ final class VideoPipeline {
             throw PipelineError.invalidVideoSize
         }
 
-        logger.info("视频尺寸: \(outputWidth)x\(outputHeight), 变换矩阵: \(transform)")
+        logger.info("视频尺寸: \(outputWidth)x\(outputHeight), 变换矩阵: \(String(describing: transform))")
 
         // 如果输出文件已存在则删除
         if FileManager.default.fileExists(atPath: outputURL.path) {
