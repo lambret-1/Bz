@@ -31,6 +31,8 @@ final class AppState: ObservableObject {
     // MARK: - 结果
     /// 输出视频 URL，非空时展示结果页
     @Published var outputURL: URL?
+    /// 实际处理模式描述（如 "AI补帧（2x）" 或 "空转管线（帧率不变）"）
+    @Published var processingMode: String = ""
 
     // MARK: - Toast
     @Published var toastMessage: String?
@@ -96,6 +98,9 @@ final class AppState: ObservableObject {
                     self.stage = .finished
                     self.progress = 1.0
                     self.outputURL = url
+                    self.processingMode = self.pipeline.isUsingAIInterpolation
+                        ? "AI补帧（\(self.frameMultiplier.label)）"
+                        : "空转管线（帧率不变）"
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
                     // 注意：成功时不设置 isProcessing = false
@@ -134,6 +139,7 @@ final class AppState: ObservableObject {
         logger.info("重置全部状态，返回首页")
         pipeline.cancel()
         outputURL = nil
+        processingMode = ""
         isProcessing = false
         showSettings = false
         selectedVideo = nil
