@@ -1,5 +1,4 @@
-
-# iOS 视频补帧 App 开发大纲（云端 CI/CD · 仅侧载版）
+# iOS 视频补帧 App 开发大纲
 
 ## 1. 项目概述
 
@@ -8,504 +7,379 @@
 - **最低系统版本**：iOS 16.0
 - **核心特性**：完全端侧运行、无需网络、保护隐私
 - **开发环境**：无 Mac 电脑，全程使用 GitHub Actions 云端 macOS Runner 完成编译与分发
-- **分发方式**：**不上架 App Store**，仅通过 AltStore / SideStore / TrollStore 等工具侧载到个人设备
+- **分发方式**：不上架 App Store，仅通过 AltStore / SideStore / TrollStore 等工具侧载到个人设备
 
 ### 1.2 核心约束
 - 无本地 Mac，所有 Xcode 构建均在 GitHub Actions 的 macOS Runner 上执行
-- 构建产物为**未签名 IPA**，通过侧载工具安装到 iPhone
-- 本项目为个人开发/测试用途，**不提交 App Store 审核，不使用 TestFlight**
+- 构建产物为未签名 IPA，通过侧载工具安装到 iPhone
+- 本项目为个人开发/测试用途，不提交 App Store 审核
+
+### 1.3 核心功能
+- 导入视频（相册 / 文件 App）
+- 选择补帧倍数（2x / 4x）
+- 选择输出分辨率与帧率
+- 实时预览处理进度
+- 导出并保存到相册
+- 支持后台处理（可选）
 
 
-## 2. 云端开发环境架构
+## 2. 技术选型与可行性
 
-### 2.1 整体架构
+### 2.1 核心技术栈
+| 层级 | 技术 | 用途 |
+| :--- | :--- | :--- |
+| 视频解码 | AVFoundation (`AVAssetReader`) | 逐帧读取视频 |
+| AI 推理 | Core ML + RIFE Lite | 光流估计与插帧 |
+| 图像处理 | Metal Shader | 预处理、Warp、Blend |
+| 视频编码 | AVFoundation (`AVAssetWriter`) | 重新封装输出视频 |
+| 并发 | GCD + 有界队列 | 异步流水线 |
+| UI | SwiftUI | 界面开发 |
+| 构建 | GitHub Actions + XcodeGen | 云端编译与打包 |
 
-```
+### 2.2 为什么选择 Core ML + RIFE Lite？
+- iOS 16 无法使用系统原生 ML 插帧
+- RIFE Lite 在移动端平衡了速度与质量
+- 转换为 Float16 Core ML 模型后可调用 ANE，能效比高
+- 社区有成熟转换方案与参考实现
 
-┌─────────────────────────────────────────────────────────┐
-│                    本地开发环境（Windows/Linux）           │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐   │
-│  │ 代码编辑器 │  │  Git CLI │  │  ios-builder CLI 工具 │   │
-│  │ (VS Code)│  │          │  │  (远程构建+下载 IPA)   │   │
-│  └──────────┘  └──────────┘  └──────────────────────┘   │
-└────────────────────────┬────────────────────────────────┘
-│ git push
-▼
-┌─────────────────────────────────────────────────────────┐
-│              GitHub Actions 云端 macOS Runner            │
-│                                                         │
-│  1. Checkout 代码                                       │
-│  2. 安装 Xcode（通过 xcodes 或默认版本）                   │
-│  3. 解析 Swift Package / CocoaPods 依赖                  │
-│  4. xcodebuild archive（禁用签名）                        │
-│  5. 导出未签名 IPA                                        │
-│  6. 上传 Artifact / 发布 Release                         │
-└────────────────────────┬────────────────────────────────┘
-│ 下载 IPA
-▼
-┌─────────────────────────────────────────────────────────┐
-│                    本地设备侧载方案                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │
-│  │  AltStore    │  │  SideStore   │  │  TrollStore  │  │
-│  │ (7天过期)     │  │ (无线侧载)    │  │ (永久，特定版本)│  │
-│  └──────────────┘  └──────────────┘  └──────────────┘  │
-└─────────────────────────────────────────────────────────┘
-
-```
-
-### 2.2 工具选型
-
-| 工具 | 用途 | 适用场景 | 费用 |
+### 2.3 性能预期
+| 设备芯片 | 建议分辨率 | 补帧倍数 | 预期速度 |
 | :--- | :--- | :--- | :--- |
-| **ios-builder** | 一键初始化 GitHub Actions 工作流、远程构建、下载 IPA | 快速上手，简化 CLI 操作 | 免费 |
-| **手动 GitHub Actions 工作流** | 自定义构建流程，精细控制每个步骤 | 需要定制化构建 | 免费（公共仓库） |
-| **AltStore / SideStore** | 将未签名 IPA 侧载到 iPhone | 个人测试 | 免费 |
-| **TrollStore** | 永久安装未签名 IPA | 特定 iOS 版本 | 免费 |
+| A16 及以上 | 1080p | 2x | 近实时 |
+| A14 / A15 | 720p | 2x | 可接受 |
+| A13 及以下 | 480p | 2x | 较慢，需降级 |
 
 
-## 3. GitHub Actions 工作流设计
+## 3. 系统架构与核心流程
 
-### 3.1 核心工作流文件
-
-在仓库根目录创建 `.github/workflows/ios-build.yml`：
-
-```yaml
-name: iOS Build
-
-on:
-  push:
-    branches: [main, develop]
-  workflow_dispatch:  # 支持手动触发
-
-jobs:
-  build:
-    runs-on: macos-15  # 使用最新的 macOS Runner
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Show Xcode version
-        run: xcodebuild -version
-
-      - name: Install xcodegen (可选，如使用 XcodeGen 管理工程)
-        run: brew install xcodegen
-
-      - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Resolve Swift Packages
-        run: |
-          xcodebuild -resolvePackageDependencies \
-            -project YourApp.xcodeproj \
-            -scheme YourApp
-
-      - name: Archive (Unsigned)
-        run: |
-          xcodebuild archive \
-            -project YourApp.xcodeproj \
-            -scheme YourApp \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -archivePath build/YourApp.xcarchive \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
-
-      - name: Export Unsigned IPA
-        run: |
-          # 从未签名的 xcarchive 中提取 .app 并打包为 IPA
-          mkdir -p build/Payload
-          cp -r build/YourApp.xcarchive/Products/Applications/YourApp.app \
-                build/Payload/
-          cd build && zip -r YourApp-unsigned.ipa Payload/
-
-      - name: Upload IPA Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: YourApp-unsigned-ipa
-          path: build/YourApp-unsigned.ipa
+### 3.1 总体架构图
 ```
 
-关键点：
-
-· runs-on: macos-15 使用 GitHub 托管的 macOS Runner，公共仓库完全免费
-· CODE_SIGNING_ALLOWED=NO 禁用代码签名，生成未签名 IPA
-· 未签名 IPA 需要通过 AltStore / SideStore / Sideloadly 等工具侧载到设备。
-
-3.2 使用 ios-builder 简化流程
-
-ios-builder 可自动完成上述配置。安装方式：
-
-```bash
-# macOS/Linux/WSL
-curl -sSL https://raw.githubusercontent.com/MobAI-App/ios-builder/main/install.sh | bash
-
-# 或 Homebrew
-brew install mobai-app/tap/ios-builder
-```
-
-使用流程：
-
-```bash
-builder auth github          # 认证 GitHub
-cd your-ios-project
-builder init                 # 自动生成工作流并提交
-builder ios build            # 触发远程构建，下载 IPA 到 ./dist/
-builder ios build --unsigned  # 生成未签名 IPA
-```
-
-builder init 会自动检测项目框架（Native iOS / Flutter / React Native / Expo 等），并生成对应的工作流配置。
-
-4. 签名与分发策略（仅侧载）
-
-4.1 分发方式
-
-本项目不上架 App Store，因此仅使用免费侧载方案。
-
-分发方式 前提条件 有效期 适合阶段
-TrollStore 特定 iOS 版本 永久 开发测试（如设备支持）
-AltStore 任意 iOS 7 天（需重签） 日常开发测试
-SideStore 任意 iOS 7 天（无线刷新） 日常开发测试
-Sideloadly 任意 iOS 7 天 初次安装测试
-
-4.2 免费侧载操作步骤
-
-1. 从 GitHub Actions Artifacts 或 Release 下载 YourApp-unsigned.ipa
-2. 在 iPhone 上安装 AltStore 或 SideStore
-3. 通过 AltStore 导入 IPA 文件完成安装
-4. 应用每 7 天 过期，需在 AltStore 中刷新（SideStore 支持无线自动刷新）
-
-⚠️ 注意：免费侧载方案仅适合个人开发测试，请勿用于对外分发。
-
-5. 开发阶段规划（云端版）
-
-阶段一：环境搭建与技术验证
-
-□ 创建 GitHub 仓库，初始化 Xcode 工程
-□ 配置 ios-build.yml 工作流，验证基础构建通过
-□ 在本地 Windows/Linux 上使用 builder ios build 跑通远程构建
-□ 下载未签名 IPA，通过 AltStore 安装到 iPhone 验证
-□ 在 Mac 上（借用或云 Mac）完成 RIFE Lite 模型转换（Core ML 转换必须在 Mac 上执行一次，之后即可将 .mlpackage 提交到仓库）
-
-阶段二：核心管线开发
-
-□ 实现 Metal 预处理 Shader（BGRA → NCHW）
-□ 实现 Metal 后处理 Shader（Sigmoid / Warp / Blend）
-□ 封装 Core ML 推理接口
-□ 每次推送代码后，通过 GitHub Actions 自动构建并下载 IPA 到真机测试
-
-阶段三：视频流集成
-
-□ 接入 AVAssetReader / AVAssetWriter
-□ 处理时间戳（PTS）管理与音视频同步
-□ 使用 CVPixelBufferPool 优化内存
-□ 实现进度回调与取消功能
-
-阶段四：性能优化与适配
-
-□ 构建异步流水线（解码 / 推理 / 编码并行）
-□ 设备分级：根据芯片动态调整分辨率
-□ 温度监控与自动降级
-□ 内存峰值优化
-
-以下为第 5 章「UI 与用户体验」的细化版，可直接替换原大纲中的阶段 5。本版本按照设计原则 → 信息架构 → 页面详细设计 → 交互与反馈 → 异常处理 → 开发任务拆解的结构展开，适合直接落地为 SwiftUI 代码。
-
----
-
-5. UI 与用户体验（细化版）
-
-5.1 设计原则与视觉风格
-
-核心设计原则：
-
-· 极简优先：用户只需三步（导入 → 选参数 → 导出），避免专业术语（如 RIFE、ANE、光流）。
-· 进度透明：AI 补帧耗时较长，必须让用户随时知道“在做什么”、“还剩多久”。
-· 容错友好：视频格式、内存不足、过热等异常需有清晰的引导，而非直接崩溃。
-· 隐私安全感：明确提示“所有处理均在本地完成，视频不会上传”。
-
-视觉风格建议：
-
-· 风格：深色模式为主（便于预览视频），搭配高对比度强调色（如系统蓝 / 青色）。
-· 字体：使用系统 SF Pro，标题用 .title2 / .headline，正文用 .body / .subheadline。
-· 图标：SF Symbols，保持圆角与统一线宽。
-· 动效：使用 .animation(.easeInOut) 实现页面切换和进度变化，避免过度动画导致性能下降。
-
----
-
-5.2 信息架构与导航设计
-
-页面流转图：
+用户导入视频
+↓
+[AVAssetReader] 解码 → CMSampleBuffer → CVPixelBuffer
+↓
+[解码队列] → [推理队列] → [编码队列]
+↓
+[Metal Shader] 预处理：BGRA → NCHW Float16
+↓
+[Core ML] RIFE Lite 推理 → 输出光流 + 掩码
+↓
+[Metal Shader] 后处理：Sigmoid → Warp → Blend → 生成中间帧
+↓
+[AVAssetWriter] 重新计算 PTS → 编码 → 输出视频
+↓
+保存到相册
 
 ```
-[首页 / 导入]
-    │ 选择视频
-    ▼
-[参数设置] ←──┐
-    │ 确认参数 │ 返回修改
-    ▼         │
-[处理中] ─────┘
-    │ 完成
-    ▼
-[结果预览] ──→ [保存到相册] ──→ [完成 / 再次处理]
-```
 
-导航方式：
+### 3.2 核心模块划分
+1. **视频读取模块**：读取视频元数据、解码、音频轨道分离
+2. **预处理模块（Metal）**：BGRA → NCHW Float16 格式转换、尺寸缩放
+3. **AI 推理模块（Core ML）**：RIFE Lite 推理，输出光流与掩码
+4. **后处理模块（Metal）**：Sigmoid、Warp、Blend 生成中间帧
+5. **视频编码模块**：重新计算 PTS，写入视频，音频透传
+6. **异步流水线调度**：解码、推理、编码三队列并行，带背压机制
+7. **任务调度与 UI**：进度回调、取消操作、错误处理、设备降级
 
-· 使用 NavigationStack 管理主流程。
-· 首页 → 设置：NavigationLink / sheet 弹出。
-· 处理中：全屏覆盖（fullScreenCover），禁止返回手势，防止误操作。
-· 结果页：push 进入，保留返回首页的路径。
+
+## 4. 云端开发环境架构
+
+### 4.1 整体架构
+- 本地开发环境：Windows / Linux，仅需 Git 与代码编辑器
+- 云端构建：GitHub Actions macOS Runner（公共仓库免费）
+- 构建工具：XcodeGen 生成工程，xcodebuild 打包
+- 分发方式：下载未签名 IPA，通过 AltStore / SideStore / TrollStore 侧载
+
+### 4.2 工具选型
+| 工具 | 用途 | 费用 |
+| :--- | :--- | :--- |
+| XcodeGen | 从 project.yml 生成 Xcode 工程 | 免费 |
+| ios-builder (可选) | 简化远程构建与下载 IPA | 免费 |
+| AltStore / SideStore | 未签名 IPA 侧载 | 免费 |
+| TrollStore | 永久安装（特定 iOS 版本） | 免费 |
+
+
+## 5. 开发阶段规划（细化版）
+
+### 5.1 里程碑总览
+| 阶段 | 目标 | 预计周期 | 关键里程碑 |
+| :--- | :--- | :--- | :--- |
+| 阶段 0 | 云端构建与侧载闭环 | 1 周 | 空白 App 可自动构建并侧载 |
+| 阶段 1 | RIFE Lite 模型转换与推理验证 | 1–2 周 | Core ML 模型在 ANE 上跑通 |
+| 阶段 2 | Metal 预处理/后处理与静态图插帧 | 2 周 | 两张图片生成中间帧 |
+| 阶段 3 | 视频流处理管线 | 2–3 周 | 端到端输出高帧率视频 |
+| 阶段 4 | 性能优化与设备适配 | 2 周 | A16 1080p 近实时补帧 |
+| 阶段 5 | UI 与用户体验 | 1–2 周 | 完整可用 App |
+| 阶段 6 | 真机测试与侧载分发 | 1 周 | 发布未签名 IPA Release |
+
+### 5.2 阶段 0：项目启动与云端构建基础设施（1 周）
+**目标**：建立无需 Mac 的完整开发闭环，确保代码推送后能自动产出可侧载的 IPA。
+
+**任务清单**：
+- [ ] 创建 GitHub 仓库，初始化 Xcode 工程（使用 XcodeGen）
+- [ ] 配置 Bundle ID、最低 iOS 16、权限声明
+- [ ] 编写 `.github/workflows/ios-build.yml`：
+  - Checkout 代码
+  - 安装 XcodeGen 并生成工程
+  - 解析 Swift Package 依赖
+  - `xcodebuild archive` 禁用签名
+  - 导出未签名 IPA
+  - 上传 Artifact
+- [ ] 配置 SPM 与 DerivedData 缓存
+- [ ] 配置 tag 触发 GitHub Release，自动上传 IPA
+- [ ] 本地安装 AltStore / SideStore，验证空白 App 可侧载启动
+- [ ] 建立真机日志查看方式
+
+**验收标准**：
+- `git push` 后 GitHub Actions 自动构建成功
+- 产出未签名 IPA，可下载并侧载到 iPhone
+- 空白 App 可正常启动，无崩溃
+- 单次构建时间控制在 20 分钟以内
+
+**交付物**：GitHub 仓库、`ios-build.yml`、空白 App IPA、侧载操作说明。
+
+### 5.3 阶段 1：RIFE Lite 模型转换与 Core ML 推理验证（1–2 周）
+**目标**：获得可在 ANE 上运行的 RIFE Lite Core ML 模型，并验证精度与速度。
+
+**前置依赖**：需要一个 macOS 环境执行一次性转换（可借用 Mac、云 Mac，或使用 GitHub Actions macOS Runner 跑转换脚本）。
+
+**任务清单**：
+- [ ] 选定 RIFE Lite 模型版本
+- [ ] 编写 PyTorch → TorchScript / ONNX → Core ML 转换脚本
+- [ ] 使用 `coremltools` 转换，指定 `mlprogram`、`FLOAT16`
+- [ ] 验证模型输入输出维度
+- [ ] 编写最小 Swift 测试：加载 `.mlpackage`，设置 `computeUnits = .all`
+- [ ] 在不同分辨率下测量 ANE 推理耗时
+- [ ] 将 `.mlpackage` 提交到仓库或使用 Git LFS 管理
+
+**验收标准**：
+- Core ML 模型可正常加载，输出维度正确
+- 推理结果与 PyTorch 参考结果误差在可接受范围
+- A16 设备上 1080p 单次推理 < 50ms
+- ANE 被实际调用，而非回退 CPU
+
+**交付物**：模型转换脚本、`.mlpackage` 文件、推理测试代码、性能测试报告。
+
+### 5.4 阶段 2：Metal 预处理 / 后处理与静态图插帧闭环（2 周）
+**目标**：实现 GPU 上的格式转换与插帧合成，用静态图片验证中间帧生成效果。
+
+**任务清单**：
+- [ ] 编写 Metal Compute Shader：
+  - `bgra_to_nchw`：`CVPixelBuffer` BGRA → Float16 NCHW
+  - `sigmoid_mask`：对掩码执行 Sigmoid
+  - `warp_frame`：根据光流对前后帧做双线性采样
+  - `blend_frames`：按掩码加权混合，生成中间帧
+- [ ] 封装 `FrameInterpolator` 类
+- [ ] 处理模型输入尺寸与视频尺寸不一致的缩放/裁剪策略
+- [ ] 用两张静态图片生成中间帧，保存 PNG 并肉眼验证
+- [ ] 编写性能测试：预处理、推理、后处理各阶段耗时
+
+**验收标准**：
+- 静态图片可生成视觉合理的中间帧，无明显伪影
+- A16 上 1080p 单帧插帧总耗时 < 100ms
+- 无内存泄漏，连续处理 100 张图片稳定
+
+**交付物**：Metal Shader 源码、`FrameInterpolator` 模块、静态图测试用例、性能报告。
+
+### 5.5 阶段 3：视频流处理管线（2–3 周）
+**目标**：打通「解码 → 补帧 → 编码」完整链路，输出可播放的高帧率视频。
+
+**任务清单**：
+- [ ] 读取视频元数据：分辨率、帧率、时长、旋转、音频轨道
+- [ ] 使用 `AVAssetReader` 逐帧解码，输出 `CVPixelBuffer`
+- [ ] 维护前后帧队列，调用 `FrameInterpolator` 生成中间帧
+- [ ] 使用 `AVAssetWriter` + `AVAssetWriterInputPixelBufferAdaptor` 编码
+- [ ] 重新计算 PTS：原 30fps → 60fps，每帧时间间隔减半
+- [ ] 音频轨道透传，保持原始时间戳，确保音画同步
+- [ ] 使用 `CVPixelBufferPool` 复用缓冲区，`autoreleasepool` 包裹每帧处理
+- [ ] 实现进度回调、预计剩余时间、取消机制
+- [ ] 输出到相册或文件 App
+
+**验收标准**：
+- 导入 10 秒 30fps 视频，输出 60fps 视频，可正常播放
+- 音画同步，无明显偏移
+- 1080p 输入下内存峰值 < 500MB
+- 取消处理不崩溃，临时文件被清理
+
+**交付物**：`VideoPipeline` 模块、导出功能、测试视频、PTS 计算工具类。
+
+### 5.6 阶段 4：性能优化与设备适配（2 周）
+**目标**：在不同芯片设备上稳定运行，控制发热与内存，提升处理速度。
+
+**任务清单**：
+- [ ] 构建异步流水线：
+  - 解码队列、推理队列、编码队列并行
+  - 使用有界队列（`BoundedQueue`）实现背压
+- [ ] 设备分级策略：
+  - A16 及以上：1080p / 2x
+  - A14–A15：720p / 2x
+  - A13 及以下：480p / 2x 或快速模式
+- [ ] 热状态监控：`ProcessInfo.thermalState`，过热自动降级
+- [ ] 内存优化：限制在途帧数、复用纹理与缓冲区
+- [ ] 后台处理支持：`beginBackgroundTask`，处理时屏幕常亮
+- [ ] 实现「快速模式」：Metal 简单帧混合，不调用 AI 推理
+- [ ] 使用 `os_signpost` 打点，真机分析各阶段耗时
+
+**验收标准**：
+- A16 上 1080p 2x 补帧速度 ≥ 视频时长的 0.8 倍（近实时）
+- A14 上 720p 2x 补帧速度 ≥ 视频时长的 0.5 倍
+- 连续处理 5 分钟不过热降频崩溃
+- 快速模式可正常输出，速度 ≥ 2 倍实时
+
+**交付物**：性能优化代码、设备分级配置、热监控与降级逻辑、性能测试报告。
+
+### 5.7 阶段 5：UI 与用户体验（1–2 周）
+**目标**：提供完整、易用的 App 界面，覆盖导入、设置、处理、导出全流程。
+
+**任务清单**：
+- [ ] SwiftUI 页面：
+  - 首页：导入视频、最近项目
+  - 设置页：补帧倍数、输出分辨率、快速模式开关
+  - 处理页：视频预览、进度条、剩余时间、取消按钮
+  - 结果页：预览、保存到相册、分享
+- [ ] 权限处理：相册读写、文件访问
+- [ ] 错误提示：解码失败、内存不足、不支持格式
+- [ ] 状态管理：`ObservableObject` / `@Observable`
+- [ ] 中英文本地化（可选）
+- [ ] App 图标与启动屏
+
+**验收标准**：
+- 完整流程：导入 → 设置 → 处理 → 保存，无崩溃
+- 进度实时更新，可取消
+- UI 适配 iPhone 各尺寸，无布局错乱
+- 错误提示清晰，用户可理解
+
+**交付物**：完整 App 界面、图标资源、本地化文件、交互说明。
+
+### 5.8 阶段 6：真机测试与侧载分发（1 周）
+**目标**：在多设备上验证稳定性，发布可侧载的未签名 IPA。
+
+**任务清单**：
+- [ ] 多设备测试：A16 / A15 / A14 / A13，iOS 16 / 17 / 18
+- [ ] 边界测试：4K 视频、慢动作、HDR、旋转视频、无音频视频
+- [ ] 长时间稳定性测试：连续处理多个视频
+- [ ] 修复测试中发现的 bug，优化体验
+- [ ] 编写 README、侧载教程、使用说明
+- [ ] 打 tag，通过 GitHub Release 上传未签名 IPA
+- [ ] 制作演示视频或 GIF（可选）
+
+**验收标准**：
+- 目标设备均可安装并运行
+- 核心功能稳定，无严重崩溃
+- GitHub Release 提供 IPA 与安装说明
+- 侧载教程清晰，新用户可按步骤完成安装
+
+**交付物**：最终未签名 IPA、README、侧载教程、演示素材。
+
+
+## 6. UI 界面详细设计（规格概要）
+
+### 6.1 设计系统
+- **颜色**：深色模式为主，强调色 `#0A84FF`，背景 `#000000`，卡片 `#1C1C1E`
+- **字体**：SF Pro，使用语义化字体（`.title2` / `.headline` / `.body` / `.caption`）
+- **间距**：4 / 8 / 16 / 24 / 32 pt
+- **圆角**：8 / 12 / 16 / 24 pt
+- **图标**：SF Symbols，线宽 regular
+
+### 6.2 页面结构
+1. **首页**：导入卡片 + 最近记录列表
+2. **参数设置页**：视频预览卡片、补帧倍数、输出分辨率、快速模式、预估信息、开始按钮
+3. **处理中页**：环形进度条、状态文案、剩余时间、取消按钮、防息屏提示
+4. **结果预览页**：视频播放器、对比信息、保存/分享按钮、再次处理
+5. **设置页**：通用、性能、存储、关于
+
+### 6.3 通用组件
+- `PrimaryButton`：高度 52pt，圆角 12pt，强调色背景
+- `CardView`：背景 `bgSecondary`，圆角 16pt
+- `SegmentedPicker`：分段控件，高度 36pt
+- `RingProgressView`：环形进度，160pt 外径
+- `ToastView`：顶部滑入，2 秒后消失
+- `EmptyStateView`：空状态插画 + 文案
+
+### 6.4 无障碍与本地化
+- VoiceOver 标签、动态字体、深色模式适配
+- 中英文本地化，使用 `Localizable.strings`
+
+
+## 7. CI/CD 工作流设计
+
+### 7.1 主工作流 `ios-build.yml`
+- **触发**：push 到 main、打 tag `v*`、手动触发
+- **步骤**：
+  1. Checkout 代码
+  2. 安装 XcodeGen
+  3. 注入版本号（从 tag 或 project.yml）
+  4. 缓存 Swift Packages
+  5. 生成 Xcode 工程
+  6. `xcodebuild archive` 禁用签名
+  7. 导出未签名 IPA
+  8. 上传 Artifact
+  9. 若为 tag 或手动发布，创建 GitHub Release 并上传 IPA
+
+### 7.2 版本管理
+- `MARKETING_VERSION`：语义化版本，来自 Git tag
+- `CURRENT_PROJECT_VERSION`：GitHub Actions run number
+- Tag 格式：`v1.0.0`
+
+### 7.3 发布流程
+- 日常迭代：push 到 main，仅构建并保留 Artifact
+- 发布版本：打 tag `v1.0.0`，自动创建 Release 并上传 IPA
+- 手动触发：可选择是否发布 Release
+
+
+## 8. 核心实现要点
+
+### 8.1 模型转换
+- 使用 `coremltools` 转换 RIFE Lite
+- 指定 `mlprogram` 格式，`compute_precision=FLOAT16`
+- 通过 GitHub Actions macOS Runner 一次性完成转换
+
+### 8.2 FrameInterpolator
+- Metal 预处理：BGRA → NCHW Float16
+- Core ML 推理：`computeUnits = .all`，调用 ANE
+- Metal 后处理：Sigmoid → Warp → Blend → 输出 BGRA
+- 支持 `t` 参数，实现 2x / 4x 补帧
+
+### 8.3 VideoPipeline
+- 异步流水线：解码、推理、编码三队列并行
+- 有界队列（`BoundedQueue`）实现背压，控制内存
+- 音频独立线程透传，保持音画同步
+- 4x 补帧采用递归策略（RIFE）
+- 热降级：`ProcessInfo.thermalState` 触发降分辨率或跳过插帧
+- 错误恢复：帧级复制补位、段级跳过插帧、任务级空转降级
+- 长视频分段处理：每段 30 秒，单 Writer 连续写入
+- 性能埋点：`os_signpost` 记录各阶段耗时
+
+### 8.4 设备能力分级
+- 根据芯片型号推荐分辨率与倍数
+- 运行时检测热状态，动态调整模型输入尺寸
+
+
+## 9. 交付物清单
+
+- [ ] GitHub 仓库（包含 `.github/workflows/ios-build.yml`）
+- [ ] Core ML `.mlpackage` 模型文件
+- [ ] Metal Shader 源码
+- [ ] Swift 核心处理管线代码
+- [ ] SwiftUI 界面代码
+- [ ] 未签名 IPA 构建产物（用于侧载）
+- [ ] README、侧载教程、使用说明
+
+
+## 10. 参考资源
+
+- [GitHub Actions 免费 macOS Runner 说明](https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners)
+- [Core ML 官方文档](https://developer.apple.com/documentation/coreml)
+- [RIFE 官方仓库](https://github.com/hzwer/ECCV2022-RIFE)
+- [AltStore 官网](https://altstore.io/)
+- [SideStore 项目](https://github.com/SideStore/SideStore)
+- [TrollStore 项目](https://github.com/opa334/TrollStore)
 
 ---
 
-5.3 页面详细设计
-
-页面 1：首页 / 导入
-
-功能：引导用户导入视频，展示最近处理记录。
-
-UI 元素：
-
-· 顶部：App 名称 + 设置入口（齿轮图标）
-· 中央：大号导入卡片
-  · 图标：photo.on.rectangle.angled
-  · 主文案：「导入视频开始补帧」
-  · 副文案：「支持 30fps → 60fps / 120fps，完全本地处理」
-  · 按钮：「从相册选择」 / 「从文件选择」
-· 底部：最近记录列表（最多 5 条）
-  · 显示缩略图、文件名、处理时间、输出帧率预估
-  · 点击可重新预览或再次处理
-
-空状态：显示引导插画 + 「还没有处理记录，导入一个视频试试吧耗时」。
-
-权限处理：
-
-· 首次点击导入时，请求相册 / 文件访问权限。
-· 被拒绝时，显示「去设置开启权限」按钮，跳转系统设置。
-
----
-
-页面 2：参数设置
-
-功能：让用户选择补帧倍数、输出分辨率、是否开启快速模式。
-
-UI 元素：
-
-· 视频预览卡片：显示视频缩略图、时长、原始帧率
-· 补帧倍数（分段控件 Picker）：
-  · 2x（30fps → 60fps）
-  · 4x（30fps → 120fps，仅 A16 及以上可用）
-· 输出分辨率（分段控件）：
-  · 自动（推荐，根据设备性能动态选择）
-  · 720p（省电、快速）
-  · 1080p（画质优先）
-· 快速模式（Toggle）：
-  · 开启后使用 Metal 帧混合，速度极快但画质略降
-  · 副文案：「适合短视频预览，不适合专业输出」
-· 预估信息卡片：
-  · 「预计耗时：约 2 分钟」
-  · 「预计输出大小：约 45 MB」
-· 底部主按钮：「开始补帧」
-
-交互细节：
-
-· 选择 4x 但设备不支持时，自动禁用并提示「当前设备不支持 4x，请选择 2x」。
-  -根据设备芯片和分辨率动态计算，给用户心理预期。
-
----
-
-页面 3：处理中
-
-功能：展示处理进度，支持取消，防止屏幕休眠。
-
-UI 元素：
-
-· 顶部：视频缩略图 + 文件名
-· 中央：环形进度条（ProgressView / 自定义 Circle）
-  · 显示百分比
-  · 下方显示「已处理 120 / 300 帧」
-· 状态文案：
-  · 「正在解码视频…」
-  · 「AI 正在计算光流…」
-  · 「正在编码输出…」
-· 底部：
-  · 「预计剩余时间：约 1 分 20 秒」
-  · 「取消」按钮（二次确认弹窗）
-  · 提示：「处理期间请保持 App 在前台，锁屏会暂停处理」
-
-交互细节：
-
-· 处理期间调用 UIApplication.shared.isIdleTimerDisabled = true 防止息屏。
-· 取消时弹出确认框：「确定要取消吗？已处理的部分将被丢弃」。
-· 支持后台短暂运行（beginBackgroundTask），切后台超过 30 秒自动暂停并提示。
-
----
-
-页面 4：结果预览与导出
-
-功能：预览补帧后的视频，保存到相册或分享。
-
-UI 元素：
-
-· 视频播放器（AVPlayer + VideoPlayer）：
-  · 支持播放 / 暂停
-  · 显示帧率标识（如「60fps」）
-· 对比信息：
-  · 「原始：30fps / 12.5 MB」
-  · 「补帧后：60fps / 45 MB」
-· 操作按钮：
-  · 「保存到相册」（主按钮）
-  · 「分享」（系统分享面板）
-  · 「再次处理」（返回设置页）
-· 保存成功提示：Toast 或 Alert：「已保存到相册」
-
-交互细节：
-
-· 保存前检查相册权限，被拒绝时引导去设置。
-· 保存成功后自动返回首页，并刷新最近记录。
-· 支持长按视频卡片弹出「删除」「分享」菜单。
-
----
-
-5.4 状态管理与全局反馈
-
-状态 UI 表现 处理方式
-加载中 骨架屏 / 转圈 ProgressView + 文案
-处理中 环形进度条 + 剩余时间 禁止返回，防息屏
-成功 Toast「处理完成」 自动跳转结果页
-失败 Alert + 错误码 提供「重试」或「反馈」
-权限拒绝 引导弹窗 跳转系统设置
-存储不足 Alert 提示清理空间
-设备过热 提示条 建议降分辨率或稍后重试
-
-触觉反馈（Haptic）：
-
-· 开始处理：UIImpactFeedbackGenerator(style: .medium)
-· 处理完成：UINotificationFeedbackGenerator(.success)
-· 错误提示：UINotificationFeedbackGenerator(.error)
-
----
-
-5.5 无障碍与本地化
-
-· VoiceOver：为所有按钮、进度条、视频卡片添加 accessibilityLabel。
-· 动态字体：使用 .dynamicTypeSize 支持系统字体缩放。
-· 深色模式：默认跟随系统，视频预览区使用纯黑背景。
-· 本地化：
-  · 优先支持中文（简体）和英文。
-  · 所有文案使用 Localizable.strings 管理，避免硬编码。
-
----
-
-5.6 开发任务拆解与验收标准
-
-任务清单：
-
-□ 搭建 SwiftUI 工程结构，配置 NavigationStack 与全局主题
-□ 实现首页：导入按钮、最近记录列表、空状态、权限请求
-□ 实现参数设置页：分段控件、Toggle、预估信息卡片
-□ 实现处理页：环形进度条、状态文案、取消确认、防息屏
-□ 实现结果页：AVPlayer 预览、保存相册、分享、再次处理
-□ 封装全局状态管理：ObservableObject / @Observable
-□ 接入触觉反馈与 Toast 提示
-□ 适配深色模式、动态字体、VoiceOver
-□ 中英文本地化（可选）
-□ 真机测试各页面交互与异常处理
-
-验收标准：
-
-· 完整流程（导入 → 设置 → 处理 → 保存）无崩溃、无卡顿
-· 进度实时更新，剩余时间估算误差 < 20%
-· 取消操作响应及时，临时文件被清理
-· 权限拒绝、内存不足、过热等异常均有明确提示
-· 深色模式、动态字体下 UI 无布局错乱
-· 通过 VoiceOver 可完成核心操作
-
-交付物：
-
-· SwiftUI 页面源码
-· 全局状态管理与主题配置
-· 本地化文件
-· UI 验收测试记录
-· 演示视频或截图
-
----
-
-6. CI/CD 工作流进阶配置
-
-6.1 缓存优化
-
-在 GitHub Actions 中缓存 Swift Package 依赖和 DerivedData，可将构建时间缩短 30%–50%：
-
-```yaml
-      - name: Cache Swift Packages
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/Developer/Xcode/DerivedData
-          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
-          restore-keys: |
-            ${{ runner.os }}-spm-
-```
-
-6.2 多设备模拟器测试
-
-```yaml
-    strategy:
-      matrix:
-        destination:
-          - 'platform=iOS Simulator,name=iPhone 16,OS=latest'
-          - 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest'
-    steps:
-      - name: Run Tests
-        run: |
-          xcodebuild test \
-            -project YourApp.xcodeproj \
-            -scheme YourApp \
-            -destination '${{ matrix.destination }}'
-```
-
-6.3 自动发布 Release
-
-```yaml
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: build/YourApp-unsigned.ipa
-```
-
-6.4 关键注意事项
-
-· 版本选择：macos-15 对应最新稳定版 Xcode，macos-26 对应更新的预览版。建议在构建步骤中先运行 xcodebuild -version 确认环境
-
-7. 交付物清单
-
-□ GitHub 仓库（包含 .github/workflows/ios-build.yml）
-□ Core ML .mlpackage 模型文件
-□ Metal Shader 源码
-□ Swift 核心处理管线代码
-□ SwiftUI 界面代码
-□ ios-builder 配置（如使用）
-□ 未签名 IPA 构建产物（用于侧载）
-
-8. 参考资源
-
-· ios-builder — 无 Mac iOS 开发 CLI 工具
-· GitHub Actions 免费 macOS Runner 说明
-· Core ML 官方文档
-· RIFE 官方仓库
-· AltStore 官网
-· SideStore 项目
-· TrollStore 项目
-
----
-
-文档版本：v2.1（云端 CI/CD · 仅侧载版）
-最后更新：2026-10-15
-适用系统：iOS 16.0+
-开发环境：GitHub Actions macOS Runner（无需本地 Mac）
-分发方式：AltStore / SideStore / TrollStore 侧载
-
+**文档版本**：v3.0（完整版）  
+**最后更新**：2026-10-15  
+**适用系统**：iOS 16.0+  
+**开发环境**：GitHub Actions macOS Runner（无需本地 Mac）  
+**分发方式**：AltStore / SideStore / TrollStore 侧载，不上架 App Store
