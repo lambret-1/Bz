@@ -1,0 +1,637 @@
+补全 FrameInterpolator 的 Metal 后处理
+
+这一步把上一版的 postprocess 占位代码替换为真正的 Metal 实现，同时把输入预处理从 CPU 循环迁移到 GPU，让整条推理链路形成 Metal → Core ML → Metal 的零拷贝闭环。
+
+---
+
+1. 明确 RIFE Lite 的输入输出契约
+
+在写 Metal 代码之前，必须先确定模型的实际张量布局。以常见 RIFE Lite Core ML 变体为例：
+
+张量 Shape 含义
+frame0 [1, 3, H, W] 前一帧（RGB，Float16，[0,1]）
+frame1 [1, 3, H, W] 后一帧（RGB，Float16，[0,1]）
+flow [1, 2, H, W] 从 frame0 → frame1 的光流
+mask [1, 1, H, W] 混合掩码（原始 logits，需 Sigmoid）
+
+中间帧合成公式：
+
+```
+t = 0.5
+warped0 = warp(frame0, flow * t)
+warped1 = warp(frame1, -flow * (1 - t))
+maskS = sigmoid(mask)
+output = warped0 * (1 - maskS) + warped1 * maskS
+```
+
+如果你的 RIFE Lite 输出了 4 通道 flow（正向 + 反向），把 flow 拆成 flow01 和 flow10，分别对两帧 warp 即可，整体思路一致。
+
+---
+
+2. 重写 Shaders.metal
+
+把上一版的四个 kernel 替换为下面这五个，全部使用 texture2d 读写，避免 CPU 拷贝。
+
+```metal
+#include <metal_stdlib>
+using namespace metal;
+
+// ============================================================
+// 1. CVPixelBuffer(BGRA) -> NCHW Float16 (归一化到 [0,1])
+//    输入:  texture(BGRA)
+//    输出:  device half* (NCHW)
+// ============================================================
+kernel void bgra_to_nchw(
+    texture2d<float, access::read> src [[texture(0)]],
+    device half *dst [[buffer(0)]],
+    constant uint &width [[buffer(1)]],
+    constant uint &height [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= width || gid.y >= height) return;
+
+    float4 color = src.read(gid);
+    uint pixelIndex = gid.y * width + gid.x;
+    uint plane = width * height;
+
+    dst[0 * plane + pixelIndex] = half(color.r);
+    dst[1 * plane + pixelIndex] = half(color.g);
+    dst[2 * plane + pixelIndex] = half(color.b);
+}
+
+// ============================================================
+// 2. MLMultiArray(logits) -> Sigmoid 后的 mask
+// ============================================================
+kernel void sigmoid_mask(
+    device half *mask [[buffer(0)]],
+    constant uint &count [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= count) return;
+    float v = float(mask[gid]);
+    mask[gid] = half(1.0 / (1.0 + exp(-v)));
+}
+
+// ============================================================
+// 3. 按光流 Warp 一帧
+//    flow: [1,2,H,W] NCHW，通道 0=dx，通道 1=dy
+//    scale: warp 时对光流的缩放（forward 用 t，backward 用 -(1-t)）
+// ============================================================
+kernel void warp_frame(
+    texture2d<float, access::sample> src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    device half *flow [[buffer(0)]],
+    constant uint &width [[buffer(1)]],
+    constant uint &height [[buffer(2)]],
+    constant float &scale [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= width || gid.y >= height) return;
+
+    uint pixelIndex = gid.y * width + gid.x;
+    uint plane = width * height;
+
+    float dx = float(flow[0 * plane + pixelIndex]) * scale;
+    float dy = float(flow[1 * plane + pixelIndex]) * scale;
+
+    // 目标像素位置 + 光流 = 源采样位置
+    float2 sampleCoord = float2(gid) + float2(dx, dy);
+
+    constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
+    float4 color = src.sample(s, sampleCoord);
+    dst.write(color, gid);
+}
+
+// ============================================================
+// 4. 按掩码混合两帧
+// ============================================================
+kernel void blend_frames(
+    texture2d<float, access::read> frame0 [[texture(0)]],
+    texture2d<float, access::read> frame1 [[texture(1)]],
+    texture2d<float, access::write> output [[texture(2)]],
+    device half *mask [[buffer(0)]],
+    constant uint &width [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= width || gid.y >= height) return;
+
+    uint pixelIndex = gid.y * width + gid.x;
+    float m = float(mask[pixelIndex]);
+
+    float4 c0 = frame0.read(gid);
+    float4 c1 = frame1.read(gid);
+
+    output.write(mix(c0, c1, m), gid);
+}
+
+// ============================================================
+// 5. 把 warp 后的帧从 RGBA 写回 BGRA 的 CVPixelBuffer
+//    （如果 warp 输出已经是 BGRA 纹理，可省略此 kernel）
+// ============================================================
+kernel void rgba_to_bgra(
+    texture2d<float, access::read> src [[texture(0)]],
+    texture2d<float, access::write> dst [[texture(1)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    float4 c = src.read(gid);
+    dst.write(float4(c.b, c.g, c.r, 1.0), gid);
+}
+```
+
+warp_frame 和 blend_frames 都按 thread_position_in_grid 处理，一次 dispatch 即可覆盖整帧。
+
+---
+
+3. 新增 MetalComputeHelper.swift
+
+封装一些重复性的 Metal 操作，让 FrameInterpolator 保持整洁。
+
+```swift
+import Metal
+import CoreVideo
+
+final class MetalComputeHelper {
+    static let shared = MetalComputeHelper()
+
+    let device: MTLDevice
+    let commandQueue: MTLCommandQueue
+
+    private init() {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else {
+            fatalError("Metal 初始化失败")
+        }
+        self.device = device
+        self.commandQueue = queue
+    }
+
+    /// 把 CVPixelBuffer(BGRA) 包装为 MTLTexture（零拷贝，依赖 IOSurface）
+    func makeTexture(from pixelBuffer: CVPixelBuffer, usage: MTLTextureUsage = [.shaderRead, .shaderWrite]) -> MTLTexture? {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        var texture: MTLTexture?
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = usage
+        descriptor.storageMode = .shared
+
+        texture = device.makeTexture(descriptor: descriptor)
+        texture?.replace(
+            region: MTLRegionMake2D(0, 0, width, height),
+            mipmapLevel: 0,
+            withBytes: baseAddress,
+            bytesPerRow: bytesPerRow
+        )
+        return texture
+    }
+
+    /// 创建一个空的 RGBA 纹理，用作 Metal 的中间缓冲
+    func makeEmptyTexture(width: Int, height: Int, format: MTLPixelFormat = .rgba16Float) -> MTLTexture? {
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: format,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        descriptor.usage = [.shaderRead, .shaderWrite]
+        descriptor.storageMode = .private
+        return device.makeTexture(descriptor: descriptor)
+    }
+
+    /// 把 MTLTexture 内容拷回 CVPixelBuffer
+    func copy(texture: MTLTexture, to pixelBuffer: CVPixelBuffer) {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+
+        texture.getBytes(
+            baseAddress,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, width, height),
+            mipmapLevel: 0
+        )
+    }
+}
+```
+
+---
+
+4. 重写 FrameInterpolator.swift
+
+```swift
+import CoreML
+import CoreVideo
+import Metal
+import Accelerate
+
+final class FrameInterpolator {
+    // MARK: - Metal
+    private let helper = MetalComputeHelper.shared
+    private let commandQueue: MTLCommandQueue
+    private let preprocessPipeline: MTLComputePipelineState
+    private let sigmoidPipeline: MTLComputePipelineState
+    private let warpPipeline: MTLComputePipelineState
+    private let blendPipeline: MTLComputePipelineState
+    private let rgbaToBgraPipeline: MTLComputePipelineState
+
+    // MARK: - Model
+    private let model: MLModel
+
+    // MARK: - Buffer
+    private let inputWidth: Int
+    private let inputHeight: Int
+    private let flowBuffer: MTLBuffer
+    private let maskBuffer: MTLBuffer
+    private let frame0Buffer: MTLBuffer
+    private let frame1Buffer: MTLBuffer
+
+    // MARK: - PixelBufferPool
+    private let pool: PixelBufferPool
+
+    init?() {
+        // ---- 加载模型 ----
+        guard let modelURL = Bundle.main.url(forResource: "RIFE_Lite", withExtension: "mlmodelc") else {
+            return nil
+        }
+        let config = MLModelConfiguration()
+        config.computeUnits = .all
+        guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
+            return nil
+        }
+        self.model = model
+
+        // ---- Metal 管线 ----
+        guard let queue = helper.device.makeCommandQueue(),
+              let library = helper.device.makeDefaultLibrary(),
+              let pre = library.makeFunction(name: "bgra_to_nchw"),
+              let sig = library.makeFunction(name: "sigmoid_mask"),
+              let warp = library.makeFunction(name: "warp_frame"),
+              let blend = library.makeFunction(name: "blend_frames"),
+              let rgb2bgra = library.makeFunction(name: "rgba_to_bgra") else {
+            return nil
+        }
+        self.commandQueue = queue
+
+        do {
+            self.preprocessPipeline = try helper.device.makeComputePipelineState(function: pre)
+            self.sigmoidPipeline    = try helper.device.makeComputePipelineState(function: sig)
+            self.warpPipeline       = try helper.device.makeComputePipelineState(function: warp)
+            self.blendPipeline      = try helper.device.makeComputePipelineState(function: blend)
+            self.rgbaToBgraPipeline = try helper.device.makeComputePipelineState(function: rgb2bgra)
+        } catch {
+            return nil
+        }
+
+        // ---- 固定输入尺寸 ----
+        self.inputWidth = 512
+        self.inputHeight = 512
+
+        // ---- 预分配 MTLBuffer ----
+        let plane = inputWidth * inputHeight
+        let frameBytes = plane * 3 * MemoryLayout<Float16>.size
+        let flowBytes  = plane * 2 * MemoryLayout<Float16>.size
+        let maskBytes  = plane * 1 * MemoryLayout<Float16>.size
+
+        guard let f0 = helper.device.makeBuffer(length: frameBytes, options: .storageModeShared),
+              let f1 = helper.device.makeBuffer(length: frameBytes, options: .storageModeShared),
+              let fl = helper.device.makeBuffer(length: flowBytes, options: .storageModeShared),
+              let mk = helper.device.makeBuffer(length: maskBytes, options: .storageModeShared) else {
+            return nil
+        }
+        self.frame0Buffer = f0
+        self.frame1Buffer = f1
+        self.flowBuffer   = fl
+        self.maskBuffer   = mk
+
+        // ---- 输出 PixelBufferPool ----
+        self.pool = PixelBufferPool()
+        pool.configure(width: inputWidth, height: inputHeight, format: kCVPixelFormatType_32BGRA)
+    }
+
+    // MARK: - Public
+    /// 输入前后两帧（任意尺寸），输出中间帧（与输入同尺寸）
+    func interpolate(frame0: CVPixelBuffer, frame1: CVPixelBuffer) -> CVPixelBuffer? {
+        let outputWidth = CVPixelBufferGetWidth(frame0)
+        let outputHeight = CVPixelBufferGetHeight(frame0)
+
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return nil }
+
+        // 1) 缩放到 512x512 并转为 BGRA 纹理
+        guard let tex0 = helper.makeTexture(from: frame0),
+              let tex1 = helper.makeTexture(from: frame1) else { return nil }
+
+        // 2) Metal 预处理：BGRA → NCHW Float16
+        encodePreprocess(commandBuffer: commandBuffer, source: tex0, dstBuffer: frame0Buffer)
+        encodePreprocess(commandBuffer: commandBuffer, source: tex1, dstBuffer: frame1Buffer)
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // 3) Core ML 推理
+        guard let prediction = try? model.prediction(from: [
+            "frame0": makeMultiArray(from: frame0Buffer, shape: [1, 3, inputHeight, inputWidth]),
+            "frame1": makeMultiArray(from: frame1Buffer, shape: [1, 3, inputHeight, inputWidth])
+        ]) else { return nil }
+
+        guard let flowArray = prediction.featureValue(for: "flow")?.multiArrayValue,
+              let maskArray = prediction.featureValue(for: "mask")?.multiArrayValue else {
+            return nil
+        }
+
+        // 4) 把 MLMultiArray 拷回 MTLBuffer
+        copyToBuffer(multiArray: flowArray, buffer: flowBuffer)
+        copyToBuffer(multiArray: maskArray, buffer: maskBuffer)
+
+        // 5) Metal 后处理：Sigmoid → Warp 0 → Warp 1 → Blend → RGBA→BGRA
+        guard let output = postprocess(
+            commandBuffer: commandQueue.makeCommandBuffer()!,
+            originalFrame0: tex0,
+            originalFrame1: tex1,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight
+        ) else { return nil }
+
+        return output
+    }
+
+    // MARK: - Encode Preprocess
+    private func encodePreprocess(
+        commandBuffer: MTLCommandBuffer,
+        source: MTLTexture,
+        dstBuffer: MTLBuffer
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(preprocessPipeline)
+        encoder.setTexture(source, index: 0)
+        encoder.setBuffer(dstBuffer, offset: 0, index: 0)
+
+        var width = UInt32(inputWidth)
+        var height = UInt32(inputHeight)
+        encoder.setBytes(&width, length: MemoryLayout<UInt32>.size, index: 1)
+        encoder.setBytes(&height, length: MemoryLayout<UInt32>.size, index: 2)
+
+        let threadGroup = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGrid = MTLSize(
+            width: (inputWidth + 15) / 16,
+            height: (inputHeight + 15) / 16,
+            depth: 1
+        )
+        encoder.dispatchThreadgroups(threadGrid, threadsPerThreadgroup: threadGroup)
+        encoder.endEncoding()
+    }
+
+    // MARK: - Encode Sigmoid
+    private func encodeSigmoid(commandBuffer: MTLCommandBuffer) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(sigmoidPipeline)
+        encoder.setBuffer(maskBuffer, offset: 0, index: 0)
+
+        var count = UInt32(inputWidth * inputHeight)
+        encoder.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 1)
+
+        let threadGroup = MTLSize(width: 256, height: 1, depth: 1)
+        let threadGrid = MTLSize(
+            width: (inputWidth * inputHeight + 255) / 256,
+            height: 1,
+            depth: 1
+        )
+        encoder.dispatchThreadgroups(threadGrid, threadsPerThreadgroup: threadGroup)
+        encoder.endEncoding()
+    }
+
+    // MARK: - Encode Warp
+    private func encodeWarp(
+        commandBuffer: MTLCommandBuffer,
+        source: MTLTexture,
+        destination: MTLTexture,
+        scale: Float
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(warpPipeline)
+        encoder.setTexture(source, index: 0)
+        encoder.setTexture(destination, index: 1)
+        encoder.setBuffer(flowBuffer, offset: 0, index: 0)
+
+        var width = UInt32(inputWidth)
+        var height = UInt32(inputHeight)
+        var s = scale
+        encoder.setBytes(&width, length: MemoryLayout<UInt32>.size, index: 1)
+        encoder.setBytes(&height, length: MemoryLayout<UInt32>.size, index: 2)
+        encoder.setBytes(&s, length: MemoryLayout<Float>.size, index: 3)
+
+        let threadGroup = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGrid = MTLSize(
+            width: (inputWidth + 15) / 16,
+            height: (inputHeight + 15) / 16,
+            depth: 1
+        )
+        encoder.dispatchThreadgroups(threadGrid, threadsPerThreadgroup: threadGroup)
+        encoder.endEncoding()
+    }
+
+    // MARK: - Encode Blend
+    private func encodeBlend(
+        commandBuffer: MTLCommandBuffer=,
+        warped0: MTLTexture,
+        warped1: MTLTexture,
+        output: MTLTexture
+    ) {
+        guard let0 encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(blendPipeline)
+        encoder.setTexture(warped.0, index: 0)
+        encoder.setTexture(warped1, index: 1)
+        encoder.setTexture(output, index: 2)
+5        encoder.setBuffer(maskBuffer, offset: 0, index: 0)
+
+        var width = UInt32(inputWidth)
+        encoder.setBytes(&width, length: MemoryLayout<UInt32>.size, index: 1)
+
+        let threadGroup = MTLSize(width: 16, height: 16, depth: 1)
+        let threadGrid = MTLSize(
+            width: (inputWidth + 15) / 16,
+            height: (inputHeight + 15) / 16,
+            depth: 1
+        )
+        encoder.dispatchThreadgroups(threadGrid, threadsPerThreadgroup: threadGroup)
+        encoder.endEncoding()
+    }
+
+    // MARK: - Postprocess
+    private func postprocess(
+        commandBuffer: MTLCommandBuffer,
+        originalFrame0: MTLTexture,
+        originalFrame1: MTLTexture,
+        outputWidth: Int,
+        outputHeight: Int
+    ) -> CVPixelBuffer? {
+        guard let warped0 = helper.makeEmptyTexture(width: inputWidth, height: inputHeight),
+              let warped1 = helper.makeEmptyTexture(width: inputWidth, height: inputHeight),
+              let blended = helper.makeEmptyTexture(width: inputWidth, height: inputHeight) else {
+            return nil
+        }
+
+        // Sigmoid mask
+        encodeSigmoid(commandBuffer: commandBuffer)
+
+        // Warp：frame0 沿 +flow 走 t=0.5；frame1 沿 -flow 走 t
+        encodeWarp(commandBuffer: commandBuffer, source: originalFrame0, destination: warped0, scale: 0.5)
+        encodeWarp(commandBuffer: commandBuffer, source: originalFrame1, destination: warped1, scale: -0.5)
+
+        // Blend
+        encodeBlend(commandBuffer: commandBuffer, warped0: warped0, warped1: warped1, output: blended)
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        // 输出到 CVPixelBuffer
+        guard let outputBuffer = pool.makeBuffer() else { return nil }
+        helper.copy(texture: blended, to: outputBuffer)
+        return outputBuffer
+    }
+
+    // MARK: - MLMultiArray <-> MTLBuffer
+    private func makeMultiArray(from buffer: MTLBuffer, shape: [NSNumber]) -> MLMultiArray? {
+        guard let array = try? MLMultiArray(shape: shape, dataType: .float16) else { return nil }
+        memcpy(array.dataPointer, buffer.contents(), buffer.length)
+        return array
+    }
+
+    private func copyToBuffer(multiArray: MLMultiArray, buffer: MTLBuffer) {
+        let byteCount = multiArray.count * MemoryLayout<Float16>.size
+        memcpy(buffer.contents(), multiArray.dataPointer, min(byteCount, buffer.length))
+    }
+}
+```
+
+---
+
+5. 修正 PixelBufferPool 的访问控制
+
+把上一版的 private var pool 改为 internal，或提供 makeBuffer() 方法：
+
+```swift
+final class PixelBufferPool {
+    private var pool: CVPixelBufferPool?
+
+    func configure(width: Int, height: Int, format: OSType = kCVPixelFormatType_32BGRA) {
+        let poolAttrs: [String: Any] = [
+            kCVPixelBufferPoolMinimumBufferCountKey as String: 6
+        ]
+        let bufferAttrs: [String: Any] = [
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferPixelFormatTypeKey as String: format,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        CVPixelBufferPoolCreate(nil, poolAttrs as CFDictionary, bufferAttrs as CFDictionary, &pool)
+    }
+
+    func makeBuffer() -> CVPixelBuffer? {
+        guard let pool else { return nil }
+        var buffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+        return buffer
+    }
+}
+```
+
+---
+
+6. 关键正确性检查
+
+6.1 光流方向与 warp scale
+
+RIFE 输出的 flow 通常是从 frame0 到 frame1 的运动。在时间 t = 0.5 处：
+
+帧 warp scale 采样位置
+frame0 +0.5 pixel + flow * 0.5
+frame1 -0.5 pixel - flow * 0.5
+
+如果画面出现“反向运动”或“重影”，先检查这个 scale 的正负号。
+
+6.2 纹理格式
+
+· frame0 / frame1 纹理：.rgba16Float（中间处理）
+· 原始 CVPixelBuffer：.bgra8Unorm
+· 输出 CVPixelBuffer：.bgra8Unorm
+
+不要混用，否则颜色会错位。如果用了 rgba_to_bgra kernel，请确保最后一帧确实执行了它。
+
+6.3 内存布局
+
+· Core ML 输入是 NCHW，通道在内存里是分平面的。
+· bgra_to_nchw kernel 的索引 dst[plane * channelOffset + pixelIndex] 必须与 MLMultiArray 的 shape 一致。
+
+---
+
+7. 性能优化：让后处理走三缓冲
+
+当前每次 interpolate 都会 commit + waitUntilCompleted，这会阻塞流水线。可以改用双 command buffer 乒乓：
+
+```swift
+private var inflightSemaphore = DispatchSemaphore(value: 2)
+
+func interpolateAsync(frame0: CVPixelBuffer, frame1: CVPixelBuffer, completion: @escaping (CVPixelBuffer?) -> Void) {
+    inflightSemaphore.wait()
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let result = self?.interpolate(frame0: frame0, frame1: frame1)
+        self?.inflightSemaphore.signal()
+        DispatchQueue.main.async { completion(result) }
+    }
+}
+```
+
+然后在 VideoPipeline 中，一边解码一边提交推理，用队列削峰，而不是逐帧同步等待。
+
+---
+
+8. 真机验证
+
+1. 推送到 GitHub，等待构建。
+2. 下载 IPA，侧载。
+3. 导入 10 秒 30fps 视频，选择 2x，开始补帧。
+4. 观察输出：
+   · 帧率应为 60fps
+   · 运动场景（挥手、走动）应比原视频更顺滑
+   · 静止场景不应出现抖动或闪烁
+   · 快速运动边缘可能轻微模糊，属正常
+5. 用 QuickTime / VLC 逐帧对比原视频与输出，确认光流方向正确。
+
+---
+
+9. 常见问题排查
+
+现象 可能原因 排查
+输出全黑 rgba_to_bgra 未执行，或纹理格式不匹配 检查 blended 纹理格式与 copy 路径
+画面重影 warp scale 符号反了 把 0.5 与 -0.5 对调试试
+颜色偏色 BGRA/RGBA 通道错位 检查 bgra_to_nchw 的通道顺序
+图像撕裂 光流与 mask 通道错位 检查 flow 是 [dx, dy] 还是 [dy, dx]
+推理精度差 输入未归一化 确认像素值除以 255
+App 崩溃 MTLBuffer 越界 检查 plane 大小与 shape 是否一致
+
+---
+
+10. 下一步预告
+
+Metal 后处理补齐后，你就拥有了完整的端侧 AI 补帧链路。下一步可以：
+
+1. 异步流水线改造：把 VideoPipeline 改成生产者-消费者模型，解码、推理、编码三线程并行，速度提升 2–3 倍。
+2. 音频透传的稳定性修复：处理长视频时音频可能丢帧，需要用 AVAssetReader 独立线程读取。
+3. 支持 4x 补帧：在 2x 输出上再插一帧，或调整 t = 0.25 / 0.5 / 0.75 三次推理。
+4. 设备降级与热监控：A13/A14 自动降到 256x256 模型输入。
+5. 进度细化：把解码 / 推理 / 编码三个阶段的进度分别展示。
