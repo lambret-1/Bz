@@ -97,15 +97,32 @@ struct HomeView: View {
 struct RecentRecordCard: View {
     let record: RecentRecord
 
+    private var thumbnailImage: UIImage? {
+        guard let data = record.thumbnailData else { return nil }
+        return UIImage(data: data)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
-            RoundedRectangle(cornerRadius: DesignTokens.Radius.s)
-                .fill(DesignTokens.Colors.bgTertiary)
-                .frame(width: 160, height: 90)
-                .overlay(
+            ZStack {
+                RoundedRectangle(cornerRadius: DesignTokens.Radius.s)
+                    .fill(DesignTokens.Colors.bgTertiary)
+                    .frame(width: 160, height: 90)
+
+                if let image = thumbnailImage {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: 160, height: 90)
+                        .clipped()
+                        .cornerRadius(DesignTokens.Radius.s)
+                } else {
                     Image(systemName: "video.fill")
                         .foregroundColor(DesignTokens.Colors.textSecondary)
-                )
+                }
+            }
+            .frame(width: 160, height: 90)
+
             Text(record.fileName)
                 .font(.caption)
                 .lineLimit(1)
