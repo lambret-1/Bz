@@ -486,9 +486,56 @@ final class VideoPipeline {
         return dst
     }
 
-    // MARK: - 快速模式：Metal 帧混合（0.5 alpha混合，GPU加速）
+    // MARK: - 快速模式：Metal 帧混合（0.5 alpha混合，GPU加速，失败回退CPU）
     private func blendFrames(_ frame0: CVPixelBuffer, _ frame1: CVPixelBuffer) -> CVPixelBuffer? {
-        return MetalFrameBlender.shared?.blend(frame0: frame0, frame1: frame1, alpha: 0.5)
+        // 优先使用 Metal GPU 混合
+        if let blender = MetalFrameBlender.shared,
+           let result = blender.blend(frame0: frame0, frame1: frame1, alpha: 0.5) {
+            return result
+        }
+
+        // Metal 不可用时回退到 CPU 混合，避免中间帧丢失导致 PTS 空洞
+        logger.error("MetalFrameBlender 不可用，回退到 CPU 帧混合")
+        return cpuBlendFrames(frame0, frame1)
+    }
+
+    // MARK: - CPU 帧混合回退（Metal 不可用时使用）
+    private func cpuBlendFrames(_ frame0: CVPixelBuffer, _ frame1: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(frame0)
+        let height = CVPixelBufferGetHeight(frame0)
+
+        var resultBuffer: CVPixelBuffer?
+        let attrs = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &resultBuffer) == kCVReturnSuccess,
+              let result = resultBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(frame0, .readOnly)
+        CVPixelBufferLockBaseAddress(frame1, .readOnly)
+        CVPixelBufferLockBaseAddress(result, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
+            CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
+            CVPixelBufferUnlockBaseAddress(result, [])
+        }
+
+        let src0 = CVPixelBufferGetBaseAddress(frame0)!.assumingMemoryBound(to: UInt8.self)
+        let src1 = CVPixelBufferGetBaseAddress(frame1)!.assumingMemoryBound(to: UInt8.self)
+        let dst = CVPixelBufferGetBaseAddress(result)!.assumingMemoryBound(to: UInt8.self)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(result)
+        let totalBytes = bytesPerRow * height
+
+        for i in 0..<totalBytes {
+            dst[i] = UInt8((UInt16(src0[i]) + UInt16(src1[i])) / 2)
+        }
+
+        return result
     }
 
     // MARK: - 等待 Writer 就绪（有界背压）
