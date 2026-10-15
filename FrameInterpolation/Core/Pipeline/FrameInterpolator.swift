@@ -18,6 +18,7 @@ final class FrameInterpolator {
     private let warpPipeline: MTLComputePipelineState
     private let blendPipeline: MTLComputePipelineState
     private let rgbaToBgraPipeline: MTLComputePipelineState
+    private let upsampleFlowMaskPipeline: MTLComputePipelineState
 
     // MARK: - Core ML 模型
     private let model: MLModel
@@ -75,7 +76,8 @@ final class FrameInterpolator {
               let sig = library.makeFunction(name: "sigmoid_mask"),
               let warp = library.makeFunction(name: "warp_frame"),
               let blend = library.makeFunction(name: "blend_frames"),
-              let rgb2bgra = library.makeFunction(name: "rgba_to_bgra") else {
+              let rgb2bgra = library.makeFunction(name: "rgba_to_bgra"),
+              let upsample = library.makeFunction(name: "upsample_flow_mask") else {
             logger.error("Metal 函数加载失败")
             return nil
         }
@@ -87,6 +89,7 @@ final class FrameInterpolator {
             self.warpPipeline = try helper.device.makeComputePipelineState(function: warp)
             self.blendPipeline = try helper.device.makeComputePipelineState(function: blend)
             self.rgbaToBgraPipeline = try helper.device.makeComputePipelineState(function: rgb2bgra)
+            self.upsampleFlowMaskPipeline = try helper.device.makeComputePipelineState(function: upsample)
         } catch {
             logger.error("Metal 管线创建失败: \(error.localizedDescription)")
             return nil
@@ -134,9 +137,16 @@ final class FrameInterpolator {
         }
 
         // 2. 创建 Metal 纹理
+        // 512 纹理用于模型预处理
         guard let tex0 = helper.makeTexture(from: resized0),
               let tex1 = helper.makeTexture(from: resized1) else {
             logger.error("创建输入纹理失败")
+            return nil
+        }
+        // 原分辨率纹理用于 warp/blend（避免二次缩放损失）
+        guard let origTex0 = helper.makeTexture(from: frame0, usage: .shaderRead),
+              let origTex1 = helper.makeTexture(from: frame1, usage: .shaderRead) else {
+            logger.error("创建原分辨率纹理失败")
             return nil
         }
 
@@ -197,28 +207,55 @@ final class FrameInterpolator {
             }
         }
 
-        // 6. Metal 后处理：Sigmoid → Warp → Warp → Blend → RGBA→BGRA
+        // 6. Metal 后处理：Sigmoid(512) → 上采样flow/mask到原分辨率 → Warp(原分辨率) → Blend(原分辨率) → RGBA→BGRA
         guard let postprocessBuffer = commandQueue.makeCommandBuffer() else { return nil }
 
-        guard let warped0 = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight),
-              let warped1 = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight),
-              let blended = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight),
-              // outputBGRA 必须用 .shared 存储模式，因为后续需要 CPU getBytes 拷贝到 PixelBuffer
-              let outputBGRA = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight, format: .bgra8Unorm, storageMode: .shared) else {
+        // 创建原分辨率的 flow/mask buffer（上采样目标）
+        let origPlane = originalWidth * originalHeight
+        let origFlowBytes = origPlane * 4 * MemoryLayout<Float16>.size
+        let origMaskBytes = origPlane * 1 * MemoryLayout<Float16>.size
+        guard let origFlowBuffer = helper.device.makeBuffer(length: origFlowBytes, options: .storageModeShared),
+              let origMaskBuffer = helper.device.makeBuffer(length: origMaskBytes, options: .storageModeShared) else {
+            logger.error("创建原分辨率flow/mask buffer失败")
+            return nil
+        }
+
+        // 创建原分辨率后处理纹理
+        guard let warped0 = helper.makeEmptyTexture(width: originalWidth, height: originalHeight),
+              let warped1 = helper.makeEmptyTexture(width: originalWidth, height: originalHeight),
+              let blended = helper.makeEmptyTexture(width: originalWidth, height: originalHeight),
+              let outputBGRA = helper.makeEmptyTexture(width: originalWidth, height: originalHeight, format: .bgra8Unorm, storageMode: .shared) else {
             logger.error("创建后处理纹理失败")
             return nil
         }
 
-        // Sigmoid mask
+        // Sigmoid mask（512空间）
         encodeSigmoid(commandBuffer: postprocessBuffer)
 
-        // Warp：RIFE 输出的光流已是 t=0.5 对应的位移，直接使用无需再乘系数
-        // frame0 用正向光流（前2通道），frame1 用反向光流（后2通道）
-        encodeWarp(commandBuffer: postprocessBuffer, source: tex0, destination: warped0, scale: 1.0, channelOffset: 0)
-        encodeWarp(commandBuffer: postprocessBuffer, source: tex1, destination: warped1, scale: 1.0, channelOffset: 2)
+        // 上采样 flow/mask 到原分辨率，光流值按宽度比缩放
+        let flowScale = Float(originalWidth) / Float(modelInputWidth)
+        encodeUpsampleFlowMask(
+            commandBuffer: postprocessBuffer,
+            srcFlow: flowBuffer, srcMask: maskBuffer,
+            dstFlow: origFlowBuffer, dstMask: origMaskBuffer,
+            srcW: modelInputWidth, srcH: modelInputHeight,
+            dstW: originalWidth, dstH: originalHeight,
+            flowScale: flowScale
+        )
 
-        // Blend
-        encodeBlend(commandBuffer: postprocessBuffer, warped0: warped0, warped1: warped1, output: blended)
+        // Warp：在原分辨率空间用原帧做warp，光流已上采样
+        // frame0 用正向光流（前2通道），frame1 用反向光流（后2通道）
+        encodeWarp(commandBuffer: postprocessBuffer, source: origTex0, destination: warped0,
+                   flowBuffer: origFlowBuffer, width: originalWidth, height: originalHeight,
+                   scale: 1.0, channelOffset: 0)
+        encodeWarp(commandBuffer: postprocessBuffer, source: origTex1, destination: warped1,
+                   flowBuffer: origFlowBuffer, width: originalWidth, height: originalHeight,
+                   scale: 1.0, channelOffset: 2)
+
+        // Blend（原分辨率空间）
+        encodeBlend(commandBuffer: postprocessBuffer, warped0: warped0, warped1: warped1,
+                    output: blended, maskBuffer: origMaskBuffer,
+                    width: originalWidth, height: originalHeight)
 
         // RGBA → BGRA
         encodeRgbaToBgra(commandBuffer: postprocessBuffer, source: blended, destination: outputBGRA)
@@ -226,19 +263,28 @@ final class FrameInterpolator {
         postprocessBuffer.commit()
         postprocessBuffer.waitUntilCompleted()
 
-        // 7. 从纹理拷贝到 PixelBuffer
-        guard let outputBuffer = pool.makeBuffer() else {
-            logger.error("从 PixelBufferPool 获取缓冲区失败")
+        // 7. 从纹理拷贝到 PixelBuffer（原分辨率，无需再缩放）
+        var outputBuffer: CVPixelBuffer?
+        let attrs = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: originalWidth,
+            kCVPixelBufferHeightKey: originalHeight,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        guard CVPixelBufferCreate(kCFAllocatorDefault, originalWidth, originalHeight,
+                                  kCVPixelFormatType_32BGRA, attrs, &outputBuffer) == kCVReturnSuccess,
+              let output = outputBuffer else {
+            logger.error("创建输出PixelBuffer失败")
             return nil
         }
-        helper.copy(texture: outputBGRA, to: outputBuffer)
+        helper.copy(texture: outputBGRA, to: output)
 
         // 首次推理完成后收集完整调试信息并通知 UI
         if !didReportDebug {
             didReportDebug = true
             let maskAfterSigmoid = statsOfFloat16Buffer(maskBuffer, count: modelInputWidth * modelInputHeight)
             let inLum = averageLuminance(of: resized0)
-            let outLum = averageLuminance(of: outputBuffer)
+            let outLum = averageLuminance(of: output)
             let info = """
             输出类型: flow=\(debugDataTypeFlow) mask=\(debugDataTypeMask) (65535=Float16, 65536=Float32)
             光流: [\(String(format: "%.2f", debugFlowMin)), \(String(format: "%.2f", debugFlowMax))] absMean=\(String(format: "%.3f", debugFlowAbsMean))
@@ -250,11 +296,8 @@ final class FrameInterpolator {
             logger.info("调试信息: \(info, privacy: .public)")
         }
 
-        // 8. 缩放到原始尺寸
-        if originalWidth == modelInputWidth && originalHeight == modelInputHeight {
-            return outputBuffer
-        }
-        return resize(pixelBuffer: outputBuffer, width: originalWidth, height: originalHeight)
+        // 8. 直接返回原分辨率输出（光流已上采样，warp/blend在原分辨率完成，无需二次缩放）
+        return output
     }
 
     // MARK: - Metal 编码：预处理
@@ -292,11 +335,47 @@ final class FrameInterpolator {
         encoder.endEncoding()
     }
 
+    // MARK: - Metal 编码：光流+掩码上采样（512→原分辨率）
+    private func encodeUpsampleFlowMask(
+        commandBuffer: MTLCommandBuffer,
+        srcFlow: MTLBuffer,
+        srcMask: MTLBuffer,
+        dstFlow: MTLBuffer,
+        dstMask: MTLBuffer,
+        srcW: Int,
+        srcH: Int,
+        dstW: Int,
+        dstH: Int,
+        flowScale: Float
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(upsampleFlowMaskPipeline)
+        encoder.setBuffer(srcFlow, offset: 0, index: 0)
+        encoder.setBuffer(srcMask, offset: 0, index: 1)
+        encoder.setBuffer(dstFlow, offset: 0, index: 2)
+        encoder.setBuffer(dstMask, offset: 0, index: 3)
+
+        var sw = UInt32(srcW), sh = UInt32(srcH)
+        var dw = UInt32(dstW), dh = UInt32(dstH)
+        var fs = flowScale
+        encoder.setBytes(&sw, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&sh, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&dw, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&dh, length: MemoryLayout<UInt32>.size, index: 7)
+        encoder.setBytes(&fs, length: MemoryLayout<Float>.size, index: 8)
+
+        dispatch2D(encoder: encoder, width: dstW, height: dstH)
+        encoder.endEncoding()
+    }
+
     // MARK: - Metal 编码：Warp
     private func encodeWarp(
         commandBuffer: MTLCommandBuffer,
         source: MTLTexture,
         destination: MTLTexture,
+        flowBuffer: MTLBuffer,
+        width: Int,
+        height: Int,
         scale: Float,
         channelOffset: UInt32
     ) {
@@ -306,16 +385,16 @@ final class FrameInterpolator {
         encoder.setTexture(destination, index: 1)
         encoder.setBuffer(flowBuffer, offset: 0, index: 0)
 
-        var width = UInt32(modelInputWidth)
-        var height = UInt32(modelInputHeight)
+        var w = UInt32(width)
+        var h = UInt32(height)
         var s = scale
         var offset = channelOffset
-        encoder.setBytes(&width, length: MemoryLayout<UInt32>.size, index: 1)
-        encoder.setBytes(&height, length: MemoryLayout<UInt32>.size, index: 2)
+        encoder.setBytes(&w, length: MemoryLayout<UInt32>.size, index: 1)
+        encoder.setBytes(&h, length: MemoryLayout<UInt32>.size, index: 2)
         encoder.setBytes(&s, length: MemoryLayout<Float>.size, index: 3)
         encoder.setBytes(&offset, length: MemoryLayout<UInt32>.size, index: 4)
 
-        dispatch2D(encoder: encoder, width: modelInputWidth, height: modelInputHeight)
+        dispatch2D(encoder: encoder, width: width, height: height)
         encoder.endEncoding()
     }
 
@@ -324,7 +403,10 @@ final class FrameInterpolator {
         commandBuffer: MTLCommandBuffer,
         warped0: MTLTexture,
         warped1: MTLTexture,
-        output: MTLTexture
+        output: MTLTexture,
+        maskBuffer: MTLBuffer,
+        width: Int,
+        height: Int
     ) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(blendPipeline)
@@ -333,12 +415,12 @@ final class FrameInterpolator {
         encoder.setTexture(output, index: 2)
         encoder.setBuffer(maskBuffer, offset: 0, index: 0)
 
-        var width = UInt32(modelInputWidth)
-        var height = UInt32(modelInputHeight)
-        encoder.setBytes(&width, length: MemoryLayout<UInt32>.size, index: 1)
-        encoder.setBytes(&height, length: MemoryLayout<UInt32>.size, index: 2)
+        var w = UInt32(width)
+        var h = UInt32(height)
+        encoder.setBytes(&w, length: MemoryLayout<UInt32>.size, index: 1)
+        encoder.setBytes(&h, length: MemoryLayout<UInt32>.size, index: 2)
 
-        dispatch2D(encoder: encoder, width: modelInputWidth, height: modelInputHeight)
+        dispatch2D(encoder: encoder, width: width, height: height)
         encoder.endEncoding()
     }
 
@@ -353,7 +435,7 @@ final class FrameInterpolator {
         encoder.setTexture(source, index: 0)
         encoder.setTexture(destination, index: 1)
 
-        dispatch2D(encoder: encoder, width: modelInputWidth, height: modelInputHeight)
+        dispatch2D(encoder: encoder, width: source.width, height: source.height)
         encoder.endEncoding()
     }
 
