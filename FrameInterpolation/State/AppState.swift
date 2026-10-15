@@ -1,6 +1,7 @@
 import SwiftUI
 import OSLog
 import AVFoundation
+import UserNotifications
 
 /// 全局应用状态，主线程隔离，统一管理导航、导入、处理、结果与 Toast
 @MainActor
@@ -14,6 +15,8 @@ final class AppState: ObservableObject {
     @Published var showSettings = false
     /// 是否展示处理中页（独立 fullScreenCover）
     @Published var isProcessing = false
+    /// 处理中但用户最小化到首页（管线继续跑，ProcessingView关闭）
+    @Published var isProcessingMinimized = false
 
     // MARK: - 首页
     @Published var recentRecords: [RecentRecord] = []
@@ -205,9 +208,63 @@ final class AppState: ObservableObject {
     func cancelProcessing() {
         pipeline.cancel()
         isProcessing = false
+        isProcessingMinimized = false
         stage = .idle
         progress = 0
         logger.info("处理已取消")
+    }
+
+    // MARK: - 最小化处理页到首页（管线继续跑）
+
+    func minimizeProcessing() {
+        guard isProcessing else { return }
+        isProcessingMinimized = true
+        isProcessing = false
+        logger.info("处理页最小化到首页，管线继续运行")
+    }
+
+    // MARK: - 从首页横幅恢复处理页
+
+    func restoreProcessingView() {
+        guard isProcessingMinimized else { return }
+        isProcessingMinimized = false
+        isProcessing = true
+        logger.info("从首页横幅恢复处理页")
+    }
+
+    // MARK: - 切后台通知
+
+    /// 应用进入后台时调用，处理中则发本地通知提醒用户
+    func applicationDidEnterBackground() {
+        guard isProcessing || isProcessingMinimized else { return }
+        sendBackgroundNotification(
+            title: "补帧处理中",
+            body: "你刚切到后台，处理将继续约30秒，点我回到App继续",
+            identifier: "bz_bg_warning"
+        )
+    }
+
+    /// 后台时间即将耗尽时调用
+    func backgroundTimeExpiring() {
+        guard isProcessing || isProcessingMinimized else { return }
+        sendBackgroundNotification(
+            title: "补帧即将暂停",
+            body: "系统马上要挂起任务，点我回来继续处理",
+            identifier: "bz_bg_expiring"
+        )
+    }
+
+    private func sendBackgroundNotification(title: String, body: String, identifier: String) {
+        let center = UNUserNotificationCenter.current()
+        center.getNotificationSettings { settings in
+            guard settings.authorizationStatus == .authorized else { return }
+            let content = UNMutableNotificationContent()
+            content.title = title
+            content.body = body
+            content.sound = .default
+            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+            center.add(request)
+        }
     }
 
     // MARK: - 重置全部状态（返回首页）
@@ -219,6 +276,7 @@ final class AppState: ObservableObject {
         processingMode = ""
         debugInfo = ""
         isProcessing = false
+        isProcessingMinimized = false
         showSettings = false
         selectedVideo = nil
         stage = .idle
