@@ -33,10 +33,24 @@ final class AppState: ObservableObject {
     @Published var outputURL: URL?
     /// 实际处理模式描述（如 "AI补帧（2x）" 或 "空转管线（帧率不变）"）
     @Published var processingMode: String = ""
+    /// 调试信息（模型输出统计、亮度对比等），显示在结果页
+    @Published var debugInfo: String = ""
 
     // MARK: - Toast
     @Published var toastMessage: String?
     @Published var toastStyle: ToastStyle = .success
+
+    // MARK: - 初始化
+    init() {
+        // 监听 FrameInterpolator 的调试信息更新
+        NotificationCenter.default.addObserver(
+            forName: NSNotification.Name("BzDebugInfoUpdated"),
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            self?.debugInfo = note.object as? String ?? ""
+        }
+    }
 
     // MARK: - 导入视频
 
@@ -140,6 +154,7 @@ final class AppState: ObservableObject {
         pipeline.cancel()
         outputURL = nil
         processingMode = ""
+        debugInfo = ""
         isProcessing = false
         showSettings = false
         selectedVideo = nil
