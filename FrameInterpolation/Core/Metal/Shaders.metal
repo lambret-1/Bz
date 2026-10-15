@@ -110,3 +110,20 @@ kernel void rgba_to_bgra(
     float4 c = src.read(gid);
     dst.write(float4(c.r, c.g, c.b, 1.0), gid);
 }
+
+// ============================================================
+// 6. 简单帧混合（快速模式用）：output = frame0 * alpha + frame1 * (1-alpha)
+//    输入输出均为 BGRA8Unorm，直接在纹理上做混合
+// ============================================================
+kernel void simple_blend(
+    texture2d<float, access::read> frame0 [[texture(0)]],
+    texture2d<float, access::read> frame1 [[texture(1)]],
+    texture2d<float, access::write> output [[texture(2)]],
+    constant float &alpha [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    float4 c0 = frame0.read(gid);
+    float4 c1 = frame1.read(gid);
+    float4 result = c0 * alpha + c1 * (1.0 - alpha);
+    output.write(float4(result.r, result.g, result.b, 1.0), gid);
+}
