@@ -254,8 +254,12 @@ final class VideoPipeline {
             autoreleasepool {
                 // 如果有前一帧且插值器可用，生成中间帧（RIFE分层递归策略）
                 if let prev = previousPixelBuffer, multiplier > 1 {
-                    // 快速模式：偶数对用AI插值，奇数对用简单混合（推理次数减半）
-                    let useAI = !fastMode || (inputFrameIndex % 2 == 0)
+                    // 快速模式：根据运动强度自适应切换AI/blend
+                    // 运动强度 >= 阈值走AI，静态画面走blend节省算力
+                    let motion = fastMode ? estimateMotion(frame0: prev, frame1: pixelBuffer) : 255
+                    let highMotion = motion >= 8.0
+                    // 非快速模式全部走AI；快速模式下高运动走AI
+                    let useAI = !fastMode || highMotion
 
                     if multiplier == 2 {
                         // 2x：单个中间帧 t=0.5
@@ -267,13 +271,11 @@ final class VideoPipeline {
                         }
                     } else if multiplier == 4 {
                         // 4x：RIFE分层递归
-                        // t=0.5: 先算中间帧
-                        let mid05 = useAI
-                            ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
-                            : self.blendFrames(prev, pixelBuffer)
+                        // t=0.5 永远走AI（视觉重心帧，保证质量）
+                        let mid05 = self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
 
                         if let mid05 = mid05 {
-                            // t=0.25: frame0 + mid05
+                            // t=0.25: frame0 + mid05，快速模式低运动走blend
                             let mid025 = useAI
                                 ? self.interpolator?.interpolate(frame0: prev, frame1: mid05)
                                 : self.blendFrames(prev, mid05)
@@ -284,7 +286,7 @@ final class VideoPipeline {
                             // t=0.5
                             writeIntermediateFrame(mid05, source: pixelBuffer)
 
-                            // t=0.75: mid05 + frame1
+                            // t=0.75: mid05 + frame1，快速模式低运动走blend
                             let mid075 = useAI
                                 ? self.interpolator?.interpolate(frame0: mid05, frame1: pixelBuffer)
                                 : self.blendFrames(mid05, pixelBuffer)
@@ -484,6 +486,57 @@ final class VideoPipeline {
         }
 
         return dst
+    }
+
+    // MARK: - 运动强度检测（快速模式自适应切换AI/blend）
+    /// 计算相邻帧平均绝对亮度差，返回值范围约 0~255
+    /// 阈值建议：<8 静态画面走blend，>=8 有运动走AI
+    private func estimateMotion(frame0: CVPixelBuffer, frame1: CVPixelBuffer) -> Float {
+        let width = CVPixelBufferGetWidth(frame0)
+        let height = CVPixelBufferGetHeight(frame0)
+        guard width > 0, height > 0 else { return 255 }
+
+        // 降采样到 64x64 降低计算量
+        let smallW = 64
+        let smallH = 64
+
+        CVPixelBufferLockBaseAddress(frame0, .readOnly)
+        CVPixelBufferLockBaseAddress(frame1, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
+            CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
+        }
+
+        guard let src0 = CVPixelBufferGetBaseAddress(frame0),
+              let src1 = CVPixelBufferGetBaseAddress(frame1) else {
+            return 255
+        }
+
+        let bytesPerRow0 = CVPixelBufferGetBytesPerRow(frame0)
+        let bytesPerRow1 = CVPixelBufferGetBytesPerRow(frame1)
+        let stepX = max(width / smallW, 1)
+        let stepY = max(height / smallH, 1)
+
+        var sum: Int64 = 0
+        var count: Int64 = 0
+
+        for y in stride(from: 0, to: height, by: stepY) {
+            let row0 = src0.assumingMemoryBound(to: UInt8.self).advanced(by: y * bytesPerRow0)
+            let row1 = src1.assumingMemoryBound(to: UInt8.self).advanced(by: y * bytesPerRow1)
+            for x in stride(from: 0, to: width, by: stepX) {
+                // BGRA 格式，取 B/G/R 三通道平均
+                let idx = x * 4
+                let b0 = Int(row0[idx]), g0 = Int(row0[idx+1]), r0 = Int(row0[idx+2])
+                let b1 = Int(row1[idx]), g1 = Int(row1[idx+1]), r1 = Int(row1[idx+2])
+                let lum0 = (r0 * 30 + g0 * 59 + b0 * 11) / 100
+                let lum1 = (r1 * 30 + g1 * 59 + b1 * 11) / 100
+                sum += Int64(abs(lum0 - lum1))
+                count += 1
+            }
+        }
+
+        guard count > 0 else { return 255 }
+        return Float(sum) / Float(count)
     }
 
     // MARK: - 快速模式：Metal 帧混合（0.5 alpha混合，GPU加速，失败回退CPU）
