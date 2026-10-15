@@ -179,12 +179,28 @@ final class VideoPipeline {
         // MARK: 配置 Writer（仅视频，音频后续用 AVAssetExportSession 合成）
         let writer = try AVAssetWriter(outputURL: tempVideoURL, fileType: .mp4)
 
+        // 按分辨率设置H.264码率，避免默认低码率导致油画感模糊
+        let maxDimension = max(outputWidth, outputHeight)
+        let bitRate: Int
+        if maxDimension >= 1920 {
+            bitRate = 20_000_000  // 1080p 20Mbps
+        } else if maxDimension >= 1280 {
+            bitRate = 10_000_000  // 720p 10Mbps
+        } else {
+            bitRate = 5_000_000   // 更低分辨率 5Mbps
+        }
+
         let videoWriterInput = AVAssetWriterInput(
             mediaType: .video,
             outputSettings: [
                 AVVideoCodecKey: AVVideoCodecType.h264,
                 AVVideoWidthKey: outputWidth,
-                AVVideoHeightKey: outputHeight
+                AVVideoHeightKey: outputHeight,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: bitRate,
+                    AVVideoMaxKeyFrameIntervalKey: 60,
+                    AVVideoAllowFrameReorderingKey: false
+                ]
             ]
         )
         videoWriterInput.expectsMediaDataInRealTime = false
