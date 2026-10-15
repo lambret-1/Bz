@@ -142,19 +142,26 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // MARK: 配置独立音频 Reader（nil透传，避免PCM解码内存峰值导致崩溃）
+        // MARK: 配置独立音频 Reader（PCM解码，视频完成后串行转AAC，避免并发内存峰值）
         var audioReader: AVAssetReader?
         var audioReaderOutput: AVAssetReaderTrackOutput?
         if let audioTrack = loadedAudioTrack {
             print("[Bz音频诊断] 音频轨道存在，时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s")
             do {
                 let independentAudioReader = try AVAssetReader(asset: asset)
-                let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                let pcmSettings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsNonInterleaved: false
+                ]
+                let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: pcmSettings)
                 if independentAudioReader.canAdd(audioOutput) {
                     independentAudioReader.add(audioOutput)
                     audioReader = independentAudioReader
                     audioReaderOutput = audioOutput
-                    print("[Bz音频诊断] 独立音频 Reader 创建成功(nil透传)")
+                    print("[Bz音频诊断] 独立音频 Reader 创建成功(PCM解码)")
                 } else {
                     print("[Bz音频诊断] 独立音频 Reader 无法添加 output")
                 }
@@ -193,17 +200,23 @@ final class VideoPipeline {
         }
         writer.add(videoWriterInput)
 
-        // 音频写入（nil透传，跳过canAdd直接add——canAdd对nil settings的audio input可能误返回false）
+        // 音频写入（AAC转码，明确settings避免canAdd误返回false）
         var audioWriterInput: AVAssetWriterInput?
         if audioReaderOutput != nil {
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            let aacSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100.0,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 128000
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aacSettings)
             audioInput.expectsMediaDataInRealTime = false
-            writer.add(audioInput)
-            if writer.status != .failed {
+            if writer.canAdd(audioInput) {
+                writer.add(audioInput)
                 audioWriterInput = audioInput
-                print("[Bz音频诊断] 音频 WriterInput 已添加成功(nil透传)")
+                print("[Bz音频诊断] 音频 WriterInput 已添加(AAC 44100Hz 2ch 128kbps)")
             } else {
-                print("[Bz音频诊断] writer.add(audio)失败，error:\(writer.error?.localizedDescription ?? "nil")")
+                print("[Bz音频诊断] Writer canAdd音频input返回false")
             }
         }
 
@@ -215,20 +228,12 @@ final class VideoPipeline {
         print("[Bz音频诊断] Writer startWriting 返回: \(writerStarted), 状态: \(writer.status.rawValue)")
         writer.startSession(atSourceTime: .zero)
 
-        // MARK: 启动音频独立线程（与视频处理并行）
-        Self.音频诊断结果 = "线程启动中"
-        let audioGroup = DispatchGroup()
-        if let audioReader = audioReader, let audioRO = audioReaderOutput, let audioWI = audioWriterInput {
-            audioGroup.enter()
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                guard let self = self else { audioGroup.leave(); return }
-                self.audioStage(reader: audioReader, output: audioRO, writerInput: audioWI)
-                audioGroup.leave()
-            }
-            print("[Bz音频诊断] 音频独立线程已启动")
+        // 音频处理将在视频完成后串行执行（避免并发内存峰值）
+        if audioReader != nil && audioReaderOutput != nil && audioWriterInput != nil {
+            Self.音频诊断结果 = "等待视频完成后转码音频"
+            print("[Bz音频诊断] 音频将在视频完成后串行处理")
         } else {
             Self.音频诊断结果 = "未启动: reader=\(audioReader != nil) output=\(audioReaderOutput != nil) writer=\(audioWriterInput != nil)"
-            print("[Bz音频诊断] 音频线程未启动: reader=\(audioReader != nil), output=\(audioReaderOutput != nil), writerInput=\(audioWriterInput != nil)")
         }
 
         // MARK: 视频处理循环
@@ -302,12 +307,14 @@ final class VideoPipeline {
         }
 
         videoWriterInput.markAsFinished()
-        print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)，等待音频线程完成...")
+        print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)，开始串行处理音频...")
 
-        // 等待音频线程完成
-        audioGroup.wait()
-        audioWriterInput?.markAsFinished()
-        print("[Bz音频诊断] 音频线程已完成，writer状态: \(writer.status.rawValue)")
+        // 串行处理音频（PCM解码→AAC转码），避免与视频CoreML推理并发导致内存峰值
+        if let audioReader = audioReader, let audioRO = audioReaderOutput, let audioWI = audioWriterInput {
+            self.audioStage(reader: audioReader, output: audioRO, writerInput: audioWI)
+            audioWI.markAsFinished()
+        }
+        print("[Bz音频诊断] 音频处理完成，writer状态: \(writer.status.rawValue)")
 
         // MARK: 完成写入
         let semaphore = DispatchSemaphore(value: 0)
