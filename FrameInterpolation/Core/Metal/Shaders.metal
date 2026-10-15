@@ -62,8 +62,10 @@ kernel void warp_frame(
     float dx = float(flow[(channelOffset + 0) * plane + pixelIndex]) * scale;
     float dy = float(flow[(channelOffset + 1) * plane + pixelIndex]) * scale;
 
-    // 目标像素位置 + 光流 = 源采样位置
-    float2 sampleCoord = float2(gid) + float2(dx, dy);
+    // 采样坐标 = 像素中心(gid+0.5) + 光流位移
+    // 加 0.5 是为了对齐 PyTorch grid_sample align_corners=True 的行为（角点像素中心对齐）
+    // 不加会导致半像素偏移，画面模糊
+    float2 sampleCoord = float2(gid) + float2(0.5) + float2(dx, dy);
 
     constexpr sampler s(coord::pixel, address::clamp_to_edge, filter::linear);
     float4 color = src.sample(s, sampleCoord);
@@ -72,7 +74,7 @@ kernel void warp_frame(
 
 // ============================================================
 // 4. 按掩码混合两帧
-//    output = frame0 * (1 - mask) + frame1 * mask
+//    RIFE 原始公式：warped_img0 * mask + warped_img1 * (1 - mask)
 // ============================================================
 kernel void blend_frames(
     texture2d<float, access::read> frame0 [[texture(0)]],
@@ -80,9 +82,10 @@ kernel void blend_frames(
     texture2d<float, access::write> output [[texture(2)]],
     device half *mask [[buffer(0)]],
     constant uint &width [[buffer(1)]],
+    constant uint &height [[buffer(2)]],
     uint2 gid [[thread_position_in_grid]]
 ) {
-    if (gid.x >= width) return;
+    if (gid.x >= width || gid.y >= height) return;
 
     uint pixelIndex = gid.y * width + gid.x;
     float m = float(mask[pixelIndex]);
@@ -90,7 +93,6 @@ kernel void blend_frames(
     float4 c0 = frame0.read(gid);
     float4 c1 = frame1.read(gid);
 
-    // RIFE 原始公式：warped_img0 * mask + warped_img1 * (1 - mask)
     float4 result = c0 * m + c1 * (1.0 - m);
     output.write(result, gid);
 }
