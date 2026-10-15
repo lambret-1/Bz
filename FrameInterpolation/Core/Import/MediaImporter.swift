@@ -29,17 +29,24 @@ enum MediaImporter {
             )
         }
 
-        // 并发加载帧率、自然尺寸、变换矩阵
+        // 并发加载帧率、自然尺寸、变换矩阵、码率
         async let fps = track.load(.nominalFrameRate)
         async let naturalSize = track.load(.naturalSize)
         async let transform = track.load(.preferredTransform)
+        async let dataRate = track.load(.estimatedDataRate)
 
-        let (resolvedFps, resolvedNaturalSize, resolvedTransform) = try await (fps, naturalSize, transform)
+        let (resolvedFps, resolvedNaturalSize, resolvedTransform, resolvedDataRate) = try await (fps, naturalSize, transform, dataRate)
 
         // 计算显示尺寸（应用旋转变换后）
         let displaySize = resolvedNaturalSize.applying(resolvedTransform)
         let width = Int(abs(displaySize.width))
         let height = Int(abs(displaySize.height))
+
+        // 视频码率（Mbps）
+        let bitRateMbps = resolvedDataRate > 0 ? resolvedDataRate / 1_000_000 : 0
+
+        // 视频编码格式（从 formatDescriptions 解析 codecType）
+        let codecFormat = Self.parseCodecFormat(track: track)
 
         // 文件大小
         let fileSize: Int64
@@ -56,7 +63,7 @@ enum MediaImporter {
 
         let durationSeconds = CMTimeGetSeconds(resolvedDuration)
 
-        logger.info("视频元数据读取完成: 时长\(durationSeconds)s, 帧率\(resolvedFps)fps, 分辨率\(width)x\(height), 大小\(sizeMB)MB")
+        logger.info("视频元数据读取完成: 时长\(durationSeconds)s, 帧率\(resolvedFps)fps, 分辨率\(width)x\(height), 大小\(sizeMB)MB, 码率\(bitRateMbps)Mbps, 编码\(codecFormat)")
 
         return VideoInfo(
             url: url,
@@ -66,8 +73,39 @@ enum MediaImporter {
             originalSizeMB: sizeMB,
             width: width,
             height: height,
+            codecFormat: codecFormat,
+            bitRateMbps: bitRateMbps,
             thumbnail: thumbnail
         )
+    }
+
+    /// 从 AVAssetTrack 的 formatDescriptions 解析视频编码格式
+    private static func parseCodecFormat(track: AVAssetTrack) -> String {
+        guard let formatDescriptions = track.formatDescriptions as? [CMFormatDescription],
+              let first = formatDescriptions.first else {
+            return "未知"
+        }
+        var codecType = CMFormatDescriptionGetMediaSubType(first)
+        let codec = fourCCToString(codecType)
+        // 常见映射
+        switch codec {
+        case "avc1", "AVC1": return "H.264"
+        case "hvc1", "hev1": return "HEVC"
+        case "mp4v": return "MPEG-4"
+        case "jpeg": return "JPEG"
+        case "ap4v": return "Apple ProRes 4444"
+        default: return codec.uppercased()
+        }
+    }
+
+    private static func fourCCToString(_ code: FourCharCode) -> String {
+        let bytes = [
+            UInt8((code >> 24) & 0xFF),
+            UInt8((code >> 16) & 0xFF),
+            UInt8((code >> 8) & 0xFF),
+            UInt8(code & 0xFF)
+        ]
+        return String(bytes: bytes, encoding: .ascii) ?? "未知"
     }
 
     /// 生成视频缩略图（取第 0.5 秒帧）
