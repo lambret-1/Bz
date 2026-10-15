@@ -139,18 +139,36 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // MARK: 配置独立音频 Reader（音频与视频完全隔离，避免共享 reader 导致音频读不到）
+        // MARK: 配置独立音频 Reader（音频与视频完全隔离，PCM解码→AAC转码，避免透传兼容性问题）
         var audioReader: AVAssetReader?
         var audioReaderOutput: AVAssetReaderTrackOutput?
+        var audioSampleRate: Double = 44100.0
+        var audioChannels: Int = 2
         if let audioTrack = loadedAudioTrack {
+            // 读取源音频格式
+            if let formatDesc = audioTrack.formatDescriptions.first as? CMFormatDescription,
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
+                audioSampleRate = asbd.pointee.mSampleRate
+                audioChannels = Int(asbd.pointee.mChannelsPerFrame)
+                print("[Bz音频诊断] 源音频格式: 采样率\(audioSampleRate)Hz, 通道\(audioChannels), 格式ID:\(asbd.pointee.mFormatID)")
+            }
+
             do {
                 let independentAudioReader = try AVAssetReader(asset: asset)
-                let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                // Reader 解码为 PCM（16位整型，小端，交错）
+                let pcmSettings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVLinearPCMBitDepthKey: 16,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsFloatKey: false,
+                    AVLinearPCMIsNonInterleaved: false
+                ]
+                let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: pcmSettings)
                 if independentAudioReader.canAdd(audioOutput) {
                     independentAudioReader.add(audioOutput)
                     audioReader = independentAudioReader
                     audioReaderOutput = audioOutput
-                    print("[Bz音频诊断] 独立音频 Reader 创建成功，音频时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s")
+                    print("[Bz音频诊断] 独立音频 Reader 创建成功(PCM解码)，音频时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s")
                 } else {
                     print("[Bz音频诊断] 独立音频 Reader 无法添加 output")
                 }
@@ -189,15 +207,21 @@ final class VideoPipeline {
         }
         writer.add(videoWriterInput)
 
-        // 音频写入
+        // 音频写入（AAC转码，从源轨道获取采样率和通道数）
         var audioWriterInput: AVAssetWriterInput?
         if audioReaderOutput != nil {
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            let aacSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: audioSampleRate,
+                AVNumberOfChannelsKey: audioChannels,
+                AVEncoderBitRateKey: 128000
+            ]
+            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aacSettings)
             audioInput.expectsMediaDataInRealTime = false
             if writer.canAdd(audioInput) {
                 writer.add(audioInput)
                 audioWriterInput = audioInput
-                print("[Bz音频诊断] 音频 WriterInput 已添加到 Writer")
+                print("[Bz音频诊断] 音频 WriterInput 已添加(AAC \(Int(audioSampleRate))Hz \(audioChannels)ch 128kbps)")
             } else {
                 print("[Bz音频诊断] Writer 无法添加音频 input")
             }
