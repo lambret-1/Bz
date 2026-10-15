@@ -388,7 +388,7 @@ final class VideoPipeline {
 
         let firstPTSStr = firstPTS.map { String(format: "%.3f", CMTimeGetSeconds($0)) } ?? "nil"
         let lastPTSStr = lastPTS.map { String(format: "%.3f", CMTimeGetSeconds($0)) } ?? "nil"
-        let诊断 = "样本\(sampleCount)个 PTS[\(firstPTSStr)~\(lastPTSStr)s] \(appendFailed ? "写入中断" : "正常结束")"
+        let 诊断 = "样本\(sampleCount)个 PTS[\(firstPTSStr)~\(lastPTSStr)s] \(appendFailed ? "写入中断" : "正常结束")"
         print("[Bz音频诊断] 音频线程结束: \(诊断)")
         Self.音频诊断结果 = 诊断
     }
