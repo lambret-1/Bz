@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreVideo
 import OSLog
+import Accelerate
 
 /// 视频处理管线：解码 → 补帧 → 编码 + 音频透传
 /// 支持 2x/4x 补帧，模型缺失时自动降级为空转（帧率不变）
@@ -40,12 +41,14 @@ final class VideoPipeline {
         inputURL: URL,
         outputURL: URL,
         multiplier: Int,
+        fastMode: Bool = false,
+        outputResolution: OutputResolution = .auto,
         progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
         completion: @escaping @MainActor (Result<URL, Error>) -> Void
     ) {
         isCancelled = false
         let effectiveMultiplier = interpolator != nil ? multiplier : 1
-        logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 倍数\(effectiveMultiplier)x")
+        logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 倍数\(effectiveMultiplier)x, 快速模式:\(fastMode), 分辨率:\(outputResolution.rawValue)")
 
         processingQueue.async { [weak self] in
             guard let self = self else { return }
@@ -54,6 +57,8 @@ final class VideoPipeline {
                     inputURL: inputURL,
                     outputURL: outputURL,
                     multiplier: effectiveMultiplier,
+                    fastMode: fastMode,
+                    outputResolution: outputResolution,
                     progress: progress,
                     completion: completion
                 )
@@ -78,6 +83,8 @@ final class VideoPipeline {
         inputURL: URL,
         outputURL: URL,
         multiplier: Int,
+        fastMode: Bool,
+        outputResolution: OutputResolution,
         progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
         completion: @escaping @MainActor (Result<URL, Error>) -> Void
     ) throws {
@@ -112,17 +119,39 @@ final class VideoPipeline {
         let durationSeconds = CMTimeGetSeconds(asset.duration)
         let totalInputFrames = max(Int(durationSeconds * inputFPS), 1)
 
-        // 输出尺寸（编码尺寸，保留原始 transform）
+        // 输出尺寸（根据 outputResolution 缩放）
         let naturalSize = videoTrack.naturalSize
         let transform = videoTrack.preferredTransform
-        let outputWidth = Int(naturalSize.width)
-        let outputHeight = Int(naturalSize.height)
+        var outputWidth = Int(naturalSize.width)
+        var outputHeight = Int(naturalSize.height)
+
+        // 计算目标高度（保持宽高比）
+        let targetHeight: Int?
+        switch outputResolution {
+        case .auto:
+            targetHeight = nil
+        case .p720:
+            targetHeight = 720
+        case .p1080:
+            targetHeight = 1080
+        }
+
+        var needsScaling = false
+        if let targetH = targetHeight, outputHeight > targetH {
+            let scale = Double(targetH) / Double(outputHeight)
+            outputWidth = Int(Double(outputWidth) * scale)
+            outputHeight = targetH
+            // 确保宽高为偶数（H.264 编码要求）
+            outputWidth = outputWidth - (outputWidth % 2)
+            outputHeight = outputHeight - (outputHeight % 2)
+            needsScaling = true
+        }
 
         guard outputWidth > 0, outputHeight > 0 else {
             throw PipelineError.invalidVideoSize
         }
 
-        print("[Bz音频诊断] 输入: \(outputWidth)x\(outputHeight), \(inputFPS)fps, 时长\(durationSeconds)s")
+        print("[Bz音频诊断] 输入: \(Int(naturalSize.width))x\(Int(naturalSize.height)), 输出: \(outputWidth)x\(outputHeight), 缩放:\(needsScaling), 快速模式:\(fastMode)")
         print("[Bz音频诊断] 输出: \(outputFPS)fps, 倍数\(multiplier)x")
 
         // 临时无声视频文件（第一阶段输出）
@@ -214,31 +243,44 @@ final class VideoPipeline {
             autoreleasepool {
                 // 如果有前一帧且插值器可用，生成中间帧
                 if let prev = previousPixelBuffer, let interpolator = self.interpolator, multiplier > 1 {
+                    // 快速模式：偶数对用AI插值，奇数对用简单混合（推理次数减半）
+                    let useAI = !fastMode || (inputFrameIndex % 2 == 0)
+
                     for midIndex in 1..<multiplier {
                         if self.isCancelled { return }
 
-                        // 生成中间帧
-                        if let midFrame = interpolator.interpolate(frame0: prev, frame1: pixelBuffer) {
+                        var midFrame: CVPixelBuffer?
+                        if useAI {
+                            midFrame = interpolator.interpolate(frame0: prev, frame1: pixelBuffer)
+                        } else {
+                            midFrame = self.blendFrames(prev, pixelBuffer)
+                        }
+
+                        if let midFrame = midFrame {
                             self.copyColorSpaceAttachments(from: pixelBuffer, to: midFrame)
+
+                            // 输出分辨率缩放
+                            let finalFrame = needsScaling ? self.scalePixelBuffer(midFrame, to: outputWidth, outputHeight) ?? midFrame : midFrame
 
                             let midPTS = CMTime(
                                 value: Int64(outputFrameIndex),
                                 timescale: Int32(outputFPS)
                             )
                             self.waitForWriterReady(videoWriterInput)
-                            pixelBufferAdaptor.append(midFrame, withPresentationTime: midPTS)
+                            pixelBufferAdaptor.append(finalFrame, withPresentationTime: midPTS)
                             outputFrameIndex += 1
                         }
                     }
                 }
 
-                // 写入当前原始帧
+                // 写入当前原始帧（输出分辨率缩放）
+                let finalFrame = needsScaling ? self.scalePixelBuffer(pixelBuffer, to: outputWidth, outputHeight) ?? pixelBuffer : pixelBuffer
                 let currentPTS = CMTime(
                     value: Int64(outputFrameIndex),
                     timescale: Int32(outputFPS)
                 )
                 self.waitForWriterReady(videoWriterInput)
-                pixelBufferAdaptor.append(pixelBuffer, withPresentationTime: currentPTS)
+                pixelBufferAdaptor.append(finalFrame, withPresentationTime: currentPTS)
                 outputFrameIndex += 1
             }
 
@@ -367,6 +409,88 @@ final class VideoPipeline {
         }
 
         Self.音频诊断结果 = "音频合成成功"
+    }
+
+    // MARK: - vImage 缩放 CVPixelBuffer（输出分辨率控制）
+    private func scalePixelBuffer(_ source: CVPixelBuffer, to width: Int, _ height: Int) -> CVPixelBuffer? {
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+
+        var srcBuffer = vImage_Buffer(
+            data: CVPixelBufferGetBaseAddress(source),
+            height: vImagePixelCount(CVPixelBufferGetHeight(source)),
+            width: vImagePixelCount(CVPixelBufferGetWidth(source)),
+            rowBytes: CVPixelBufferGetBytesPerRow(source)
+        )
+
+        var dstPixelBuffer: CVPixelBuffer?
+        let attrs = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &dstPixelBuffer) == kCVReturnSuccess,
+              let dst = dstPixelBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(dst, [])
+        defer { CVPixelBufferUnlockBaseAddress(dst, []) }
+
+        var dstBuffer = vImage_Buffer(
+            data: CVPixelBufferGetBaseAddress(dst),
+            height: vImagePixelCount(height),
+            width: vImagePixelCount(width),
+            rowBytes: CVPixelBufferGetBytesPerRow(dst)
+        )
+
+        let error = vImageScale_ARGB8888(&srcBuffer, &dstBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
+        guard error == kvImageNoError else {
+            return nil
+        }
+
+        return dst
+    }
+
+    // MARK: - 快速模式：简单帧混合（跳过AI推理，0.5 alpha混合）
+    private func blendFrames(_ frame0: CVPixelBuffer, _ frame1: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(frame0)
+        let height = CVPixelBufferGetHeight(frame0)
+
+        var resultBuffer: CVPixelBuffer?
+        let attrs = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &resultBuffer) == kCVReturnSuccess,
+              let result = resultBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(frame0, .readOnly)
+        CVPixelBufferLockBaseAddress(frame1, .readOnly)
+        CVPixelBufferLockBaseAddress(result, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
+            CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
+            CVPixelBufferUnlockBaseAddress(result, [])
+        }
+
+        let src0 = CVPixelBufferGetBaseAddress(frame0)!.assumingMemoryBound(to: UInt8.self)
+        let src1 = CVPixelBufferGetBaseAddress(frame1)!.assumingMemoryBound(to: UInt8.self)
+        let dst = CVPixelBufferGetBaseAddress(result)!.assumingMemoryBound(to: UInt8.self)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(result)
+        let totalBytes = bytesPerRow * height
+
+        // 0.5 混合：dst = (src0 + src1) / 2
+        for i in 0..<totalBytes {
+            dst[i] = (UInt16(src0[i]) + UInt16(src1[i])) / 2
+        }
+
+        return result
     }
 
     // MARK: - 等待 Writer 就绪（有界背压）

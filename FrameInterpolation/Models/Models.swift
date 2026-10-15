@@ -28,12 +28,20 @@ struct VideoInfo: Identifiable, Equatable {
 }
 
 // MARK: - 最近处理记录
-struct RecentRecord: Identifiable, Equatable {
-    let id = UUID()
+struct RecentRecord: Identifiable, Equatable, Codable {
+    let id: UUID
     let fileName: String
     let outputFPS: Double
     let createdAt: Date
     let thumbnailData: Data?
+
+    init(id: UUID = UUID(), fileName: String, outputFPS: Double, createdAt: Date = Date(), thumbnailData: Data? = nil) {
+        self.id = id
+        self.fileName = fileName
+        self.outputFPS = outputFPS
+        self.createdAt = createdAt
+        self.thumbnailData = thumbnailData
+    }
 }
 
 // MARK: - 补帧倍数
