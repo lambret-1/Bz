@@ -145,13 +145,7 @@ final class VideoPipeline {
         var audioSampleRate: Double = 44100.0
         var audioChannels: Int = 2
         if let audioTrack = loadedAudioTrack {
-            // 读取源音频格式
-            if let formatDesc = audioTrack.formatDescriptions.first as? CMAudioFormatDescription,
-               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-                audioSampleRate = asbd.pointee.mSampleRate
-                audioChannels = Int(asbd.pointee.mChannelsPerFrame)
-                print("[Bz音频诊断] 源音频格式: 采样率\(audioSampleRate)Hz, 通道\(audioChannels), 格式ID:\(asbd.pointee.mFormatID)")
-            }
+            print("[Bz音频诊断] 音频轨道存在，时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s, 自然时间范围: \(audioTrack.timeRange)")
 
             do {
                 let independentAudioReader = try AVAssetReader(asset: asset)
