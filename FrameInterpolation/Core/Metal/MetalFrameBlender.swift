@@ -43,10 +43,23 @@ final class MetalFrameBlender {
             return nil
         }
 
-        // 创建纹理
+        // 创建输入纹理（从 pixelBuffer 上传数据）
         guard let tex0 = helper.makeTexture(from: frame0, usage: .shaderRead),
-              let tex1 = helper.makeTexture(from: frame1, usage: .shaderRead),
-              let texOut = helper.makeTexture(from: output, usage: [.shaderRead, .shaderWrite]) else {
+              let tex1 = helper.makeTexture(from: frame1, usage: .shaderRead) else {
+            return nil
+        }
+
+        // 创建输出纹理：独立的 .shared 纹理，不绑定 output pixelBuffer
+        // 避免 IOSurface 隐式同步导致的间歇性全黑
+        let outDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm,
+            width: width,
+            height: height,
+            mipmapped: false
+        )
+        outDescriptor.usage = [.shaderWrite]
+        outDescriptor.storageMode = .shared
+        guard let texOut = helper.device.makeTexture(descriptor: outDescriptor) else {
             return nil
         }
 
@@ -72,11 +85,33 @@ final class MetalFrameBlender {
         encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
 
+        // 用信号量等待完成，确保 GPU 写入对 CPU 可见
+        let semaphore = DispatchSemaphore(value: 0)
+        commandBuffer.addCompletedHandler { _ in
+            semaphore.signal()
+        }
         commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
+        semaphore.wait()
+
+        guard commandBuffer.status == .completed else {
+            return nil
+        }
 
         // 从输出纹理拷回 pixelBuffer
-        helper.copy(texture: texOut, to: output)
+        CVPixelBufferLockBaseAddress(output, [])
+        defer { CVPixelBufferUnlockBaseAddress(output, []) }
+
+        guard let dstAddr = CVPixelBufferGetBaseAddress(output) else {
+            return nil
+        }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(output)
+
+        texOut.getBytes(
+            dstAddr,
+            bytesPerRow: bytesPerRow,
+            from: MTLRegionMake2D(0, 0, width, height),
+            mipmapLevel: 0
+        )
 
         return output
     }

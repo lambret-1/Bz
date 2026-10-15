@@ -262,48 +262,39 @@ final class VideoPipeline {
                     let useAI = !fastMode || highMotion
 
                     if multiplier == 2 {
-                        // 2x：单个中间帧 t=0.5
+                        // 2x：单个中间帧 t=0.5，失败时用prev深拷贝补位
                         let midFrame = useAI
                             ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
                             : self.blendFrames(prev, pixelBuffer)
-                        if let midFrame = midFrame {
-                            writeIntermediateFrame(midFrame, source: pixelBuffer)
-                        }
+                        writeIntermediateFrame(midFrame ?? self.deepCopyPixelBuffer(prev) ?? prev, source: pixelBuffer)
                     } else if multiplier == 4 {
-                        // 4x：RIFE分层递归
+                        // 4x：RIFE分层递归，每个位置都必须有帧，失败用补位
                         // t=0.5 永远走AI（视觉重心帧，保证质量）
                         let mid05 = self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
+                            ?? self.deepCopyPixelBuffer(prev) ?? prev
 
-                        if let mid05 = mid05 {
-                            // t=0.25: frame0 + mid05，快速模式低运动走blend
-                            let mid025 = useAI
-                                ? self.interpolator?.interpolate(frame0: prev, frame1: mid05)
-                                : self.blendFrames(prev, mid05)
-                            if let mid025 = mid025 {
-                                writeIntermediateFrame(mid025, source: pixelBuffer)
-                            }
+                        // t=0.25: frame0 + mid05，快速模式低运动走blend
+                        let mid025 = useAI
+                            ? self.interpolator?.interpolate(frame0: prev, frame1: mid05)
+                            : self.blendFrames(prev, mid05)
+                        writeIntermediateFrame(mid025 ?? self.deepCopyPixelBuffer(prev) ?? prev, source: pixelBuffer)
 
-                            // t=0.5
-                            writeIntermediateFrame(mid05, source: pixelBuffer)
+                        // t=0.5
+                        writeIntermediateFrame(mid05, source: pixelBuffer)
 
-                            // t=0.75: mid05 + frame1，快速模式低运动走blend
-                            let mid075 = useAI
-                                ? self.interpolator?.interpolate(frame0: mid05, frame1: pixelBuffer)
-                                : self.blendFrames(mid05, pixelBuffer)
-                            if let mid075 = mid075 {
-                                writeIntermediateFrame(mid075, source: pixelBuffer)
-                            }
-                        }
+                        // t=0.75: mid05 + frame1，快速模式低运动走blend
+                        let mid075 = useAI
+                            ? self.interpolator?.interpolate(frame0: mid05, frame1: pixelBuffer)
+                            : self.blendFrames(mid05, pixelBuffer)
+                        writeIntermediateFrame(mid075 ?? self.deepCopyPixelBuffer(pixelBuffer) ?? pixelBuffer, source: pixelBuffer)
                     } else {
-                        // 其他倍数：回退到简单线性插值
+                        // 其他倍数：回退到简单线性插值，每帧都补位
                         for _ in 1..<multiplier {
                             if self.isCancelled { return }
                             let midFrame = useAI
                                 ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
                                 : self.blendFrames(prev, pixelBuffer)
-                            if let midFrame = midFrame {
-                                writeIntermediateFrame(midFrame, source: pixelBuffer)
-                            }
+                            writeIntermediateFrame(midFrame ?? self.deepCopyPixelBuffer(prev) ?? prev, source: pixelBuffer)
                         }
                     }
                 }
@@ -319,7 +310,8 @@ final class VideoPipeline {
                 outputFrameIndex += 1
             }
 
-            previousPixelBuffer = pixelBuffer
+            // Bug2修复：深拷贝前一帧，防止reader复用内存覆盖（alwaysCopiesSampleData=false时）
+            previousPixelBuffer = deepCopyPixelBuffer(pixelBuffer) ?? pixelBuffer
         }
 
         // 检查 reader 最终状态
@@ -444,6 +436,52 @@ final class VideoPipeline {
         }
 
         Self.音频诊断结果 = "音频合成成功"
+    }
+
+    // MARK: - CVPixelBuffer 深拷贝（防止 reader 复用内存覆盖前一帧）
+    private func deepCopyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(source)
+
+        var resultBuffer: CVPixelBuffer?
+        let attrs = [
+            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixelFormat, attrs, &resultBuffer) == kCVReturnSuccess,
+              let result = resultBuffer else {
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(source, .readOnly)
+        CVPixelBufferLockBaseAddress(result, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(source, .readOnly)
+            CVPixelBufferUnlockBaseAddress(result, [])
+        }
+
+        guard let srcAddr = CVPixelBufferGetBaseAddress(source),
+              let dstAddr = CVPixelBufferGetBaseAddress(result) else {
+            return nil
+        }
+
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(result)
+        let bytesPerRow = min(srcBytesPerRow, dstBytesPerRow)
+
+        for row in 0..<height {
+            memcpy(dstAddr.advanced(by: row * dstBytesPerRow),
+                   srcAddr.advanced(by: row * srcBytesPerRow),
+                   bytesPerRow)
+        }
+
+        // 复制颜色空间附件
+        copyColorSpaceAttachments(from: source, to: result)
+
+        return result
     }
 
     // MARK: - vImage 缩放 CVPixelBuffer（输出分辨率控制）
