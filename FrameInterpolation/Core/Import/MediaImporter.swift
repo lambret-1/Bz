@@ -1,6 +1,7 @@
 import AVFoundation
 import UIKit
 import OSLog
+import CoreMedia
 
 /// 媒体导入工具：读取视频真实元数据（时长、帧率、分辨率、文件大小、缩略图）
 enum MediaImporter {
@@ -81,19 +82,16 @@ enum MediaImporter {
 
     /// 从 AVAssetTrack 的 formatDescriptions 解析视频编码格式
     private static func parseCodecFormat(track: AVAssetTrack) -> String {
-        guard let formatDescriptions = track.formatDescriptions as? [CMFormatDescription],
-              let first = formatDescriptions.first else {
+        guard let first = track.formatDescriptions.first as CMFormatDescription? else {
             return "未知"
         }
-        var codecType = CMFormatDescriptionGetMediaSubType(first)
+        let codecType = CMFormatDescriptionGetMediaSubType(first)
         let codec = fourCCToString(codecType)
-        // 常见映射
         switch codec {
         case "avc1", "AVC1": return "H.264"
         case "hvc1", "hev1": return "HEVC"
         case "mp4v": return "MPEG-4"
         case "jpeg": return "JPEG"
-        case "ap4v": return "Apple ProRes 4444"
         default: return codec.uppercased()
         }
     }
