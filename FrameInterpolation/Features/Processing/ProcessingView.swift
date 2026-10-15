@@ -2,13 +2,13 @@ import SwiftUI
 import UIKit
 
 /// 处理中页（独立全屏，禁止手势返回防止误触取消）
-/// 左上角取消按钮 + 防息屏 + 后台任务申请 + 热状态提示
+/// 左上角回首页+取消按钮 + 防息屏 + 热状态提示
+/// 后台任务统一由 AppState 管理，处理全程持有（包括最小化到首页）
 /// 处理完成后自动全屏展示结果页
 struct ProcessingView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @State private var showCancelConfirm = false
-    @State private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
     var body: some View {
         VStack(spacing: DesignTokens.Spacing.l) {
@@ -76,26 +76,12 @@ struct ProcessingView: View {
         .background(DesignTokens.Colors.bgPrimary)
         // 禁止手势返回，防止处理中误触
         .interactiveDismissDisabled()
-        // 防息屏 + 后台任务申请
+        // 防息屏（后台任务由AppState统一管理）
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
-            // 申请后台任务，切后台后继续执行约30秒
-            backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "视频补帧处理") {
-                // 后台时间快用完了，发通知喊用户回来
-                appState.backgroundTimeExpiring()
-                if backgroundTaskID != .invalid {
-                    UIApplication.shared.endBackgroundTask(backgroundTaskID)
-                    backgroundTaskID = .invalid
-                }
-            }
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
-            // 结束后台任务
-            if backgroundTaskID != .invalid {
-                UIApplication.shared.endBackgroundTask(backgroundTaskID)
-                backgroundTaskID = .invalid
-            }
         }
         // 取消确认弹窗
         .confirmationDialog("确定要取消吗？", isPresented: $showCancelConfirm, titleVisibility: .visible) {
