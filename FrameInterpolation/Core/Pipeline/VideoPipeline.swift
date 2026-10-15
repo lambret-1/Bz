@@ -263,7 +263,7 @@ final class VideoPipeline {
                             ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
                             : self.blendFrames(prev, pixelBuffer)
                         if let midFrame = midFrame {
-                            self.writeIntermediateFrame(midFrame, source: pixelBuffer)
+                            writeIntermediateFrame(midFrame, source: pixelBuffer)
                         }
                     } else if multiplier == 4 {
                         // 4x：RIFE分层递归
@@ -278,18 +278,18 @@ final class VideoPipeline {
                                 ? self.interpolator?.interpolate(frame0: prev, frame1: mid05)
                                 : self.blendFrames(prev, mid05)
                             if let mid025 = mid025 {
-                                self.writeIntermediateFrame(mid025, source: pixelBuffer)
+                                writeIntermediateFrame(mid025, source: pixelBuffer)
                             }
 
                             // t=0.5
-                            self.writeIntermediateFrame(mid05, source: pixelBuffer)
+                            writeIntermediateFrame(mid05, source: pixelBuffer)
 
                             // t=0.75: mid05 + frame1
                             let mid075 = useAI
                                 ? self.interpolator?.interpolate(frame0: mid05, frame1: pixelBuffer)
                                 : self.blendFrames(mid05, pixelBuffer)
                             if let mid075 = mid075 {
-                                self.writeIntermediateFrame(mid075, source: pixelBuffer)
+                                writeIntermediateFrame(mid075, source: pixelBuffer)
                             }
                         }
                     } else {
@@ -300,7 +300,7 @@ final class VideoPipeline {
                                 ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
                                 : self.blendFrames(prev, pixelBuffer)
                             if let midFrame = midFrame {
-                                self.writeIntermediateFrame(midFrame, source: pixelBuffer)
+                                writeIntermediateFrame(midFrame, source: pixelBuffer)
                             }
                         }
                     }
