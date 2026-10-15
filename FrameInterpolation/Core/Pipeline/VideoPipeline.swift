@@ -193,17 +193,17 @@ final class VideoPipeline {
         }
         writer.add(videoWriterInput)
 
-        // 音频写入（AAC转码，从源轨道获取采样率和通道数）
+        // 音频写入（nil透传，跳过canAdd直接add——canAdd对nil settings的audio input可能误返回false）
         var audioWriterInput: AVAssetWriterInput?
         if audioReaderOutput != nil {
             let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
             audioInput.expectsMediaDataInRealTime = false
-            if writer.canAdd(audioInput) {
-                writer.add(audioInput)
+            let added = writer.add(audioInput)
+            if added {
                 audioWriterInput = audioInput
-                print("[Bz音频诊断] 音频 WriterInput 已添加(nil透传)")
+                print("[Bz音频诊断] 音频 WriterInput 已添加成功(nil透传)")
             } else {
-                print("[Bz音频诊断] Writer 无法添加音频 input")
+                print("[Bz音频诊断] writer.add(audio)返回false，writer状态:\(writer.status.rawValue) error:\(writer.error?.localizedDescription ?? "nil")")
             }
         }
 
