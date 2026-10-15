@@ -157,7 +157,8 @@ final class FrameInterpolator {
         guard let warped0 = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight),
               let warped1 = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight),
               let blended = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight),
-              let outputBGRA = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight, format: .bgra8Unorm) else {
+              // outputBGRA 必须用 .shared 存储模式，因为后续需要 CPU getBytes 拷贝到 PixelBuffer
+              let outputBGRA = helper.makeEmptyTexture(width: modelInputWidth, height: modelInputHeight, format: .bgra8Unorm, storageMode: .shared) else {
             logger.error("创建后处理纹理失败")
             return nil
         }
