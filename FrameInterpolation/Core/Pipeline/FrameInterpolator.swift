@@ -271,7 +271,9 @@ final class FrameInterpolator {
         encoder.setBuffer(maskBuffer, offset: 0, index: 0)
 
         var width = UInt32(modelInputWidth)
+        var height = UInt32(modelInputHeight)
         encoder.setBytes(&width, length: MemoryLayout<UInt32>.size, index: 1)
+        encoder.setBytes(&height, length: MemoryLayout<UInt32>.size, index: 2)
 
         dispatch2D(encoder: encoder, width: modelInputWidth, height: modelInputHeight)
         encoder.endEncoding()
