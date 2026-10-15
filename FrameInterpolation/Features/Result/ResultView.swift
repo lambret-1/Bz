@@ -54,6 +54,16 @@ struct ResultView: View {
                                             .fixedSize(horizontal: false, vertical: true)
                                     }
                                 }
+                                Divider()
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("音频诊断")
+                                        .font(.subheadline)
+                                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                                    Text(VideoPipeline.音频诊断结果)
+                                        .font(.caption.monospaced())
+                                        .foregroundColor(DesignTokens.Colors.textPrimary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
                             }
                         }
                     }
