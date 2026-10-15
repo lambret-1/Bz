@@ -81,7 +81,8 @@ enum MediaImporter {
 
     /// 从 AVAssetTrack 的 formatDescriptions 解析视频编码格式
     private static func parseCodecFormat(track: AVAssetTrack) -> String {
-        guard let first = track.formatDescriptions.first as CMFormatDescription? else {
+        guard let descriptions = track.formatDescriptions as? [CMFormatDescription],
+              let first = descriptions.first else {
             return "未知"
         }
         let codecType = CMFormatDescriptionGetMediaSubType(first)
