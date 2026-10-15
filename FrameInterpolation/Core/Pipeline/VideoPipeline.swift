@@ -125,6 +125,11 @@ final class VideoPipeline {
         print("[Bz音频诊断] 输入: \(outputWidth)x\(outputHeight), \(inputFPS)fps, 时长\(durationSeconds)s")
         print("[Bz音频诊断] 输出: \(outputFPS)fps, 倍数\(multiplier)x")
 
+        // 临时无声视频文件（第一阶段输出）
+        let tempVideoURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("mp4")
+
         // 删除已存在的输出文件
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try? FileManager.default.removeItem(at: outputURL)
@@ -142,38 +147,8 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // MARK: 配置独立音频 Reader（PCM解码，视频完成后串行转AAC，避免并发内存峰值）
-        var audioReader: AVAssetReader?
-        var audioReaderOutput: AVAssetReaderTrackOutput?
-        if let audioTrack = loadedAudioTrack {
-            print("[Bz音频诊断] 音频轨道存在，时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s")
-            do {
-                let independentAudioReader = try AVAssetReader(asset: asset)
-                let pcmSettings: [String: Any] = [
-                    AVFormatIDKey: kAudioFormatLinearPCM,
-                    AVLinearPCMBitDepthKey: 16,
-                    AVLinearPCMIsBigEndianKey: false,
-                    AVLinearPCMIsFloatKey: false,
-                    AVLinearPCMIsNonInterleaved: false
-                ]
-                let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: pcmSettings)
-                if independentAudioReader.canAdd(audioOutput) {
-                    independentAudioReader.add(audioOutput)
-                    audioReader = independentAudioReader
-                    audioReaderOutput = audioOutput
-                    print("[Bz音频诊断] 独立音频 Reader 创建成功(PCM解码)")
-                } else {
-                    print("[Bz音频诊断] 独立音频 Reader 无法添加 output")
-                }
-            } catch {
-                print("[Bz音频诊断] 独立音频 Reader 创建失败: \(error.localizedDescription)")
-            }
-        } else {
-            print("[Bz音频诊断] 无音频轨道，输出将无音频")
-        }
-
-        // MARK: 配置 Writer
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+        // MARK: 配置 Writer（仅视频，音频后续用 AVAssetExportSession 合成）
+        let writer = try AVAssetWriter(outputURL: tempVideoURL, fileType: .mp4)
 
         let videoWriterInput = AVAssetWriterInput(
             mediaType: .video,
@@ -200,41 +175,13 @@ final class VideoPipeline {
         }
         writer.add(videoWriterInput)
 
-        // 音频写入（AAC转码，明确settings避免canAdd误返回false）
-        var audioWriterInput: AVAssetWriterInput?
-        if audioReaderOutput != nil {
-            let aacSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 44100.0,
-                AVNumberOfChannelsKey: 2,
-                AVEncoderBitRateKey: 128000
-            ]
-            let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: aacSettings)
-            audioInput.expectsMediaDataInRealTime = false
-            if writer.canAdd(audioInput) {
-                writer.add(audioInput)
-                audioWriterInput = audioInput
-                print("[Bz音频诊断] 音频 WriterInput 已添加(AAC 44100Hz 2ch 128kbps)")
-            } else {
-                print("[Bz音频诊断] Writer canAdd音频input返回false")
-            }
-        }
-
         // MARK: 启动读写
         guard reader.startReading() else {
             throw PipelineError.readerStartFailed(reader.error ?? PipelineError.unknown)
         }
-        let writerStarted = writer.startWriting()
-        print("[Bz音频诊断] Writer startWriting 返回: \(writerStarted), 状态: \(writer.status.rawValue)")
+        writer.startWriting()
         writer.startSession(atSourceTime: .zero)
-
-        // 音频处理将在视频完成后串行执行（避免并发内存峰值）
-        if audioReader != nil && audioReaderOutput != nil && audioWriterInput != nil {
-            Self.音频诊断结果 = "等待视频完成后转码音频"
-            print("[Bz音频诊断] 音频将在视频完成后串行处理")
-        } else {
-            Self.音频诊断结果 = "未启动: reader=\(audioReader != nil) output=\(audioReaderOutput != nil) writer=\(audioWriterInput != nil)"
-        }
+        Self.音频诊断结果 = "视频处理中，后续合成音频"
 
         // MARK: 视频处理循环
         var outputFrameIndex = 0
@@ -307,97 +254,119 @@ final class VideoPipeline {
         }
 
         videoWriterInput.markAsFinished()
-        print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)，开始串行处理音频...")
+        print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)")
 
-        // 串行处理音频（PCM解码→AAC转码），避免与视频CoreML推理并发导致内存峰值
-        if let audioReader = audioReader, let audioRO = audioReaderOutput, let audioWI = audioWriterInput {
-            self.audioStage(reader: audioReader, output: audioRO, writerInput: audioWI)
-            audioWI.markAsFinished()
-        }
-        print("[Bz音频诊断] 音频处理完成，writer状态: \(writer.status.rawValue)")
-
-        // MARK: 完成写入
+        // MARK: 完成视频写入
         let semaphore = DispatchSemaphore(value: 0)
         writer.finishWriting {
             semaphore.signal()
         }
         semaphore.wait()
 
-        if writer.status == .completed {
-            logger.info("视频编码完成: \(outputURL.lastPathComponent, privacy: .public)")
-            Task { @MainActor in
-                progress(1.0, .finished)
-                completion(.success(outputURL))
-            }
-        } else {
+        guard writer.status == .completed else {
             let error = writer.error ?? PipelineError.writerFailed
             logger.error("视频编码失败: \(error.localizedDescription, privacy: .public)")
+            try? FileManager.default.removeItem(at: tempVideoURL)
             throw error
+        }
+
+        // MARK: 第二阶段：用 AVAssetExportSession 合成原视频音频
+        if loadedAudioTrack != nil {
+            Self.音频诊断结果 = "合成音频中..."
+            print("[Bz音频诊断] 开始合成原视频音频")
+            try self.muxAudio(
+                videoURL: tempVideoURL,
+                sourceAsset: asset,
+                outputURL: outputURL
+            )
+            print("[Bz音频诊断] 音频合成完成")
+        } else {
+            // 无音频轨道，直接移动临时文件到输出位置
+            try? FileManager.default.removeItem(at: outputURL)
+            try FileManager.default.moveItem(at: tempVideoURL, to: outputURL)
+            Self.音频诊断结果 = "原视频无音频轨道"
+            print("[Bz音频诊断] 原视频无音频，直接输出无声视频")
+        }
+
+        // 清理临时文件
+        try? FileManager.default.removeItem(at: tempVideoURL)
+
+        Task { @MainActor in
+            progress(1.0, .finished)
+            completion(.success(outputURL))
         }
     }
 
-    // MARK: - 音频独立线程（独立 Reader，连续读取写入，健壮错误处理）
-    private func audioStage(reader: AVAssetReader, output: AVAssetReaderTrackOutput, writerInput: AVAssetWriterInput) {
-        guard reader.startReading() else {
-            print("[Bz音频诊断] 音频 Reader startReading 失败: \(reader.error?.localizedDescription ?? "unknown")")
-            Self.音频诊断结果 = "Reader启动失败"
-            return
+    // MARK: - 合成音频（AVMutableComposition + AVAssetExportSession）
+    private func muxAudio(videoURL: URL, sourceAsset: AVAsset, outputURL: URL) throws {
+        let videoAsset = AVURLAsset(url: videoURL)
+        let composition = AVMutableComposition()
+
+        // 视频轨道
+        guard let videoTrack = composition.addMutableTrack(
+            withMediaType: .video,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            Self.音频诊断结果 = "合成失败：无法创建视频轨道"
+            throw PipelineError.writerConfigurationFailed
         }
-        print("[Bz音频诊断] 音频 Reader 已启动，开始读取写入")
+        guard let sourceVideoTrack = videoAsset.tracks(withMediaType: .video).first else {
+            Self.音频诊断结果 = "合成失败：临时视频无视频轨道"
+            throw PipelineError.noVideoTrack
+        }
+        try videoTrack.insertTimeRange(
+            CMTimeRange(start: .zero, duration: videoAsset.duration),
+            of: sourceVideoTrack,
+            at: .zero
+        )
+        videoTrack.preferredTransform = sourceVideoTrack.preferredTransform
 
-        var sampleCount = 0
-        var firstPTS: CMTime?
-        var lastPTS: CMTime?
-        var appendFailed = false
+        // 音频轨道（从原视频复制）
+        guard let sourceAudioTrack = sourceAsset.tracks(withMediaType: .audio).first else {
+            Self.音频诊断结果 = "合成失败：原视频无音频轨道"
+            throw PipelineError.writerConfigurationFailed
+        }
+        guard let audioTrack = composition.addMutableTrack(
+            withMediaType: .audio,
+            preferredTrackID: kCMPersistentTrackID_Invalid
+        ) else {
+            Self.音频诊断结果 = "合成失败：无法创建音频轨道"
+            throw PipelineError.writerConfigurationFailed
+        }
+        try audioTrack.insertTimeRange(
+            CMTimeRange(start: .zero, duration: sourceAsset.duration),
+            of: sourceAudioTrack,
+            at: .zero
+        )
 
-        while reader.status == .reading && !appendFailed {
-            if isCancelled {
-                reader.cancelReading()
-                break
-            }
-
-            guard let sampleBuffer = output.copyNextSampleBuffer() else {
-                break
-            }
-
-            // 记录 PTS
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            if firstPTS == nil { firstPTS = pts }
-            lastPTS = pts
-
-            // 等待 writer 就绪（有界超时，避免死等）
-            var waitCount = 0
-            while !writerInput.isReadyForMoreMediaData {
-                if isCancelled { reader.cancelReading(); return }
-                Thread.sleep(forTimeInterval: 0.005)
-                waitCount += 1
-                if waitCount > 1200 { // 6秒超时
-                    print("[Bz音频诊断] 音频 Writer 6秒未就绪，强制退出")
-                    appendFailed = true
-                    break
-                }
-            }
-            if appendFailed { break }
-
-            autoreleasepool {
-                if writerInput.append(sampleBuffer) {
-                    sampleCount += 1
-                } else {
-                    print("[Bz音频诊断] 音频 append 失败，已写入\(sampleCount)个，停止音频写入")
-                    appendFailed = true
-                }
-            }
+        // 导出
+        guard let exportSession = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetPassthrough
+        ) else {
+            Self.音频诊断结果 = "合成失败：无法创建ExportSession"
+            throw PipelineError.writerConfigurationFailed
         }
 
-        if reader.status == .failed {
-            print("[Bz音频诊断] 音频 Reader 失败: \(reader.error?.localizedDescription ?? "unknown")")
+        try? FileManager.default.removeItem(at: outputURL)
+        exportSession.outputURL = outputURL
+        exportSession.outputFileType = .mp4
+        exportSession.shouldOptimizeForNetworkUse = true
+
+        let exportSemaphore = DispatchSemaphore(value: 0)
+        exportSession.exportAsynchronously {
+            exportSemaphore.signal()
+        }
+        exportSemaphore.wait()
+
+        if exportSession.status != .completed {
+            let error = exportSession.error ?? PipelineError.writerFailed
+            Self.音频诊断结果 = "合成失败：\(error.localizedDescription)"
+            print("[Bz音频诊断] 音频合成失败: \(error.localizedDescription)")
+            throw error
         }
 
-        let firstPTSStr = firstPTS.map { String(format: "%.3f", CMTimeGetSeconds($0)) } ?? "nil"
-        let lastPTSStr = lastPTS.map { String(format: "%.3f", CMTimeGetSeconds($0)) } ?? "nil"
-        let 诊断 = "样本\(sampleCount)个 PTS[\(firstPTSStr)~\(lastPTSStr)s] \(appendFailed ? "写入中断" : "正常结束")"
-        print("[Bz音频诊断] 音频线程结束: \(诊断)")
-        Self.音频诊断结果 = 诊断
+        Self.音频诊断结果 = "音频合成成功"
     }
 
     // MARK: - 等待 Writer 就绪（有界背压）
