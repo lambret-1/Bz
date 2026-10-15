@@ -217,6 +217,17 @@ final class VideoPipeline {
         var previousPixelBuffer: CVPixelBuffer?
         var lastProgressReport = 0.0
 
+        // 局部函数：写入中间帧（复制颜色空间+缩放+写入Writer）
+        func writeIntermediateFrame(_ frame: CVPixelBuffer, source: CVPixelBuffer) {
+            if isCancelled { return }
+            copyColorSpaceAttachments(from: source, to: frame)
+            let finalFrame = needsScaling ? scalePixelBuffer(frame, to: outputWidth, outputHeight) ?? frame : frame
+            let midPTS = CMTime(value: Int64(outputFrameIndex), timescale: Int32(outputFPS))
+            waitForWriterReady(videoWriterInput)
+            pixelBufferAdaptor.append(finalFrame, withPresentationTime: midPTS)
+            outputFrameIndex += 1
+        }
+
         while reader.status == .reading {
             if isCancelled {
                 reader.cancelReading()
@@ -241,34 +252,56 @@ final class VideoPipeline {
             }
 
             autoreleasepool {
-                // 如果有前一帧且插值器可用，生成中间帧
-                if let prev = previousPixelBuffer, let interpolator = self.interpolator, multiplier > 1 {
+                // 如果有前一帧且插值器可用，生成中间帧（RIFE分层递归策略）
+                if let prev = previousPixelBuffer, multiplier > 1 {
                     // 快速模式：偶数对用AI插值，奇数对用简单混合（推理次数减半）
                     let useAI = !fastMode || (inputFrameIndex % 2 == 0)
 
-                    for midIndex in 1..<multiplier {
-                        if self.isCancelled { return }
-
-                        var midFrame: CVPixelBuffer?
-                        if useAI {
-                            midFrame = interpolator.interpolate(frame0: prev, frame1: pixelBuffer)
-                        } else {
-                            midFrame = self.blendFrames(prev, pixelBuffer)
-                        }
-
+                    if multiplier == 2 {
+                        // 2x：单个中间帧 t=0.5
+                        let midFrame = useAI
+                            ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
+                            : self.blendFrames(prev, pixelBuffer)
                         if let midFrame = midFrame {
-                            self.copyColorSpaceAttachments(from: pixelBuffer, to: midFrame)
+                            self.writeIntermediateFrame(midFrame, source: pixelBuffer)
+                        }
+                    } else if multiplier == 4 {
+                        // 4x：RIFE分层递归
+                        // t=0.5: 先算中间帧
+                        let mid05 = useAI
+                            ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
+                            : self.blendFrames(prev, pixelBuffer)
 
-                            // 输出分辨率缩放
-                            let finalFrame = needsScaling ? self.scalePixelBuffer(midFrame, to: outputWidth, outputHeight) ?? midFrame : midFrame
+                        if let mid05 = mid05 {
+                            // t=0.25: frame0 + mid05
+                            let mid025 = useAI
+                                ? self.interpolator?.interpolate(frame0: prev, frame1: mid05)
+                                : self.blendFrames(prev, mid05)
+                            if let mid025 = mid025 {
+                                self.writeIntermediateFrame(mid025, source: pixelBuffer)
+                            }
 
-                            let midPTS = CMTime(
-                                value: Int64(outputFrameIndex),
-                                timescale: Int32(outputFPS)
-                            )
-                            self.waitForWriterReady(videoWriterInput)
-                            pixelBufferAdaptor.append(finalFrame, withPresentationTime: midPTS)
-                            outputFrameIndex += 1
+                            // t=0.5
+                            self.writeIntermediateFrame(mid05, source: pixelBuffer)
+
+                            // t=0.75: mid05 + frame1
+                            let mid075 = useAI
+                                ? self.interpolator?.interpolate(frame0: mid05, frame1: pixelBuffer)
+                                : self.blendFrames(mid05, pixelBuffer)
+                            if let mid075 = mid075 {
+                                self.writeIntermediateFrame(mid075, source: pixelBuffer)
+                            }
+                        }
+                    } else {
+                        // 其他倍数：回退到简单线性插值
+                        for _ in 1..<multiplier {
+                            if self.isCancelled { return }
+                            let midFrame = useAI
+                                ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
+                                : self.blendFrames(prev, pixelBuffer)
+                            if let midFrame = midFrame {
+                                self.writeIntermediateFrame(midFrame, source: pixelBuffer)
+                            }
                         }
                     }
                 }
@@ -453,44 +486,9 @@ final class VideoPipeline {
         return dst
     }
 
-    // MARK: - 快速模式：简单帧混合（跳过AI推理，0.5 alpha混合）
+    // MARK: - 快速模式：Metal 帧混合（0.5 alpha混合，GPU加速）
     private func blendFrames(_ frame0: CVPixelBuffer, _ frame1: CVPixelBuffer) -> CVPixelBuffer? {
-        let width = CVPixelBufferGetWidth(frame0)
-        let height = CVPixelBufferGetHeight(frame0)
-
-        var resultBuffer: CVPixelBuffer?
-        let attrs = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
-        ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &resultBuffer) == kCVReturnSuccess,
-              let result = resultBuffer else {
-            return nil
-        }
-
-        CVPixelBufferLockBaseAddress(frame0, .readOnly)
-        CVPixelBufferLockBaseAddress(frame1, .readOnly)
-        CVPixelBufferLockBaseAddress(result, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
-            CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
-            CVPixelBufferUnlockBaseAddress(result, [])
-        }
-
-        let src0 = CVPixelBufferGetBaseAddress(frame0)!.assumingMemoryBound(to: UInt8.self)
-        let src1 = CVPixelBufferGetBaseAddress(frame1)!.assumingMemoryBound(to: UInt8.self)
-        let dst = CVPixelBufferGetBaseAddress(result)!.assumingMemoryBound(to: UInt8.self)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(result)
-        let totalBytes = bytesPerRow * height
-
-        // 0.5 混合：dst = (src0 + src1) / 2
-        for i in 0..<totalBytes {
-            dst[i] = UInt8((UInt16(src0[i]) + UInt16(src1[i])) / 2)
-        }
-
-        return result
+        return MetalFrameBlender.shared?.blend(frame0: frame0, frame1: frame1, alpha: 0.5)
     }
 
     // MARK: - 等待 Writer 就绪（有界背压）
