@@ -86,7 +86,7 @@ struct SettingsView: View {
                         Text("时长 \(formattedDuration(video.duration)) · 原始 \(Int(video.originalFPS))fps")
                             .font(.caption)
                             .foregroundColor(DesignTokens.Colors.textSecondary)
-                        Text("分辨率 \(video.width)×\(video.height)")
+                        Text("\(video.codecFormat) · \(Int(video.width))×\(video.height)")
                             .font(.caption)
                             .foregroundColor(DesignTokens.Colors.textSecondary)
                     }
@@ -96,6 +96,15 @@ struct SettingsView: View {
                 Divider()
 
                 HStack {
+                    Text("\(video.codecFormat)")
+                        .font(.caption)
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                    if video.bitRateMbps > 0 {
+                        Text("码率 \(String(format: "%.1f", video.bitRateMbps)) Mbps")
+                            .font(.caption)
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+                    Spacer()
                     Text("原始大小 \(String(format: "%.1f", video.originalSizeMB)) MB")
                         .font(.caption)
                         .foregroundColor(DesignTokens.Colors.textSecondary)

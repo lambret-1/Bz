@@ -19,6 +19,10 @@ struct VideoInfo: Identifiable, Equatable {
     let width: Int
     /// 显示高度（像素，已应用旋转）
     let height: Int
+    /// 视频编码格式（如 H.264 / HEVC）
+    let codecFormat: String
+    /// 视频码率（Mbps）
+    let bitRateMbps: Double
     /// 缩略图
     let thumbnail: UIImage?
 
