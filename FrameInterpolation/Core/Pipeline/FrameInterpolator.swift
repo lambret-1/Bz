@@ -165,9 +165,10 @@ final class FrameInterpolator {
         // Sigmoid mask
         encodeSigmoid(commandBuffer: postprocessBuffer)
 
-        // Warp：frame0 沿正向光流走 t=0.5；frame1 沿反向光流走 t=-0.5
-        encodeWarp(commandBuffer: postprocessBuffer, source: tex0, destination: warped0, scale: 0.5, channelOffset: 0)
-        encodeWarp(commandBuffer: postprocessBuffer, source: tex1, destination: warped1, scale: -0.5, channelOffset: 2)
+        // Warp：RIFE 输出的光流已是 t=0.5 对应的位移，直接使用无需再乘系数
+        // frame0 用正向光流（前2通道），frame1 用反向光流（后2通道）
+        encodeWarp(commandBuffer: postprocessBuffer, source: tex0, destination: warped0, scale: 1.0, channelOffset: 0)
+        encodeWarp(commandBuffer: postprocessBuffer, source: tex1, destination: warped1, scale: 1.0, channelOffset: 2)
 
         // Blend
         encodeBlend(commandBuffer: postprocessBuffer, warped0: warped0, warped1: warped1, output: blended)
