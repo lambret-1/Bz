@@ -39,7 +39,7 @@ final class MetalFrameBlender {
 
         // 尺寸变化时重新配置输出池
         if width != configuredWidth || height != configuredHeight {
-            outputPool.configure(width: width, height: height, minBufferCount: 4)
+            outputPool.configure(width: width, height: height, minBufferCount: 8)
             configuredWidth = width
             configuredHeight = height
         }

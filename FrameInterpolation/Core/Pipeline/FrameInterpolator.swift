@@ -136,16 +136,16 @@ final class FrameInterpolator {
             return nil
         }
 
-        // 2. 创建 Metal 纹理
+        // 2. 创建 Metal 纹理（全部走 IOSurface 零拷贝）
         // 512 纹理用于模型预处理
-        guard let tex0 = helper.makeTexture(from: resized0),
-              let tex1 = helper.makeTexture(from: resized1) else {
+        guard let tex0 = helper.makeIOSurfaceTexture(from: resized0, usage: .shaderRead),
+              let tex1 = helper.makeIOSurfaceTexture(from: resized1, usage: .shaderRead) else {
             logger.error("创建输入纹理失败")
             return nil
         }
         // 原分辨率纹理用于 warp/blend（避免二次缩放损失）
-        guard let origTex0 = helper.makeTexture(from: frame0, usage: .shaderRead),
-              let origTex1 = helper.makeTexture(from: frame1, usage: .shaderRead) else {
+        guard let origTex0 = helper.makeIOSurfaceTexture(from: frame0, usage: .shaderRead),
+              let origTex1 = helper.makeIOSurfaceTexture(from: frame1, usage: .shaderRead) else {
             logger.error("创建原分辨率纹理失败")
             return nil
         }
