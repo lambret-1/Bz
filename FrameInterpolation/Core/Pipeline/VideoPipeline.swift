@@ -112,7 +112,7 @@ final class VideoPipeline {
             try? FileManager.default.removeItem(at: outputURL)
         }
 
-        // MARK: 配置 Reader
+        // MARK: 配置 Reader（视频和音频使用独立 Reader，避免共享 reader 导致音频读不到数据）
         let reader = try AVAssetReader(asset: asset)
 
         let videoReaderOutput = AVAssetReaderTrackOutput(
@@ -125,14 +125,19 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // 音频轨道
+        // 音频轨道：使用独立的 AVAssetReader
+        // 根因：视频和音频共享同一个 reader 时，视频读完后 reader 内部状态推进到末尾，
+        // 音频 output 的 copyNextSampleBuffer() 会立即返回 nil，导致音频零样本写入
+        var audioReader: AVAssetReader?
         var audioReaderOutput: AVAssetReaderTrackOutput?
         if let audioTrack = asset.tracks(withMediaType: .audio).first {
+            let independentAudioReader = try AVAssetReader(asset: asset)
             let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-            if reader.canAdd(audioOutput) {
-                reader.add(audioOutput)
+            if independentAudioReader.canAdd(audioOutput) {
+                independentAudioReader.add(audioOutput)
+                audioReader = independentAudioReader
                 audioReaderOutput = audioOutput
-                logger.info("检测到音频轨道，将透传音频")
+                logger.info("检测到音频轨道，使用独立 Reader 透传音频")
             }
         }
 
@@ -258,31 +263,40 @@ final class VideoPipeline {
         videoWriterInput.markAsFinished()
         logger.info("视频处理完成，输出帧数: \(outputFrameIndex)")
 
-        // MARK: 音频透传
-        if let audioReaderOutput = audioReaderOutput, let audioWriterInput = audioWriterInput {
-            logger.info("开始音频透传")
-            var audioFrameCount = 0
+        // MARK: 音频透传（使用独立 Reader）
+        if let audioReader = audioReader, let audioReaderOutput = audioReaderOutput, let audioWriterInput = audioWriterInput {
+            logger.info("开始音频透传（独立 Reader）")
+            guard audioReader.startReading() else {
+                logger.error("音频 Reader 启动失败: \(audioReader.error?.localizedDescription ?? "unknown")")
+                // 音频失败不影响视频输出，继续完成写入
+            } else {
+                var audioFrameCount = 0
 
-            while reader.status == .reading {
-                if isCancelled {
-                    reader.cancelReading()
-                    writer.cancelWriting()
-                    throw PipelineError.cancelled
+                while audioReader.status == .reading {
+                    if isCancelled {
+                        audioReader.cancelReading()
+                        writer.cancelWriting()
+                        throw PipelineError.cancelled
+                    }
+
+                    guard let audioSample = audioReaderOutput.copyNextSampleBuffer() else {
+                        break
+                    }
+
+                    autoreleasepool {
+                        self.waitForWriterReady(audioWriterInput)
+                        audioWriterInput.append(audioSample)
+                        audioFrameCount += 1
+                    }
                 }
 
-                guard let audioSample = audioReaderOutput.copyNextSampleBuffer() else {
-                    break
+                if audioReader.status == .failed {
+                    logger.error("音频读取失败: \(audioReader.error?.localizedDescription ?? "unknown")")
                 }
 
-                autoreleasepool {
-                    self.waitForWriterReady(audioWriterInput)
-                    audioWriterInput.append(audioSample)
-                    audioFrameCount += 1
-                }
+                logger.info("音频透传完成，音频样本数: \(audioFrameCount)")
             }
-
             audioWriterInput.markAsFinished()
-            logger.info("音频透传完成，音频帧数: \(audioFrameCount)")
         }
 
         // MARK: 完成写入
