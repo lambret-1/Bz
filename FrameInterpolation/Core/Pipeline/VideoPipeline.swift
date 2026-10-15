@@ -112,7 +112,7 @@ final class VideoPipeline {
             try? FileManager.default.removeItem(at: outputURL)
         }
 
-        // MARK: 配置 Reader（视频和音频使用独立 Reader，避免共享 reader 导致音频读不到数据）
+        // MARK: 配置 Reader（视频和音频共享 Reader，在视频循环中同步读取音频）
         let reader = try AVAssetReader(asset: asset)
 
         let videoReaderOutput = AVAssetReaderTrackOutput(
@@ -125,19 +125,14 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // 音频轨道：使用独立的 AVAssetReader
-        // 根因：视频和音频共享同一个 reader 时，视频读完后 reader 内部状态推进到末尾，
-        // 音频 output 的 copyNextSampleBuffer() 会立即返回 nil，导致音频零样本写入
-        var audioReader: AVAssetReader?
+        // 音频轨道（共享 reader，在视频循环中同步读取写入，避免时间戳回退）
         var audioReaderOutput: AVAssetReaderTrackOutput?
         if let audioTrack = asset.tracks(withMediaType: .audio).first {
-            let independentAudioReader = try AVAssetReader(asset: asset)
             let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-            if independentAudioReader.canAdd(audioOutput) {
-                independentAudioReader.add(audioOutput)
-                audioReader = independentAudioReader
+            if reader.canAdd(audioOutput) {
+                reader.add(audioOutput)
                 audioReaderOutput = audioOutput
-                logger.info("检测到音频轨道，使用独立 Reader 透传音频")
+                logger.info("检测到音频轨道，将在视频循环中同步透传音频")
             }
         }
 
@@ -191,6 +186,7 @@ final class VideoPipeline {
         var outputFrameIndex = 0
         var previousPixelBuffer: CVPixelBuffer?
         var lastProgressReport = 0.0
+        var audioSampleCount = 0
 
         while reader.status == .reading {
             if isCancelled {
@@ -202,6 +198,19 @@ final class VideoPipeline {
             guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
                   let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                 break
+            }
+
+            // 同步读取并写入所有可用的音频样本（关键：在视频循环中排空音频 output，
+            // 避免视频读完后 reader 时间戳推进到末尾导致音频读不到数据）
+            if let audioWriterInput = audioWriterInput, let audioRO = audioReaderOutput {
+                while let audioSample = audioRO.copyNextSampleBuffer() {
+                    autoreleasepool {
+                        self.waitForWriterReady(audioWriterInput)
+                        if audioWriterInput.append(audioSample) {
+                            audioSampleCount += 1
+                        }
+                    }
+                }
             }
 
             // 进度计算（基于输入帧数）
@@ -223,9 +232,6 @@ final class VideoPipeline {
 
                         // 生成中间帧
                         if let midFrame = interpolator.interpolate(frame0: prev, frame1: pixelBuffer) {
-                            // 关键修复：补帧是手动创建的 CVPixelBuffer，缺少颜色空间附件
-                            // 原帧带有 BT.709 等颜色空间信息，H.264 编码时 RGB→YUV 转换依赖此附件
-                            // 不复制会导致补帧使用默认 BT.601，出现亮度/颜色偏差
                             self.copyColorSpaceAttachments(from: pixelBuffer, to: midFrame)
 
                             let midPTS = CMTime(
@@ -252,6 +258,19 @@ final class VideoPipeline {
             previousPixelBuffer = pixelBuffer
         }
 
+        // 视频读完后，扫尾剩余音频样本
+        if let audioWriterInput = audioWriterInput, let audioRO = audioReaderOutput {
+            while let audioSample = audioRO.copyNextSampleBuffer() {
+                autoreleasepool {
+                    self.waitForWriterReady(audioWriterInput)
+                    if audioWriterInput.append(audioSample) {
+                        audioSampleCount += 1
+                    }
+                }
+            }
+            logger.info("音频透传完成，音频样本数: \(audioSampleCount)")
+        }
+
         // 检查 reader 最终状态
         if reader.status == .failed {
             if let error = reader.error {
@@ -261,43 +280,8 @@ final class VideoPipeline {
         }
 
         videoWriterInput.markAsFinished()
+        audioWriterInput?.markAsFinished()
         logger.info("视频处理完成，输出帧数: \(outputFrameIndex)")
-
-        // MARK: 音频透传（使用独立 Reader）
-        if let audioReader = audioReader, let audioReaderOutput = audioReaderOutput, let audioWriterInput = audioWriterInput {
-            logger.info("开始音频透传（独立 Reader）")
-            if audioReader.startReading() {
-                var audioFrameCount = 0
-
-                while audioReader.status == .reading {
-                    if isCancelled {
-                        audioReader.cancelReading()
-                        writer.cancelWriting()
-                        throw PipelineError.cancelled
-                    }
-
-                    guard let audioSample = audioReaderOutput.copyNextSampleBuffer() else {
-                        break
-                    }
-
-                    autoreleasepool {
-                        self.waitForWriterReady(audioWriterInput)
-                        audioWriterInput.append(audioSample)
-                        audioFrameCount += 1
-                    }
-                }
-
-                if audioReader.status == .failed {
-                    logger.error("音频读取失败: \(audioReader.error?.localizedDescription ?? "unknown")")
-                }
-
-                logger.info("音频透传完成，音频样本数: \(audioFrameCount)")
-            } else {
-                logger.error("音频 Reader 启动失败: \(audioReader.error?.localizedDescription ?? "unknown")")
-                // 音频失败不影响视频输出，继续完成写入
-            }
-            audioWriterInput.markAsFinished()
-        }
 
         // MARK: 完成写入
         let semaphore = DispatchSemaphore(value: 0)
