@@ -30,21 +30,20 @@ enum MediaImporter {
             )
         }
 
-        // 并发加载帧率、自然尺寸、变换矩阵、码率
+        // 并发加载帧率、自然尺寸、变换矩阵
         async let fps = track.load(.nominalFrameRate)
         async let naturalSize = track.load(.naturalSize)
         async let transform = track.load(.preferredTransform)
-        async let dataRate = track.load(.estimatedDataRate)
 
-        let (resolvedFps, resolvedNaturalSize, resolvedTransform, resolvedDataRate) = try await (fps, naturalSize, transform, dataRate)
+        let (resolvedFps, resolvedNaturalSize, resolvedTransform) = try await (fps, naturalSize, transform)
 
         // 计算显示尺寸（应用旋转变换后）
         let displaySize = resolvedNaturalSize.applying(resolvedTransform)
         let width = Int(abs(displaySize.width))
         let height = Int(abs(displaySize.height))
 
-        // 视频码率（Mbps）
-        let bitRateMbps = resolvedDataRate > 0 ? resolvedDataRate / 1_000_000 : 0
+        // 视频码率（Mbps），track 已通过 loadTracks 加载，直接读属性
+        let bitRateMbps = track.estimatedDataRate > 0 ? track.estimatedDataRate / 1_000_000 : 0
 
         // 视频编码格式（从 formatDescriptions 解析 codecType）
         let codecFormat = Self.parseCodecFormat(track: track)
