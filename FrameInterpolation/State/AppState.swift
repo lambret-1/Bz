@@ -2,6 +2,7 @@ import SwiftUI
 import OSLog
 import AVFoundation
 import UserNotifications
+import UIKit
 
 /// 全局应用状态，主线程隔离，统一管理导航、导入、处理、结果与 Toast
 @MainActor
@@ -9,6 +10,9 @@ final class AppState: ObservableObject {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "AppState")
     private let pipeline = VideoPipeline()
     private let recentRecordsKey = "BzRecentRecords"
+
+    // MARK: - 后台任务管理（统一在AppState，避免ProcessingView dismiss后丢失保护）
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
     // MARK: - 导航状态
     /// 是否展示参数设置页（独立 fullScreenCover）
@@ -151,6 +155,9 @@ final class AppState: ObservableObject {
         processedFrames = 0
         stage = .decoding
 
+        // 统一申请后台任务，处理全程持有（包括最小化到首页）
+        beginBackgroundTask()
+
         // 输出文件路径
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("output_\(UUID().uuidString).mp4")
@@ -183,6 +190,8 @@ final class AppState: ObservableObject {
                     self.appendRecentRecord(outputURL: url, outputFPS: outputFPS)
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
+                    // 处理完成，结束后台任务
+                    self.endBackgroundTask()
                     // 注意：成功时不设置 isProcessing = false
                     // 保持 ProcessingView 在后台，ResultView 通过 fullScreenCover 覆盖在上
                     // 避免 ProcessingView 被 dismiss 时连带移除 ResultView
@@ -190,8 +199,11 @@ final class AppState: ObservableObject {
 
                 case .failure(let error):
                     self.isProcessing = false
+                    self.isProcessingMinimized = false
                     self.stage = .failed
                     self.outputURL = nil
+                    // 处理失败，结束后台任务
+                    self.endBackgroundTask()
                     if case PipelineError.cancelled = error {
                         self.showToast("已取消处理", style: .warning)
                     } else {
@@ -211,7 +223,29 @@ final class AppState: ObservableObject {
         isProcessingMinimized = false
         stage = .idle
         progress = 0
+        endBackgroundTask()
         logger.info("处理已取消")
+    }
+
+    // MARK: - 后台任务统一管理
+
+    private func beginBackgroundTask() {
+        endBackgroundTask() // 先结束旧的
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "视频补帧处理") { [weak self] in
+            // 后台时间快用完了，发通知喊用户回来
+            self?.backgroundTimeExpiring()
+            if let id = self?.backgroundTaskID, id != .invalid {
+                UIApplication.shared.endBackgroundTask(id)
+                self?.backgroundTaskID = .invalid
+            }
+        }
+    }
+
+    private func endBackgroundTask() {
+        if backgroundTaskID != .invalid {
+            UIApplication.shared.endBackgroundTask(backgroundTaskID)
+            backgroundTaskID = .invalid
+        }
     }
 
     // MARK: - 最小化处理页到首页（管线继续跑）
@@ -236,7 +270,8 @@ final class AppState: ObservableObject {
 
     /// 应用进入后台时调用，处理中则发本地通知提醒用户
     func applicationDidEnterBackground() {
-        guard isProcessing || isProcessingMinimized else { return }
+        // 任务完成后（outputURL != nil）不再发后台通知
+        guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
         sendBackgroundNotification(
             title: "补帧处理中",
             body: "你刚切到后台，处理将继续约30秒，点我回到App继续",
@@ -246,7 +281,8 @@ final class AppState: ObservableObject {
 
     /// 后台时间即将耗尽时调用
     func backgroundTimeExpiring() {
-        guard isProcessing || isProcessingMinimized else { return }
+        // 任务完成后不再发通知
+        guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
         sendBackgroundNotification(
             title: "补帧即将暂停",
             body: "系统马上要挂起任务，点我回来继续处理",
