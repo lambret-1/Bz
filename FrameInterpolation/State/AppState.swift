@@ -42,6 +42,8 @@ final class AppState: ObservableObject {
     @Published var processedFrames: Int = 0
     @Published var totalFrames: Int = 0
     @Published var stage: ProcessingStage = .idle
+    /// 预计剩余时间（秒），基于已用时间和进度估算
+    @Published var estimatedRemaining: TimeInterval = 0
 
     // MARK: - 结果
     /// 输出视频 URL，非空时展示结果页
@@ -185,6 +187,11 @@ final class AppState: ObservableObject {
                 guard let self = self else { return }
                 self.progress = value
                 self.stage = stage
+                // 基于已用时间和进度估算剩余时间
+                if let start = self.processingStartTime, value > 0.01 {
+                    let elapsed = Date().timeIntervalSince(start)
+                    self.estimatedRemaining = elapsed * (1.0 - value) / value
+                }
             },
             completion: { [weak self] result in
                 guard let self = self else { return }
@@ -193,6 +200,7 @@ final class AppState: ObservableObject {
                 case .success(let url):
                     self.stage = .finished
                     self.progress = 1.0
+                    self.estimatedRemaining = 0
                     self.outputURL = url
                     self.processingMode = self.pipeline.isUsingAIInterpolation
                         ? "AI补帧（\(self.frameMultiplier.label)）"
@@ -227,6 +235,7 @@ final class AppState: ObservableObject {
                     self.isProcessing = false
                     self.isProcessingMinimized = false
                     self.stage = .failed
+                    self.estimatedRemaining = 0
                     self.outputURL = nil
                     // 处理失败，结束后台任务
                     self.endBackgroundTask()

@@ -54,7 +54,14 @@ struct ProcessingView: View {
             Text(appState.stage.rawValue)
                 .font(.headline)
 
-            
+            // 预计剩余时间
+            if appState.estimatedRemaining > 1 {
+                Text("预计剩余时间：约 \(Int(appState.estimatedRemaining)) 秒")
+                    .font(.subheadline)
+                    .foregroundColor(DesignTokens.Colors.textSecondary)
+            }
+
+
 
             Spacer()
 
