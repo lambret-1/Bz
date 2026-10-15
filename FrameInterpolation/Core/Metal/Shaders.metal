@@ -90,13 +90,15 @@ kernel void blend_frames(
     float4 c0 = frame0.read(gid);
     float4 c1 = frame1.read(gid);
 
-    // frame0 * (1-mask) + frame1 * mask
-    float4 result = c0 * (1.0 - m) + c1 * m;
+    // RIFE 原始公式：warped_img0 * mask + warped_img1 * (1 - mask)
+    float4 result = c0 * m + c1 * (1.0 - m);
     output.write(result, gid);
 }
 
 // ============================================================
-// 5. RGBA -> BGRA（写回 CVPixelBuffer）
+// 5. RGBA16Float -> BGRA8Unorm（格式转换，Metal自动处理通道交换）
+//    注意：写入 .bgra8Unorm 时 Metal 会自动将 RGBA 转为 BGRA 存储，
+//    无需手动交换通道，否则会导致 R/B 通道二次颠倒
 // ============================================================
 kernel void rgba_to_bgra(
     texture2d<float, access::read> src [[texture(0)]],
@@ -104,5 +106,5 @@ kernel void rgba_to_bgra(
     uint2 gid [[thread_position_in_grid]]
 ) {
     float4 c = src.read(gid);
-    dst.write(float4(c.b, c.g, c.r, 1.0), gid);
+    dst.write(float4(c.r, c.g, c.b, 1.0), gid);
 }
