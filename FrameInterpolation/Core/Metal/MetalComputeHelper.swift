@@ -8,6 +8,8 @@ final class MetalComputeHelper {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     private var textureCache: CVMetalTextureCache?
+    // 保护 textureCache 访问，CVMetalTextureCache 非线程安全
+    private let cacheLock = NSLock()
 
     private init() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -33,12 +35,19 @@ final class MetalComputeHelper {
 
     /// 从 CVPixelBuffer 的 IOSurface 创建 MTLTexture（零拷贝，推荐用于输入/输出帧）
     /// 比 makeTexture(from:) 的 lock+replace 路径快得多，无 CPU/GPU 来回拷贝
+    /// 若 IOSurface 零拷贝失败，自动回退到 makeTexture（CPU→GPU拷贝路径），保证GPU可用
     func makeIOSurfaceTexture(from pixelBuffer: CVPixelBuffer, usage: MTLTextureUsage = [.shaderRead, .shaderWrite]) -> MTLTexture? {
-        guard let cache = textureCache else { return nil }
-
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         guard width > 0, height > 0 else { return nil }
+
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        guard let cache = textureCache else {
+            // cache 不可用，回退到 CPU→GPU 拷贝路径
+            return makeTextureLocked(from: pixelBuffer, usage: usage)
+        }
 
         var image: CVMetalTexture?
         let status = CVMetalTextureCacheCreateTextureFromImage(
@@ -54,7 +63,8 @@ final class MetalComputeHelper {
         )
 
         guard status == kCVReturnSuccess, let cvImage = image else {
-            return nil
+            // IOSurface 零拷贝失败，回退到 CPU→GPU 拷贝路径
+            return makeTextureLocked(from: pixelBuffer, usage: usage)
         }
         return CVMetalTextureGetTexture(cvImage)
     }
@@ -62,6 +72,13 @@ final class MetalComputeHelper {
     /// 把 CVPixelBuffer(BGRA) 包装为 MTLTexture（CPU→GPU 拷贝路径，用于非 IOSurface buffer）
     /// 注意：有性能开销，优先使用 makeIOSurfaceTexture
     func makeTexture(from pixelBuffer: CVPixelBuffer, usage: MTLTextureUsage = [.shaderRead, .shaderWrite]) -> MTLTexture? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return makeTextureLocked(from: pixelBuffer, usage: usage)
+    }
+
+    /// 内部方法：调用方必须已持有 cacheLock
+    private func makeTextureLocked(from pixelBuffer: CVPixelBuffer, usage: MTLTextureUsage) -> MTLTexture? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
 
