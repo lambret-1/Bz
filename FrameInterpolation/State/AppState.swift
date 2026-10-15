@@ -349,12 +349,16 @@ final class AppState: ObservableObject {
 
     // MARK: - Toast
 
-    func showToast(_ message: String, style: ToastStyle = .success) {
-        toastMessage = message
-        toastStyle = style
-        Task {
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            withAnimation { toastMessage = nil }
-        }
+private var toastWorkItem: DispatchWorkItem?
+
+func showToast(_ message: String, style: ToastStyle = .success) {
+    toastWorkItem?.cancel()
+    toastMessage = message
+    toastStyle = style
+    let workItem = DispatchWorkItem {
+        withAnimation { self.toastMessage = nil }
     }
+    toastWorkItem = workItem
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: workItem)
+}
 }
