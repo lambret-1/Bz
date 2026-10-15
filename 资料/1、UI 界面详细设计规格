@@ -231,14 +231,15 @@ NavigationStack
 │   │   │   │   ├── "时长 00:12 · 原始 30fps" .caption .textSecondary
 │   │   ├── Divider
 │   │   ├── HStack
+│   │   │   ├── Text("码率 12.5 Mbps") .caption
 │   │   │   ├── Text("原始大小 12.5 MB") .caption
 │   │   │   └── Spacer()
 │   │   │   └── Text("预计输出 45 MB") .caption .accent
 │   ├── spacingL
 │   ├── 补帧倍数
 │   │   ├── Text("补帧倍数") .headline
-│   │   ├── SegmentedPicker(["2x", "4x"])
-│   │   └── Text("4x 仅 A16 及以上设备支持") .caption .textSecondary (条件显示)
+│   │   ├── SegmentedPicker(["30帧","60帧","2x", "4x"])
+│   │   └── 
 │   ├── spacingL
 │   ├── 输出分辨率
 │   │   ├── Text("输出分辨率") .headline
@@ -322,6 +323,7 @@ NavigationStack
 │   │   ├── HStack { Text("原始") ; Spacer() ; Text("30fps / 12.5 MB") }
 │   │   ├── Divider
 │   │   └── HStack { Text("补帧后") ; Spacer() ; Text("60fps / 45 MB") .accent }
+│   │   └── HStack { Text("码率") ; Spacer() ;
 │   ├── spacingL
 │   ├── HStack(spacing: 12)
 │   │   ├── PrimaryButton("保存到相册")  (flex 1)
