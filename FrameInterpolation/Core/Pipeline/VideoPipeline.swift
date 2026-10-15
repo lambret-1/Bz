@@ -127,13 +127,19 @@ final class VideoPipeline {
 
         // 音频轨道（共享 reader，在视频循环中同步读取写入，避免时间戳回退）
         var audioReaderOutput: AVAssetReaderTrackOutput?
-        if let audioTrack = asset.tracks(withMediaType: .audio).first {
+        let audioTracks = asset.tracks(withMediaType: .audio)
+        logger.notice("音频轨道数量: \(audioTracks.count)")
+        if let audioTrack = audioTracks.first {
             let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
             if reader.canAdd(audioOutput) {
                 reader.add(audioOutput)
                 audioReaderOutput = audioOutput
-                logger.info("检测到音频轨道，将在视频循环中同步透传音频")
+                logger.notice("音频轨道已添加到 Reader，时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s, 格式描述: \(String(describing: audioTrack.formatDescriptions.first ?? "unknown"))")
+            } else {
+                logger.error("Reader 无法添加音频 output")
             }
+        } else {
+            logger.notice("未检测到音频轨道，输出将无音频")
         }
 
         // MARK: 配置 Writer
@@ -172,6 +178,9 @@ final class VideoPipeline {
             if writer.canAdd(audioInput) {
                 writer.add(audioInput)
                 audioWriterInput = audioInput
+                logger.notice("音频 WriterInput 已添加")
+            } else {
+                logger.error("Writer 无法添加音频 input")
             }
         }
 
@@ -179,7 +188,8 @@ final class VideoPipeline {
         guard reader.startReading() else {
             throw PipelineError.readerStartFailed(reader.error ?? PipelineError.unknown)
         }
-        writer.startWriting()
+        let writerStarted = writer.startWriting()
+        logger.notice("Writer startWriting 返回: \(writerStarted), 状态: \(writer.status.rawValue)")
         writer.startSession(atSourceTime: .zero)
 
         // MARK: 视频处理循环
@@ -208,6 +218,8 @@ final class VideoPipeline {
                         self.waitForWriterReady(audioWriterInput)
                         if audioWriterInput.append(audioSample) {
                             audioSampleCount += 1
+                        } else {
+                            logger.error("音频样本 append 失败，writer状态: \(writer.status.rawValue), 已写入\(audioSampleCount)个")
                         }
                     }
                 }
@@ -268,7 +280,9 @@ final class VideoPipeline {
                     }
                 }
             }
-            logger.info("音频透传完成，音频样本数: \(audioSampleCount)")
+            logger.notice("音频透传完成，音频样本数: \(audioSampleCount), reader状态: \(reader.status.rawValue)")
+        } else {
+            logger.notice("音频透传跳过：audioWriterInput=\(audioWriterInput != nil), audioReaderOutput=\(audioReaderOutput != nil)")
         }
 
         // 检查 reader 最终状态
