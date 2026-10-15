@@ -127,3 +127,59 @@ kernel void simple_blend(
     float4 result = c0 * alpha + c1 * (1.0 - alpha);
     output.write(float4(result.r, result.g, result.b, 1.0), gid);
 }
+
+// ============================================================
+// 7. 光流+掩码上采样（512→原分辨率）
+//    双线性插值，光流值按缩放系数放大（位移量与分辨率成正比）
+//    输入: flow[4,srcH,srcW] half, mask[1,srcH,srcW] half
+//    输出: flow[4,dstH,dstW] half, mask[1,dstH,dstW] half
+// ============================================================
+kernel void upsample_flow_mask(
+    device half *srcFlow [[buffer(0)]],
+    device half *srcMask [[buffer(1)]],
+    device half *dstFlow [[buffer(2)]],
+    device half *dstMask [[buffer(3)]],
+    constant uint &srcW [[buffer(4)]],
+    constant uint &srcH [[buffer(5)]],
+    constant uint &dstW [[buffer(6)]],
+    constant uint &dstH [[buffer(7)]],
+    constant float &flowScale [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= dstW || gid.y >= dstH) return;
+
+    // 双线性插值坐标
+    float fx = (float(gid.x) + 0.5) * float(srcW) / float(dstW) - 0.5;
+    float fy = (float(gid.y) + 0.5) * float(srcH) / float(dstH) - 0.5;
+    fx = clamp(fx, 0.0, float(srcW - 1));
+    fy = clamp(fy, 0.0, float(srcH - 1));
+
+    int x0 = int(floor(fx));
+    int y0 = int(floor(fy));
+    int x1 = min(x0 + 1, int(srcW - 1));
+    int y1 = min(y0 + 1, int(srcH - 1));
+    float wx = fx - float(x0);
+    float wy = fy - float(y0);
+
+    uint srcPlane = srcW * srcH;
+    uint dstPlane = dstW * dstH;
+    uint dstIdx = gid.y * dstW + gid.x;
+
+    // 上采样 4 通道光流，乘以 flowScale
+    for (uint c = 0; c < 4; c++) {
+        float v00 = float(srcFlow[c * srcPlane + y0 * srcW + x0]);
+        float v01 = float(srcFlow[c * srcPlane + y0 * srcW + x1]);
+        float v10 = float(srcFlow[c * srcPlane + y1 * srcW + x0]);
+        float v11 = float(srcFlow[c * srcPlane + y1 * srcW + x1]);
+        float v = v00 * (1-wx) * (1-wy) + v01 * wx * (1-wy) + v10 * (1-wx) * wy + v11 * wx * wy;
+        dstFlow[c * dstPlane + dstIdx] = half(v * flowScale);
+    }
+
+    // 上采样 1 通道 mask
+    float m00 = float(srcMask[y0 * srcW + x0]);
+    float m01 = float(srcMask[y0 * srcW + x1]);
+    float m10 = float(srcMask[y1 * srcW + x0]);
+    float m11 = float(srcMask[y1 * srcW + x1]);
+    float m = m00 * (1-wx) * (1-wy) + m01 * wx * (1-wy) + m10 * (1-wx) * wy + m11 * wx * wy;
+    dstMask[dstIdx] = half(m);
+}
