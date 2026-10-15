@@ -198,11 +198,30 @@ struct SettingsView: View {
 
     private var estimatedTime: String {
         guard let video = appState.selectedVideo else { return "约 0 秒" }
-        // 空转管线预估：约视频时长的 0.3 倍
-        let base = video.duration * 0.3
-        let resolutionFactor: Double = appState.outputResolution == .p1080 ? 1.5 : 1.0
-        let fastFactor: Double = appState.fastMode ? 0.4 : 1.0
-        let seconds = base * resolutionFactor * fastFactor
+        let n = appState.frameMultiplier.rawValue
+        let usingAI = appState.isUsingAI
+
+        // 基础系数：优先用本机实测速度系数，无实测时用默认值
+        // 实测系数 = 视频时长/实际耗时，越大越快；预估耗时 = 视频时长/速度系数
+        let defaultSpeed: Double = usingAI ? 0.8 : 3.0 // AI约0.8倍速，空转约3倍速
+        let speedFactor = appState.measuredSpeedFactor ?? defaultSpeed
+        var base = video.duration / speedFactor
+
+        // 倍数系数：4x递归3次推理，工作量约为2x的1.5倍
+        let multFactor = n == 2 ? 1.0 : 1.5
+        base *= multFactor
+
+        // 分辨率：720p比1080p快约40%，1080p比原始慢约30%
+        switch appState.outputResolution {
+        case .p720: base *= 0.6
+        case .p1080: base *= 1.3
+        case .auto: break
+        }
+
+        // 快速模式：静态帧走GPU blend，实际加速约1.4倍
+        if appState.fastMode { base /= 1.4 }
+
+        let seconds = max(base, 1)
         if seconds < 60 { return String(format: "约 %.0f 秒", seconds) }
         return String(format: "约 %.1f 分钟", seconds / 60)
     }
