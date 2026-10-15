@@ -1,13 +1,20 @@
 import Metal
 import CoreVideo
+import OSLog
 
 /// Metal 帧混合器：使用 GPU 做简单 alpha 混合，用于快速模式
-/// 替代 CPU 逐字节混合，降低 CPU 占用并提升速度
+/// IOSurface 零拷贝 + PixelBufferPool 复用 + GPU 状态检查，避免黑帧
 final class MetalFrameBlender {
     static let shared = MetalFrameBlender()
 
     private let helper = MetalComputeHelper.shared
     private let pipeline: MTLComputePipelineState
+    private let logger = Logger(subsystem: "com.lambret.bz", category: "MetalFrameBlender")
+
+    // 输出 buffer 复用池
+    private let outputPool = PixelBufferPool()
+    private var configuredWidth = 0
+    private var configuredHeight = 0
 
     private init?() {
         guard let library = helper.device.makeDefaultLibrary(),
@@ -20,46 +27,34 @@ final class MetalFrameBlender {
 
     /// 混合两帧：result = frame0 * alpha + frame1 * (1-alpha)
     /// - Parameters:
-    ///   - frame0: 第一帧（BGRA8Unorm）
-    ///   - frame1: 第二帧（BGRA8Unorm）
+    ///   - frame0: 第一帧（BGRA8Unorm，IOSurface-backed）
+    ///   - frame1: 第二帧（BGRA8Unorm，IOSurface-backed）
     ///   - alpha: 混合系数，0.5 为平均混合
-    /// - Returns: 混合后的新 CVPixelBuffer，失败返回 nil
+    /// - Returns: 混合后的新 CVPixelBuffer，失败返回 nil（调用方回退CPU）
     func blend(frame0: CVPixelBuffer, frame1: CVPixelBuffer, alpha: Float = 0.5) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(frame0)
         let height = CVPixelBufferGetHeight(frame0)
 
         guard width > 0, height > 0 else { return nil }
 
-        // 创建输出 pixelBuffer
-        var outputBuffer: CVPixelBuffer?
-        let attrs = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
-        ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &outputBuffer) == kCVReturnSuccess,
-              let output = outputBuffer else {
+        // 尺寸变化时重新配置输出池
+        if width != configuredWidth || height != configuredHeight {
+            outputPool.configure(width: width, height: height, minBufferCount: 4)
+            configuredWidth = width
+            configuredHeight = height
+        }
+
+        // 从池取输出 buffer（IOSurface-backed，支持零拷贝）
+        guard let output = outputPool.makeBuffer() else {
+            logger.error("从PixelBufferPool获取输出buffer失败")
             return nil
         }
 
-        // 创建输入纹理（从 pixelBuffer 上传数据）
-        guard let tex0 = helper.makeTexture(from: frame0, usage: .shaderRead),
-              let tex1 = helper.makeTexture(from: frame1, usage: .shaderRead) else {
-            return nil
-        }
-
-        // 创建输出纹理：独立的 .shared 纹理，不绑定 output pixelBuffer
-        // 避免 IOSurface 隐式同步导致的间歇性全黑
-        let outDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: .bgra8Unorm,
-            width: width,
-            height: height,
-            mipmapped: false
-        )
-        outDescriptor.usage = [.shaderWrite]
-        outDescriptor.storageMode = .shared
-        guard let texOut = helper.device.makeTexture(descriptor: outDescriptor) else {
+        // 三张纹理全部走 IOSurface 零拷贝，无 CPU/GPU 来回拷贝
+        guard let tex0 = helper.makeIOSurfaceTexture(from: frame0, usage: .shaderRead),
+              let tex1 = helper.makeIOSurfaceTexture(from: frame1, usage: .shaderRead),
+              let texOut = helper.makeIOSurfaceTexture(from: output, usage: [.shaderRead, .shaderWrite]) else {
+            logger.error("创建IOSurface纹理失败")
             return nil
         }
 
@@ -85,34 +80,16 @@ final class MetalFrameBlender {
         encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
 
-        // 用信号量等待完成，确保 GPU 写入对 CPU 可见
-        let semaphore = DispatchSemaphore(value: 0)
-        commandBuffer.addCompletedHandler { _ in
-            semaphore.signal()
-        }
         commandBuffer.commit()
-        semaphore.wait()
+        commandBuffer.waitUntilCompleted()
 
-        guard commandBuffer.status == .completed else {
+        // 关键：检查 GPU 执行状态，失败返回 nil（调用方回退CPU），不返回黑帧
+        guard commandBuffer.status == .completed, commandBuffer.error == nil else {
+            logger.error("Metal blend GPU执行失败: \(commandBuffer.error?.localizedDescription ?? "unknown"), status: \(commandBuffer.status.rawValue)")
             return nil
         }
 
-        // 从输出纹理拷回 pixelBuffer
-        CVPixelBufferLockBaseAddress(output, [])
-        defer { CVPixelBufferUnlockBaseAddress(output, []) }
-
-        guard let dstAddr = CVPixelBufferGetBaseAddress(output) else {
-            return nil
-        }
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(output)
-
-        texOut.getBytes(
-            dstAddr,
-            bytesPerRow: bytesPerRow,
-            from: MTLRegionMake2D(0, 0, width, height),
-            mipmapLevel: 0
-        )
-
+        // texOut 直接写在 output 的 IOSurface 上，不需要 helper.copy() 回拷
         return output
     }
 }
