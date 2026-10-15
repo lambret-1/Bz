@@ -218,6 +218,11 @@ final class VideoPipeline {
 
                         // 生成中间帧
                         if let midFrame = interpolator.interpolate(frame0: prev, frame1: pixelBuffer) {
+                            // 关键修复：补帧是手动创建的 CVPixelBuffer，缺少颜色空间附件
+                            // 原帧带有 BT.709 等颜色空间信息，H.264 编码时 RGB→YUV 转换依赖此附件
+                            // 不复制会导致补帧使用默认 BT.601，出现亮度/颜色偏差
+                            self.copyColorSpaceAttachments(from: pixelBuffer, to: midFrame)
+
                             let midPTS = CMTime(
                                 value: Int64(outputFrameIndex),
                                 timescale: Int32(outputFPS)
@@ -310,6 +315,26 @@ final class VideoPipeline {
             if waitCount > 200 { // 超过 1 秒未就绪
                 logger.warning("Writer 超过 1 秒未就绪，等待次数: \(waitCount)")
                 break
+            }
+        }
+    }
+
+    // MARK: - 颜色空间附件复制
+    /// 将源 PixelBuffer 的颜色空间附件复制到目标 PixelBuffer
+    /// 关键：AVAssetReader 读出的原帧带有 BT.709 等颜色空间信息，
+    /// 手动创建的补帧缺少这些附件，H.264 编码时 RGB→YUV 转换会用默认 BT.601，
+    /// 导致补帧与原帧亮度/颜色不一致
+    private func copyColorSpaceAttachments(from src: CVPixelBuffer, to dst: CVPixelBuffer) {
+        let colorKeys: [CFString] = [
+            kCVImageBufferColorPrimariesKey,
+            kCVImageBufferTransferFunctionKey,
+            kCVImageBufferYCbCrMatrixKey,
+            kCVImageBufferICCProfileKey,
+            kCVImageBufferChromaLocationTopFieldKey
+        ]
+        for key in colorKeys {
+            if let value = CVBufferGetAttachment(src, key, nil) {
+                CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
         }
     }
