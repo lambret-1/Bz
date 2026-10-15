@@ -146,7 +146,7 @@ final class VideoPipeline {
         var audioChannels: Int = 2
         if let audioTrack = loadedAudioTrack {
             // 读取源音频格式
-            if let formatDesc = audioTrack.formatDescriptions.first,
+            if let formatDesc = audioTrack.formatDescriptions.first as? CMAudioFormatDescription,
                let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
                 audioSampleRate = asbd.pointee.mSampleRate
                 audioChannels = Int(asbd.pointee.mChannelsPerFrame)
