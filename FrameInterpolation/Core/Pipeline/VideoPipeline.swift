@@ -266,10 +266,7 @@ final class VideoPipeline {
         // MARK: 音频透传（使用独立 Reader）
         if let audioReader = audioReader, let audioReaderOutput = audioReaderOutput, let audioWriterInput = audioWriterInput {
             logger.info("开始音频透传（独立 Reader）")
-            guard audioReader.startReading() else {
-                logger.error("音频 Reader 启动失败: \(audioReader.error?.localizedDescription ?? "unknown")")
-                // 音频失败不影响视频输出，继续完成写入
-            } else {
+            if audioReader.startReading() {
                 var audioFrameCount = 0
 
                 while audioReader.status == .reading {
@@ -295,6 +292,9 @@ final class VideoPipeline {
                 }
 
                 logger.info("音频透传完成，音频样本数: \(audioFrameCount)")
+            } else {
+                logger.error("音频 Reader 启动失败: \(audioReader.error?.localizedDescription ?? "unknown")")
+                // 音频失败不影响视频输出，继续完成写入
             }
             audioWriterInput.markAsFinished()
         }
