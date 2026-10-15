@@ -54,14 +54,11 @@ struct ProcessingView: View {
             Text(appState.stage.rawValue)
                 .font(.headline)
 
-            // 进度百分比
-            Text("\(Int(appState.progress * 100))%")
-                .font(.system(size: 28, weight: .medium, design: .monospaced))
-                .foregroundColor(DesignTokens.Colors.accent)
+            
 
             Spacer()
 
-            // 提示条
+            // 提示条，
             HStack(spacing: DesignTokens.Spacing.s) {
                 Image(systemName: "thermometer.high")
                     .foregroundColor(DesignTokens.Colors.warning)
