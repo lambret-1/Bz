@@ -43,7 +43,7 @@ enum MediaImporter {
         let height = Int(abs(displaySize.height))
 
         // 视频码率（Mbps），track 已通过 loadTracks 加载，直接读属性
-        let bitRateMbps = track.estimatedDataRate > 0 ? track.estimatedDataRate / 1_000_000 : 0
+        let bitRateMbps = Double(track.estimatedDataRate) / 1_000_000
 
         // 视频编码格式（从 formatDescriptions 解析 codecType）
         let codecFormat = Self.parseCodecFormat(track: track)
