@@ -44,6 +44,16 @@ final class FrameInterpolator {
 
     // MARK: - 调试标志
     private var hasLoggedDataType = false
+    private var didReportDebug = false
+    // 调试统计暂存
+    private var debugDataTypeFlow: Int = 0
+    private var debugDataTypeMask: Int = 0
+    private var debugFlowMin: Float = 0
+    private var debugFlowMax: Float = 0
+    private var debugFlowAbsMean: Float = 0
+    private var debugMaskLogitMin: Float = 0
+    private var debugMaskLogitMax: Float = 0
+    private var debugMaskLogitMean: Float = 0
 
     // MARK: - 初始化
     init?() {
@@ -163,16 +173,28 @@ final class FrameInterpolator {
                 return nil
             }
 
-            // 首次推理时打印数据类型，确认是否需要 Float32→Float16 转换
+            // 首次推理时收集模型输出统计
             if !hasLoggedDataType {
                 hasLoggedDataType = true
-                logger.info("模型输出 dataType: flow=\(flowArray.dataType.rawValue), mask=\(maskArray.dataType.rawValue)")
-                logger.info("模型输出 count: flow=\(flowArray.count), mask=\(maskArray.count)")
+                debugDataTypeFlow = flowArray.dataType.rawValue
+                debugDataTypeMask = maskArray.dataType.rawValue
             }
 
             // 5. 将 MLMultiArray 拷贝到 MTLBuffer（含 Float32→Float16 转换）
             copyToBuffer(multiArray: flowArray, buffer: flowBuffer)
             copyToBuffer(multiArray: maskArray, buffer: maskBuffer)
+
+            // 首次推理时收集 flow/mask 统计（sigmoid 前）
+            if !didReportDebug {
+                let flowStats = statsOfFloat16Buffer(flowBuffer, count: modelInputWidth * modelInputHeight * 4)
+                let maskStats = statsOfFloat16Buffer(maskBuffer, count: modelInputWidth * modelInputHeight)
+                debugFlowMin = flowStats.min
+                debugFlowMax = flowStats.max
+                debugFlowAbsMean = flowStats.absMean
+                debugMaskLogitMin = maskStats.min
+                debugMaskLogitMax = maskStats.max
+                debugMaskLogitMean = maskStats.mean
+            }
         }
 
         // 6. Metal 后处理：Sigmoid → Warp → Warp → Blend → RGBA→BGRA
@@ -210,6 +232,23 @@ final class FrameInterpolator {
             return nil
         }
         helper.copy(texture: outputBGRA, to: outputBuffer)
+
+        // 首次推理完成后收集完整调试信息并通知 UI
+        if !didReportDebug {
+            didReportDebug = true
+            let maskAfterSigmoid = statsOfFloat16Buffer(maskBuffer, count: modelInputWidth * modelInputHeight)
+            let inLum = averageLuminance(of: resized0)
+            let outLum = averageLuminance(of: outputBuffer)
+            let info = """
+            输出类型: flow=\(debugDataTypeFlow) mask=\(debugDataTypeMask) (65535=Float16, 65536=Float32)
+            光流: [\(String(format: "%.2f", debugFlowMin)), \(String(format: "%.2f", debugFlowMax))] absMean=\(String(format: "%.3f", debugFlowAbsMean))
+            掩码logits: [\(String(format: "%.2f", debugMaskLogitMin)), \(String(format: "%.2f", debugMaskLogitMax))] mean=\(String(format: "%.3f", debugMaskLogitMean))
+            掩码sigmoid后: mean=\(String(format: "%.3f", maskAfterSigmoid.mean))
+            输入亮度: \(String(format: "%.1f", inLum))  输出亮度: \(String(format: "%.1f", outLum))  比例: \(String(format: "%.3f", outLum / max(inLum, 1)))
+            """
+            NotificationCenter.default.post(name: NSNotification.Name("BzDebugInfoUpdated"), object: info)
+            logger.info("调试信息: \(info, privacy: .public)")
+        }
 
         // 8. 缩放到原始尺寸
         if originalWidth == modelInputWidth && originalHeight == modelInputHeight {
@@ -352,6 +391,44 @@ final class FrameInterpolator {
         } else {
             logger.error("不支持的 MLMultiArray 数据类型: \(multiArray.dataType.rawValue)")
         }
+    }
+
+    // MARK: - 调试统计辅助
+    /// 统计 Float16 MTLBuffer 的 min/max/mean/absMean
+    private func statsOfFloat16Buffer(_ buffer: MTLBuffer, count: Int) -> (min: Float, max: Float, mean: Float, absMean: Float) {
+        let ptr = buffer.contents().assumingMemoryBound(to: Float16.self)
+        var minVal = Float.greatestFiniteMagnitude
+        var maxVal = -Float.greatestFiniteMagnitude
+        var sum: Float = 0
+        var absSum: Float = 0
+        for i in 0..<count {
+            let v = Float(ptr[i])
+            if v < minVal { minVal = v }
+            if v > maxVal { maxVal = v }
+            sum += v
+            absSum += abs(v)
+        }
+        let fCount = Float(count)
+        return (minVal, maxVal, sum / fCount, absSum / fCount)
+    }
+
+    /// 计算 CVPixelBuffer（32BGRA）的平均亮度（RGB 三通道平均，0-255）
+    private func averageLuminance(of pixelBuffer: CVPixelBuffer) -> Double {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return 0 }
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        var sum: Int64 = 0
+        for y in 0..<height {
+            let row = base.advanced(by: y * bytesPerRow).assumingMemoryBound(to: UInt8.self)
+            for x in 0..<width {
+                // 32BGRA: 字节0=B, 1=G, 2=R, 3=A
+                sum += Int64(row[x * 4 + 0]) + Int64(row[x * 4 + 1]) + Int64(row[x * 4 + 2])
+            }
+        }
+        return Double(sum) / Double(width * height * 3)
     }
 
     // MARK: - vImage 缩放

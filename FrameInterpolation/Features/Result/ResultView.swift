@@ -36,12 +36,24 @@ struct ResultView: View {
 
                         // 文件信息
                         CardView {
-                            VStack(spacing: DesignTokens.Spacing.s) {
+                            VStack(alignment: .leading, spacing: DesignTokens.Spacing.s) {
                                 infoRow("输出文件", outputURL.lastPathComponent)
                                 Divider()
                                 infoRow("处理状态", "处理完成", highlight: true)
                                 Divider()
                                 infoRow("当前模式", appState.processingMode.isEmpty ? "未知" : appState.processingMode)
+                                if !appState.debugInfo.isEmpty {
+                                    Divider()
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("调试信息")
+                                            .font(.subheadline)
+                                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                                        Text(appState.debugInfo)
+                                            .font(.caption.monospaced())
+                                            .foregroundColor(DesignTokens.Colors.textPrimary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
                             }
                         }
                     }
