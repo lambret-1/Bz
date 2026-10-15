@@ -2,7 +2,7 @@ name: iOS Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, testping]
   workflow_dispatch:
 
 jobs:
@@ -30,6 +30,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-spm-
 
+      - name: 读取版本号
+        id: version
+        run: |
+          VERSION=$(grep 'CFBundleShortVersionString' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "版本号: $VERSION"
+
       - name: 生成 Xcode 工程
         run: xcodegen generate
 
@@ -47,13 +54,19 @@ jobs:
 
       - name: 导出未签名 IPA
         run: |
+          BRANCH=${GITHUB_REF_NAME}
+          VERSION=${{ steps.version.outputs.version }}
+          IPA_NAME="AI补帧_${BRANCH}_v${VERSION}.ipa"
           mkdir -p build/Payload
           cp -r build/FrameInterpolation.xcarchive/Products/Applications/FrameInterpolation.app build/Payload/
-          cd build && zip -r FrameInterpolation-unsigned.ipa Payload/
+          cd build && zip -r "$IPA_NAME" Payload/
+          echo "ipa_name=$IPA_NAME" >> $GITHUB_OUTPUT
+          echo "产物名称: $IPA_NAME"
+        id: export
 
       - name: 上传 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: FrameInterpolation-unsigned-ipa
-          path: build/FrameInterpolation-unsigned.ipa
+          name: AI补帧_${{ github.ref_name }}_v${{ steps.version.outputs.version }}
+          path: build/${{ steps.export.outputs.ipa_name }}
           retention-days: 30

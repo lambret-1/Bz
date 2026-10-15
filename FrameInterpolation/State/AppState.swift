@@ -1,11 +1,13 @@
 import SwiftUI
 import OSLog
+import AVFoundation
 
 /// 全局应用状态，主线程隔离，统一管理导航、导入、处理、结果与 Toast
 @MainActor
 final class AppState: ObservableObject {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "AppState")
     private let pipeline = VideoPipeline()
+    private let recentRecordsKey = "BzRecentRecords"
 
     // MARK: - 导航状态
     /// 是否展示参数设置页（独立 fullScreenCover）
@@ -42,6 +44,9 @@ final class AppState: ObservableObject {
 
     // MARK: - 初始化
     init() {
+        // 加载最近记录
+        loadRecentRecords()
+
         // 监听 FrameInterpolator 的调试信息更新
         NotificationCenter.default.addObserver(
             forName: NSNotification.Name("BzDebugInfoUpdated"),
@@ -50,6 +55,59 @@ final class AppState: ObservableObject {
         ) { [weak self] note in
             self?.debugInfo = note.object as? String ?? ""
         }
+    }
+
+    // MARK: - 最近记录持久化
+
+    private func loadRecentRecords() {
+        guard let data = UserDefaults.standard.data(forKey: recentRecordsKey) else { return }
+        do {
+            recentRecords = try JSONDecoder().decode([RecentRecord].self, from: data)
+            logger.info("加载最近记录: \(self.recentRecords.count) 条")
+        } catch {
+            logger.error("加载最近记录失败: \(error.localizedDescription)")
+        }
+    }
+
+    private func saveRecentRecords() {
+        do {
+            let data = try JSONEncoder().encode(recentRecords)
+            UserDefaults.standard.set(data, forKey: recentRecordsKey)
+        } catch {
+            logger.error("保存最近记录失败: \(error.localizedDescription)")
+        }
+    }
+
+    /// 从视频文件生成缩略图（第一帧）
+    private func generateThumbnail(from url: URL) -> Data? {
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 320, height: 320)
+        do {
+            let cgImage = try generator.copyCGImage(at: .zero, actualTime: nil)
+            let uiImage = UIImage(cgImage: cgImage)
+            return uiImage.jpegData(compressionQuality: 0.6)
+        } catch {
+            logger.error("生成缩略图失败: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// 追加最近记录（处理成功后调用）
+    private func appendRecentRecord(outputURL: URL, outputFPS: Double) {
+        let thumbnail = generateThumbnail(from: outputURL)
+        let record = RecentRecord(
+            fileName: outputURL.lastPathComponent,
+            outputFPS: outputFPS,
+            thumbnailData: thumbnail
+        )
+        recentRecords.insert(record, at: 0)
+        // 最多保留 20 条
+        if recentRecords.count > 20 {
+            recentRecords = Array(recentRecords.prefix(20))
+        }
+        saveRecentRecords()
     }
 
     // MARK: - 导入视频
@@ -99,6 +157,8 @@ final class AppState: ObservableObject {
             inputURL: video.url,
             outputURL: outputURL,
             multiplier: frameMultiplier.rawValue,
+            fastMode: fastMode,
+            outputResolution: outputResolution,
             progress: { [weak self] value, stage in
                 guard let self = self else { return }
                 self.progress = value
@@ -115,6 +175,9 @@ final class AppState: ObservableObject {
                     self.processingMode = self.pipeline.isUsingAIInterpolation
                         ? "AI补帧（\(self.frameMultiplier.label)）"
                         : "空转管线（帧率不变）"
+                    // 追加最近记录
+                    let outputFPS = (self.selectedVideo?.originalFPS ?? 30) * Double(self.frameMultiplier.rawValue)
+                    self.appendRecentRecord(outputURL: url, outputFPS: outputFPS)
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
                     // 注意：成功时不设置 isProcessing = false

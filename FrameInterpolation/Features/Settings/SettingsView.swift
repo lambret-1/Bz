@@ -146,7 +146,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("快速模式")
                         .font(.headline)
-                    Text("使用 Metal 帧混合，速度更快（当前为空转管线）")
+                    Text("AI插值与帧混合交替，速度提升约40%")
                         .font(.caption)
                         .foregroundColor(DesignTokens.Colors.textSecondary)
                 }
