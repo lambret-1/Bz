@@ -198,12 +198,12 @@ final class VideoPipeline {
         if audioReaderOutput != nil {
             let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
             audioInput.expectsMediaDataInRealTime = false
-            let added = writer.add(audioInput)
-            if added {
+            writer.add(audioInput)
+            if writer.status != .failed {
                 audioWriterInput = audioInput
                 print("[Bz音频诊断] 音频 WriterInput 已添加成功(nil透传)")
             } else {
-                print("[Bz音频诊断] writer.add(audio)返回false，writer状态:\(writer.status.rawValue) error:\(writer.error?.localizedDescription ?? "nil")")
+                print("[Bz音频诊断] writer.add(audio)失败，error:\(writer.error?.localizedDescription ?? "nil")")
             }
         }
 
