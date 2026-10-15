@@ -7,6 +7,7 @@ final class MetalComputeHelper {
 
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
+    private var textureCache: CVMetalTextureCache?
 
     private init() {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -15,9 +16,51 @@ final class MetalComputeHelper {
         }
         self.device = device
         self.commandQueue = queue
+
+        // 创建 CVMetalTextureCache，用于 IOSurface 零拷贝纹理
+        var cache: CVMetalTextureCache?
+        let status = CVMetalTextureCacheCreate(
+            kCFAllocatorDefault,
+            nil,
+            device,
+            [kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary,
+            &cache
+        )
+        if status == kCVReturnSuccess {
+            self.textureCache = cache
+        }
     }
 
-    /// 把 CVPixelBuffer(BGRA) 包装为 MTLTexture（零拷贝，依赖 IOSurface）
+    /// 从 CVPixelBuffer 的 IOSurface 创建 MTLTexture（零拷贝，推荐用于输入/输出帧）
+    /// 比 makeTexture(from:) 的 lock+replace 路径快得多，无 CPU/GPU 来回拷贝
+    func makeIOSurfaceTexture(from pixelBuffer: CVPixelBuffer, usage: MTLTextureUsage = [.shaderRead, .shaderWrite]) -> MTLTexture? {
+        guard let cache = textureCache else { return nil }
+
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        guard width > 0, height > 0 else { return nil }
+
+        var image: CVMetalTexture?
+        let status = CVMetalTextureCacheCreateTextureFromImage(
+            kCFAllocatorDefault,
+            cache,
+            pixelBuffer,
+            nil,
+            .bgra8Unorm,
+            width,
+            height,
+            0,
+            &image
+        )
+
+        guard status == kCVReturnSuccess, let cvImage = image else {
+            return nil
+        }
+        return CVMetalTextureGetTexture(cvImage)
+    }
+
+    /// 把 CVPixelBuffer(BGRA) 包装为 MTLTexture（CPU→GPU 拷贝路径，用于非 IOSurface buffer）
+    /// 注意：有性能开销，优先使用 makeIOSurfaceTexture
     func makeTexture(from pixelBuffer: CVPixelBuffer, usage: MTLTextureUsage = [.shaderRead, .shaderWrite]) -> MTLTexture? {
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
