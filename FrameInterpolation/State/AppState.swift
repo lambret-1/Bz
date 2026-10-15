@@ -14,6 +14,12 @@ final class AppState: ObservableObject {
     // MARK: - 后台任务管理（统一在AppState，避免ProcessingView dismiss后丢失保护）
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
+    // MARK: - 处理耗时统计（用于预估时间自适应）
+    private let processingSpeedKey = "BzProcessingSpeedFactor"
+    private var processingStartTime: Date?
+    /// 本机实测处理速度系数：视频时长/实际耗时，越大越快。nil表示尚未实测
+    @Published private(set) var measuredSpeedFactor: Double?
+
     // MARK: - 导航状态
     /// 是否展示参数设置页（独立 fullScreenCover）
     @Published var showSettings = false
@@ -44,6 +50,8 @@ final class AppState: ObservableObject {
     @Published var processingMode: String = ""
     /// 调试信息（模型输出统计、亮度对比等），显示在结果页
     @Published var debugInfo: String = ""
+    /// 是否使用AI插值（模型加载成功）
+    var isUsingAI: Bool { pipeline.isUsingAIInterpolation }
 
     // MARK: - Toast
     @Published var toastMessage: String?
@@ -53,6 +61,9 @@ final class AppState: ObservableObject {
     init() {
         // 加载最近记录
         loadRecentRecords()
+        // 加载本机实测处理速度系数
+        let saved = UserDefaults.standard.double(forKey: processingSpeedKey)
+        measuredSpeedFactor = saved > 0 ? saved : nil
 
         // 监听 FrameInterpolator 的调试信息更新
         NotificationCenter.default.addObserver(
@@ -154,6 +165,7 @@ final class AppState: ObservableObject {
         progress = 0
         processedFrames = 0
         stage = .decoding
+        processingStartTime = Date()
 
         // 统一申请后台任务，处理全程持有（包括最小化到首页）
         beginBackgroundTask()
@@ -190,6 +202,20 @@ final class AppState: ObservableObject {
                     self.appendRecentRecord(outputURL: url, outputFPS: outputFPS)
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
+                    // 记录本机实测处理速度系数（视频时长/实际耗时）
+                    if let start = self.processingStartTime,
+                       let videoDuration = self.selectedVideo?.duration,
+                       videoDuration > 0 {
+                        let elapsed = Date().timeIntervalSince(start)
+                        if elapsed > 0 {
+                            let speedFactor = videoDuration / elapsed
+                            // 滑动平均：新系数占30%，避免单次异常波动
+                            let averaged = self.measuredSpeedFactor.map { ($0 * 0.7) + (speedFactor * 0.3) } ?? speedFactor
+                            self.measuredSpeedFactor = averaged
+                            UserDefaults.standard.set(averaged, forKey: self.processingSpeedKey)
+                            self.logger.info("实测速度系数: \(String(format: "%.2f", speedFactor)), 滑动平均: \(String(format: "%.2f", averaged))")
+                        }
+                    }
                     // 处理完成，结束后台任务
                     self.endBackgroundTask()
                     // 注意：成功时不设置 isProcessing = false
