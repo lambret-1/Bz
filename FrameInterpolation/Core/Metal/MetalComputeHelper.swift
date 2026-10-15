@@ -48,8 +48,16 @@ final class MetalComputeHelper {
         return texture
     }
 
-    /// 创建一个空的 RGBA 纹理，用作 Metal 的中间缓冲
-    func makeEmptyTexture(width: Int, height: Int, format: MTLPixelFormat = .rgba16Float) -> MTLTexture? {
+    /// 创建一个空的纹理，用作 Metal 的中间缓冲
+    /// - Parameters:
+    ///   - storageMode: 存储模式，中间缓冲用 .private（GPU-only，性能好），
+    ///                  需要 CPU 读取（如 getBytes）时必须用 .shared
+    func makeEmptyTexture(
+        width: Int,
+        height: Int,
+        format: MTLPixelFormat = .rgba16Float,
+        storageMode: MTLStorageMode = .private
+    ) -> MTLTexture? {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: format,
             width: width,
@@ -57,7 +65,7 @@ final class MetalComputeHelper {
             mipmapped: false
         )
         descriptor.usage = [.shaderRead, .shaderWrite]
-        descriptor.storageMode = .private
+        descriptor.storageMode = storageMode
         return device.makeTexture(descriptor: descriptor)
     }
 
