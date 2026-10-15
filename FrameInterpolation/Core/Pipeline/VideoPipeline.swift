@@ -487,7 +487,7 @@ final class VideoPipeline {
 
         // 0.5 混合：dst = (src0 + src1) / 2
         for i in 0..<totalBytes {
-            dst[i] = (UInt16(src0[i]) + UInt16(src1[i])) / 2
+            dst[i] = UInt8((UInt16(src0[i]) + UInt16(src1[i])) / 2)
         }
 
         return result
