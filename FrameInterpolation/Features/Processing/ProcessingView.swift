@@ -12,8 +12,23 @@ struct ProcessingView: View {
 
     var body: some View {
         VStack(spacing: DesignTokens.Spacing.l) {
-            // 顶部栏：取消按钮
+            // 顶部栏：回首页 + 取消
             HStack {
+                Button {
+                    appState.minimizeProcessing()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "house")
+                        Text("回首页")
+                    }
+                    .font(.subheadline)
+                    .foregroundColor(DesignTokens.Colors.textSecondary)
+                    .frame(height: DesignTokens.minTapArea)
+                }
+                .accessibilityLabel("最小化到首页")
+
+                Spacer()
+
                 Button {
                     showCancelConfirm = true
                 } label: {
@@ -23,7 +38,6 @@ struct ProcessingView: View {
                         .frame(width: DesignTokens.minTapArea, height: DesignTokens.minTapArea)
                 }
                 .accessibilityLabel("取消处理")
-                Spacer()
             }
             .padding(.horizontal, DesignTokens.Spacing.m)
 
@@ -67,7 +81,8 @@ struct ProcessingView: View {
             UIApplication.shared.isIdleTimerDisabled = true
             // 申请后台任务，切后台后继续执行约30秒
             backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "视频补帧处理") {
-                // 后台时间耗尽时的回调
+                // 后台时间快用完了，发通知喊用户回来
+                appState.backgroundTimeExpiring()
                 if backgroundTaskID != .invalid {
                     UIApplication.shared.endBackgroundTask(backgroundTaskID)
                     backgroundTaskID = .invalid

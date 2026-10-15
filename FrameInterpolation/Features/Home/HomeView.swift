@@ -90,6 +90,43 @@ struct HomeView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
+        // 处理中横幅（最小化到首页时显示）
+        .overlay(alignment: .top) {
+            if appState.isProcessingMinimized {
+                Button {
+                    appState.restoreProcessingView()
+                } label: {
+                    HStack(spacing: DesignTokens.Spacing.s) {
+                        ProgressView(value: appState.progress)
+                            .progressViewStyle(.linear)
+                            .frame(width: 80)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("补帧中 \(Int(appState.progress * 100))%")
+                                .font(.caption.weight(.medium))
+                            Text(appState.stage.rawValue)
+                                .font(.caption2)
+                                .foregroundColor(DesignTokens.Colors.textSecondary)
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+                    .padding(.horizontal, DesignTokens.Spacing.m)
+                    .padding(.vertical, DesignTokens.Spacing.s)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(12)
+                    .padding(.horizontal, DesignTokens.Spacing.m)
+                    .padding(.top, DesignTokens.Spacing.s)
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        // 处理中页（从首页横幅恢复时展示）
+        .fullScreenCover(isPresented: $appState.isProcessing) {
+            ProcessingView()
+                .environmentObject(appState)
+        }
     }
 }
 
