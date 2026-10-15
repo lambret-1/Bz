@@ -333,7 +333,8 @@ final class VideoPipeline {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            if let value = CVBufferGetAttachment(src, key, nil) {
+            if let unmanagedValue = CVBufferGetAttachment(src, key, nil) {
+                let value = unmanagedValue.takeUnretainedValue()
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
         }
