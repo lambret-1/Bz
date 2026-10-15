@@ -349,7 +349,7 @@ final class VideoPipeline {
                 Thread.sleep(forTimeInterval: 0.005)
                 waitCount += 1
                 if waitCount > 600 {
-                    print("[Bz音频诊断] 音频 Writer 3秒未就绪，writer状态: \(writerInput.assetWriter?.status.rawValue ?? -1)")
+                    print("[Bz音频诊断] 音频 Writer 3秒未就绪，isReady: \(writerInput.isReadyForMoreMediaData)")
                     break
                 }
             }
@@ -358,7 +358,7 @@ final class VideoPipeline {
                 if writerInput.append(sampleBuffer) {
                     sampleCount += 1
                 } else {
-                    print("[Bz音频诊断] 音频样本 append 失败，已写入\(sampleCount)个，writer状态: \(writerInput.assetWriter?.status.rawValue ?? -1)")
+                    print("[Bz音频诊断] 音频样本 append 失败，已写入\(sampleCount)个，isReady: \(writerInput.isReadyForMoreMediaData)")
                 }
             }
         }
