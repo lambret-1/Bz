@@ -80,8 +80,23 @@ final class VideoPipeline {
     ) throws {
         let asset = AVURLAsset(url: inputURL)
 
+        // 异步加载轨道（iOS 16+ 同步属性可能返回空，必须用 loadTracks）
+        let tracksSemaphore = DispatchSemaphore(value: 0)
+        var loadedVideoTrack: AVAssetTrack?
+        var loadedAudioTrack: AVAssetTrack?
+        asset.loadTracks(withMediaType: .video) { videoTracks, error in
+            loadedVideoTrack = videoTracks?.first
+            asset.loadTracks(withMediaType: .audio) { audioTracks, _ in
+                loadedAudioTrack = audioTracks?.first
+                tracksSemaphore.signal()
+            }
+        }
+        tracksSemaphore.wait()
+
+        print("[Bz音频诊断] 视频轨道: \(loadedVideoTrack != nil ? "有" : "无"), 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
+
         // 获取视频轨道
-        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+        guard let videoTrack = loadedVideoTrack else {
             throw PipelineError.noVideoTrack
         }
 
@@ -104,17 +119,16 @@ final class VideoPipeline {
             throw PipelineError.invalidVideoSize
         }
 
-        logger.info("输入: \(outputWidth)x\(outputHeight), \(inputFPS)fps, 时长\(durationSeconds)s, 总帧数\(totalInputFrames)")
-        logger.info("输出: \(outputFPS)fps, 倍数\(multiplier)x")
+        print("[Bz音频诊断] 输入: \(outputWidth)x\(outputHeight), \(inputFPS)fps, 时长\(durationSeconds)s")
+        print("[Bz音频诊断] 输出: \(outputFPS)fps, 倍数\(multiplier)x")
 
         // 删除已存在的输出文件
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try? FileManager.default.removeItem(at: outputURL)
         }
 
-        // MARK: 配置 Reader（视频和音频共享 Reader，在视频循环中同步读取音频）
+        // MARK: 配置视频 Reader
         let reader = try AVAssetReader(asset: asset)
-
         let videoReaderOutput = AVAssetReaderTrackOutput(
             track: videoTrack,
             outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
@@ -125,21 +139,26 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // 音频轨道（共享 reader，在视频循环中同步读取写入，避免时间戳回退）
+        // MARK: 配置独立音频 Reader（音频与视频完全隔离，避免共享 reader 导致音频读不到）
+        var audioReader: AVAssetReader?
         var audioReaderOutput: AVAssetReaderTrackOutput?
-        let audioTracks = asset.tracks(withMediaType: .audio)
-        logger.notice("音频轨道数量: \(audioTracks.count)")
-        if let audioTrack = audioTracks.first {
-            let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-            if reader.canAdd(audioOutput) {
-                reader.add(audioOutput)
-                audioReaderOutput = audioOutput
-                logger.notice("音频轨道已添加到 Reader，时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s, 格式描述: \(String(describing: audioTrack.formatDescriptions.first ?? "unknown"))")
-            } else {
-                logger.error("Reader 无法添加音频 output")
+        if let audioTrack = loadedAudioTrack {
+            do {
+                let independentAudioReader = try AVAssetReader(asset: asset)
+                let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+                if independentAudioReader.canAdd(audioOutput) {
+                    independentAudioReader.add(audioOutput)
+                    audioReader = independentAudioReader
+                    audioReaderOutput = audioOutput
+                    print("[Bz音频诊断] 独立音频 Reader 创建成功，音频时长: \(CMTimeGetSeconds(audioTrack.timeRange.duration))s")
+                } else {
+                    print("[Bz音频诊断] 独立音频 Reader 无法添加 output")
+                }
+            } catch {
+                print("[Bz音频诊断] 独立音频 Reader 创建失败: \(error.localizedDescription)")
             }
         } else {
-            logger.notice("未检测到音频轨道，输出将无音频")
+            print("[Bz音频诊断] 无音频轨道，输出将无音频")
         }
 
         // MARK: 配置 Writer
@@ -178,9 +197,9 @@ final class VideoPipeline {
             if writer.canAdd(audioInput) {
                 writer.add(audioInput)
                 audioWriterInput = audioInput
-                logger.notice("音频 WriterInput 已添加")
+                print("[Bz音频诊断] 音频 WriterInput 已添加到 Writer")
             } else {
-                logger.error("Writer 无法添加音频 input")
+                print("[Bz音频诊断] Writer 无法添加音频 input")
             }
         }
 
@@ -189,14 +208,27 @@ final class VideoPipeline {
             throw PipelineError.readerStartFailed(reader.error ?? PipelineError.unknown)
         }
         let writerStarted = writer.startWriting()
-        logger.notice("Writer startWriting 返回: \(writerStarted), 状态: \(writer.status.rawValue)")
+        print("[Bz音频诊断] Writer startWriting 返回: \(writerStarted), 状态: \(writer.status.rawValue)")
         writer.startSession(atSourceTime: .zero)
+
+        // MARK: 启动音频独立线程（与视频处理并行）
+        let audioGroup = DispatchGroup()
+        if let audioReader = audioReader, let audioRO = audioReaderOutput, let audioWI = audioWriterInput {
+            audioGroup.enter()
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self = self else { audioGroup.leave(); return }
+                self.audioStage(reader: audioReader, output: audioRO, writerInput: audioWI)
+                audioGroup.leave()
+            }
+            print("[Bz音频诊断] 音频独立线程已启动")
+        } else {
+            print("[Bz音频诊断] 音频线程未启动: reader=\(audioReader != nil), output=\(audioReaderOutput != nil), writerInput=\(audioWriterInput != nil)")
+        }
 
         // MARK: 视频处理循环
         var outputFrameIndex = 0
         var previousPixelBuffer: CVPixelBuffer?
         var lastProgressReport = 0.0
-        var audioSampleCount = 0
 
         while reader.status == .reading {
             if isCancelled {
@@ -208,21 +240,6 @@ final class VideoPipeline {
             guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
                   let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
                 break
-            }
-
-            // 同步读取并写入所有可用的音频样本（关键：在视频循环中排空音频 output，
-            // 避免视频读完后 reader 时间戳推进到末尾导致音频读不到数据）
-            if let audioWriterInput = audioWriterInput, let audioRO = audioReaderOutput {
-                while let audioSample = audioRO.copyNextSampleBuffer() {
-                    autoreleasepool {
-                        self.waitForWriterReady(audioWriterInput)
-                        if audioWriterInput.append(audioSample) {
-                            audioSampleCount += 1
-                        } else {
-                            logger.error("音频样本 append 失败，writer状态: \(writer.status.rawValue), 已写入\(audioSampleCount)个")
-                        }
-                    }
-                }
             }
 
             // 进度计算（基于输入帧数）
@@ -270,21 +287,6 @@ final class VideoPipeline {
             previousPixelBuffer = pixelBuffer
         }
 
-        // 视频读完后，扫尾剩余音频样本
-        if let audioWriterInput = audioWriterInput, let audioRO = audioReaderOutput {
-            while let audioSample = audioRO.copyNextSampleBuffer() {
-                autoreleasepool {
-                    self.waitForWriterReady(audioWriterInput)
-                    if audioWriterInput.append(audioSample) {
-                        audioSampleCount += 1
-                    }
-                }
-            }
-            logger.notice("音频透传完成，音频样本数: \(audioSampleCount), reader状态: \(reader.status.rawValue)")
-        } else {
-            logger.notice("音频透传跳过：audioWriterInput=\(audioWriterInput != nil), audioReaderOutput=\(audioReaderOutput != nil)")
-        }
-
         // 检查 reader 最终状态
         if reader.status == .failed {
             if let error = reader.error {
@@ -294,8 +296,12 @@ final class VideoPipeline {
         }
 
         videoWriterInput.markAsFinished()
+        print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)，等待音频线程完成...")
+
+        // 等待音频线程完成
+        audioGroup.wait()
         audioWriterInput?.markAsFinished()
-        logger.info("视频处理完成，输出帧数: \(outputFrameIndex)")
+        print("[Bz音频诊断] 音频线程已完成，writer状态: \(writer.status.rawValue)")
 
         // MARK: 完成写入
         let semaphore = DispatchSemaphore(value: 0)
@@ -315,6 +321,52 @@ final class VideoPipeline {
             logger.error("视频编码失败: \(error.localizedDescription, privacy: .public)")
             throw error
         }
+    }
+
+    // MARK: - 音频独立线程（独立 Reader，连续读取写入）
+    private func audioStage(reader: AVAssetReader, output: AVAssetReaderTrackOutput, writerInput: AVAssetWriterInput) {
+        guard reader.startReading() else {
+            print("[Bz音频诊断] 音频 Reader startReading 失败: \(reader.error?.localizedDescription ?? "unknown")")
+            return
+        }
+        print("[Bz音频诊断] 音频 Reader 已启动，开始读取写入")
+
+        var sampleCount = 0
+        while reader.status == .reading {
+            if isCancelled {
+                reader.cancelReading()
+                break
+            }
+
+            guard let sampleBuffer = output.copyNextSampleBuffer() else {
+                break
+            }
+
+            // 等待 writer 就绪
+            var waitCount = 0
+            while !writerInput.isReadyForMoreMediaData {
+                if isCancelled { reader.cancelReading(); return }
+                Thread.sleep(forTimeInterval: 0.005)
+                waitCount += 1
+                if waitCount > 600 {
+                    print("[Bz音频诊断] 音频 Writer 3秒未就绪，writer状态: \(writerInput.assetWriter?.status.rawValue ?? -1)")
+                    break
+                }
+            }
+
+            autoreleasepool {
+                if writerInput.append(sampleBuffer) {
+                    sampleCount += 1
+                } else {
+                    print("[Bz音频诊断] 音频样本 append 失败，已写入\(sampleCount)个，writer状态: \(writerInput.assetWriter?.status.rawValue ?? -1)")
+                }
+            }
+        }
+
+        if reader.status == .failed {
+            print("[Bz音频诊断] 音频 Reader 失败: \(reader.error?.localizedDescription ?? "unknown")")
+        }
+        print("[Bz音频诊断] 音频线程结束，共写入 \(sampleCount) 个样本，reader状态: \(reader.status.rawValue)")
     }
 
     // MARK: - 等待 Writer 就绪（有界背压）
