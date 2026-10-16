@@ -1,56 +1,50 @@
 import SwiftUI
 import AVKit
 
-/// 视频预览区，强制黑色背景，16:9 比例
-/// 直接使用 PlayerManager 单例，避免双 player 状态不同步
-/// 监听 currentProject 变化，确保异步导入后能正确加载
+/// 视频预览区
+/// 使用 @ObservedObject 监听 PlayerManager，player 变化自动刷新
+/// 不强制 16:9，根据可用空间自适应，避免上下大片黑边
 struct PreviewArea: View {
     @EnvironmentObject var appState: AppState
-    @State private var refreshID = UUID()  // 用于触发视图刷新
-    @State private var hasLoaded = false   // 标记是否已尝试加载
-
-    private var player: AVPlayer? {
-        PlayerManager.shared.player
-    }
+    @ObservedObject private var playerManager = PlayerManager.shared
+    @State private var hasLoaded = false
 
     private var currentURL: URL? {
         appState.currentProject?.videoInfo.url
     }
 
     var body: some View {
-        ZStack {
-            Color.videoBg
+        GeometryReader { geometry in
+            ZStack {
+                Color.videoBg
 
-            if let player {
-                VideoPlayer(player: player)
-                    .aspectRatio(16/9, contentMode: .fit)
-                    .frame(maxWidth: .infinity)
-                    .id(refreshID)
-            } else {
-                VStack(spacing: 8) {
-                    Image(systemName: "play.rectangle")
-                        .font(.system(size: 48))
-                        .foregroundColor(Color(uiColor: .systemGray))
-                    if !hasLoaded {
-                        Text("加载中…")
-                            .font(.caption)
-                            .foregroundColor(.gray)
+                if let player = playerManager.player {
+                    VideoPlayer(player: player)
+                        .frame(width: geometry.size.width, height: geometry.size.height)
+                } else {
+                    VStack(spacing: 8) {
+                        Image(systemName: "play.rectangle")
+                            .font(.system(size: 48))
+                            .foregroundColor(Color(uiColor: .systemGray))
+                        if !hasLoaded {
+                            Text("加载中…")
+                                .font(.caption)
+                                .foregroundColor(.gray)
+                        }
                     }
+                    .frame(width: geometry.size.width, height: geometry.size.height)
                 }
-                .aspectRatio(16/9, contentMode: .fit)
-                .frame(maxWidth: .infinity)
             }
         }
-        .aspectRatio(16/9, contentMode: .fit)
         .frame(maxWidth: .infinity)
+        .frame(minHeight: 200, maxHeight: .infinity)
         .onAppear {
             loadPlayerIfNeeded()
         }
-        // 监听项目变化（包括异步导入完成后的变化）
+        // 监听项目变化（异步导入完成后加载）
         .onChange(of: appState.currentProject?.id) { _ in
             loadPlayerIfNeeded()
         }
-        // 监听 url 变化（兜底，防止 id 相同但 url 不同的情况）
         .onChange(of: currentURL?.lastPathComponent) { _ in
             loadPlayerIfNeeded()
         }
@@ -58,13 +52,10 @@ struct PreviewArea: View {
 
     private func loadPlayerIfNeeded() {
         guard let url = currentURL else {
-            // 项目尚未就绪，标记未加载，等待后续变化
             hasLoaded = false
             return
         }
-
         hasLoaded = true
         PlayerManager.shared.load(url: url)
-        refreshID = UUID()
     }
 }

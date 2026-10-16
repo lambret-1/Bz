@@ -11,15 +11,15 @@ enum ZoomLevel: CGFloat, CaseIterable {
 
 /// 时间线视图：刻度尺 + 片段卡片 + 播放头 + 缩放 + 逐帧 + 音频轨 + 转场
 /// 单 ScrollView 架构：刻度尺与片段轨道同步滚动，避免双 ScrollView 不同步
+/// @ObservedObject 监听 PlayerManager，播放时间自动同步
 struct TimelineView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var playerManager = PlayerManager.shared
     @State private var currentZoom: ZoomLevel = .l1
-    @State private var currentFrame: Int = 0
     @State private var thumbnails: [Int: UIImage] = [:]
     @State private var audioSegment: AudioSegment?
     @State private var transition: TransitionType = .none
     @State private var transitionDuration: TimeInterval = 0.3
-    @State private var timeObserver: Any?
     @State private var isScrubbing = false
     @State private var viewAlive = true  // 标记视图存活，避免异步回调写入已销毁视图
 
@@ -40,6 +40,12 @@ struct TimelineView: View {
         appState.currentProject?.segments ?? []
     }
 
+    /// 当前帧号（从 playerManager 自动同步，拖动时锁定）
+    private var currentFrame: Int {
+        isScrubbing ? _scrubFrame : Int(playerManager.currentTime * fps)
+    }
+    @State private var _scrubFrame = 0
+
     var body: some View {
         VStack(spacing: 0) {
             // 统一滚动区域：刻度尺 + 片段轨道在同一个 ScrollView 内，保证同步
@@ -52,7 +58,7 @@ struct TimelineView: View {
                 }
                 .padding(.horizontal, UIScreen.main.bounds.width / 2)
             }
-            .frame(height: 124)  // 24(刻度尺) + 100(片段轨道)
+            .frame(height: 140)  // 24(刻度尺) + 100(片段轨道) + 16(间距)
             .background(Color.timelineBg)
             // 缩放手势（用 simultaneousGesture 避免与滚动手势冲突）
             .simultaneousGesture(
@@ -74,10 +80,18 @@ struct TimelineView: View {
             // 拖动开始/结束时设置 isScrubbing，防止播放器回调抢帧号
             .simultaneousGesture(
                 DragGesture(minimumDistance: 1)
-                    .onChanged { _ in
-                        if !isScrubbing { isScrubbing = true }
+                    .onChanged { value in
+                        if !isScrubbing {
+                            isScrubbing = true
+                            _scrubFrame = Int(playerManager.currentTime * fps)
+                        }
+                        // 根据拖动距离计算帧偏移
+                        let frameOffset = Int(value.translation.width / frameWidth)
+                        _scrubFrame = max(0, min(totalFrames - 1, _scrubFrame + frameOffset))
                     }
                     .onEnded { _ in
+                        // 拖动结束，seek 到目标帧
+                        playerManager.seek(toFrame: _scrubFrame, fps: fps)
                         isScrubbing = false
                     }
             )
@@ -100,15 +114,14 @@ struct TimelineView: View {
         .background(Color.timelineBg)
         .onAppear {
             viewAlive = true
-            setupPlayerObserver()
         }
         .onDisappear {
             viewAlive = false
-            removePlayerObserver()
         }
-        // 监听项目变化（异步导入完成后刷新片段轨道）
+        // 监听项目变化（异步导入完成后清空缩略图缓存，重新加载）
         .onChange(of: appState.currentProject?.id) { _ in
-            // 触发视图刷新，重新计算 segments
+            thumbnails.removeAll()
+            audioSegment = nil
         }
     }
 
@@ -208,9 +221,9 @@ struct TimelineView: View {
     private var frameStepControl: some View {
         HStack {
             Button {
-                currentFrame = max(0, currentFrame - 1)
+                let target = max(0, currentFrame - 1)
                 UISelectionFeedbackGenerator().selectionChanged()
-                seekToFrame(currentFrame)
+                playerManager.seek(toFrame: target, fps: fps)
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "chevron.left")
@@ -232,9 +245,9 @@ struct TimelineView: View {
             Divider().frame(height: 20).background(Color.gray)
 
             Button {
-                currentFrame = min(max(totalFrames - 1, 0), currentFrame + 1)
+                let target = min(max(totalFrames - 1, 0), currentFrame + 1)
                 UISelectionFeedbackGenerator().selectionChanged()
-                seekToFrame(currentFrame)
+                playerManager.seek(toFrame: target, fps: fps)
             } label: {
                 HStack(spacing: 4) {
                     Text("下一帧")
@@ -286,29 +299,6 @@ struct TimelineView: View {
         .background(Color(uiColor: .systemBackground))
     }
 
-    // MARK: - 播放器观察者（播放头与播放器同步）
-    private func setupPlayerObserver() {
-        guard let player = PlayerManager.shared.player else { return }
-        // 降低刷新频率到 20fps（0.05s），减少主线程压力
-        let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
-        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
-            guard self.viewAlive else { return }
-            guard !self.isScrubbing else { return }  // 拖动时不覆盖帧号
-            let seconds = CMTimeGetSeconds(time)
-            let frame = Int(seconds * self.fps)
-            if frame != self.currentFrame {
-                self.currentFrame = frame
-            }
-        }
-    }
-
-    private func removePlayerObserver() {
-        if let observer = timeObserver, let player = PlayerManager.shared.player {
-            player.removeTimeObserver(observer)
-        }
-        timeObserver = nil
-    }
-
     // MARK: - 缩略图加载（加载20个，与显示数量一致）
     private func loadSegmentThumbnails(_ segment: VideoSegment) {
         let startFrame = Int(segment.startTime * fps)
@@ -347,14 +337,6 @@ struct TimelineView: View {
     }
 
     // MARK: - 帧吸附跳转
-    private func seekToFrame(_ frame: Int) {
-        // 帧吸附：对齐到最近的帧边界
-        let snappedFrame = max(0, min(totalFrames - 1, frame))
-        let time = Double(snappedFrame) / fps
-        PlayerManager.shared.seek(to: time)
-        currentFrame = snappedFrame
-    }
-
     // MARK: - 片段裁剪
     private func trimSegment(_ segment: VideoSegment, start: TimeInterval, end: TimeInterval) {
         guard let project = appState.currentProject,
