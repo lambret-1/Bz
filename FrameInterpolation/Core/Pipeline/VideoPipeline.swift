@@ -841,7 +841,8 @@ final class VideoPipeline {
         }
 
         outputFrameIndex = localOutputFrameCount
-        logger.info("异步超分管线完成，输出帧数: \(outputFrameIndex)")
+        let finalFrameCount = localOutputFrameCount
+        logger.info("异步超分管线完成，输出帧数: \(finalFrameCount)")
     }
 
     // MARK: - 异步补帧管线（解码+推理与编码并发）
@@ -1053,7 +1054,8 @@ final class VideoPipeline {
         }
 
         outputFrameIndex = localOutputFrameCount
-        logger.info("异步补帧管线完成，输出帧数: \(outputFrameIndex)")
+        let finalFrameCount = localOutputFrameCount
+        logger.info("异步补帧管线完成，输出帧数: \(finalFrameCount)")
     }
 
     // MARK: - 创建视频写入输入（支持 HEVC/H.264，自动检测兼容性）
