@@ -10,6 +10,8 @@ final class AppState: ObservableObject {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "AppState")
     private let pipeline = VideoPipeline()
     private let recentRecordsKey = "BzRecentRecords"
+    /// 性能监控器（处理中页面显示 CPU/内存）
+    let performanceMonitor = PerformanceMonitor()
 
     // MARK: - 后台任务管理（统一在AppState，避免ProcessingView dismiss后丢失保护）
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
@@ -40,12 +42,6 @@ final class AppState: ObservableObject {
     @Published var selectedMode: PipelineMode = .interpolation(.x2)
     /// 超分引擎类型（仅超分模式生效）
     @Published var superResolutionEngine: SuperResolutionEngineType = .fastSRGAN
-    /// 是否显示性能监控 HUD（FPS/CPU/内存），默认开启
-    @Published var showPerformanceHUD: Bool = UserDefaults.standard.bool(forKey: "BzShowPerformanceHUD") {
-        didSet {
-            UserDefaults.standard.set(showPerformanceHUD, forKey: "BzShowPerformanceHUD")
-        }
-    }
 
     // MARK: - 处理中
     @Published var progress: Double = 0
@@ -190,6 +186,9 @@ final class AppState: ObservableObject {
         stage = .decoding
         processingStartTime = Date()
 
+        // 启动性能监控（处理中页面显示 CPU/内存）
+        performanceMonitor.start()
+
         // 统一申请后台任务，处理全程持有（包括最小化到首页）
         beginBackgroundTask()
 
@@ -220,6 +219,9 @@ final class AppState: ObservableObject {
             },
             completion: { [weak self] result in
                 guard let self = self else { return }
+
+                // 停止性能监控
+                self.performanceMonitor.stop()
 
                 switch result {
                 case .success(let url):
@@ -293,6 +295,7 @@ final class AppState: ObservableObject {
 
     func cancelProcessing() {
         pipeline.cancel()
+        performanceMonitor.stop()
         isProcessing = false
         isProcessingMinimized = false
         stage = .idle

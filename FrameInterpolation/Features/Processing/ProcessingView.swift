@@ -61,6 +61,26 @@ struct ProcessingView: View {
                     .foregroundColor(DesignTokens.Colors.textSecondary)
             }
 
+            // CPU 和内存监控
+            HStack(spacing: DesignTokens.Spacing.xl) {
+                HStack(spacing: 4) {
+                    Image(systemName: "cpu")
+                        .font(.caption)
+                        .foregroundColor(cpuColor)
+                    Text(String(format: "CPU %.0f%%", appState.performanceMonitor.cpuUsage))
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                }
+                HStack(spacing: 4) {
+                    Image(systemName: "memorychip")
+                        .font(.caption)
+                        .foregroundColor(memoryColor)
+                    Text(String(format: "内存 %.0f MB", appState.performanceMonitor.memoryUsageMB))
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                }
+            }
+
 
 
             Spacer()
@@ -107,5 +127,19 @@ struct ProcessingView: View {
                     .environmentObject(appState)
             }
         }
+    }
+
+    // MARK: - 性能指标颜色
+
+    private var cpuColor: Color {
+        if appState.performanceMonitor.cpuUsage < 50 { return .green }
+        if appState.performanceMonitor.cpuUsage < 80 { return .orange }
+        return .red
+    }
+
+    private var memoryColor: Color {
+        if appState.performanceMonitor.memoryUsageMB < 200 { return .green }
+        if appState.performanceMonitor.memoryUsageMB < 400 { return .orange }
+        return .red
     }
 }
