@@ -1,50 +1,79 @@
 import SwiftUI
 import AVFoundation
 
-/// 音频波形视图
+/// 音频波形视图（后台线程解码，混合左右声道）
 struct AudioWaveformView: View {
     let url: URL
     let duration: TimeInterval
     let color: Color
 
     @State private var samples: [Float] = []
+    @State private var isLoading = true
 
     var body: some View {
         GeometryReader { geometry in
-            HStack(spacing: 1) {
-                ForEach(Array(samples.enumerated()), id: \.offset) { _, sample in
-                    let barHeight = max(2, CGFloat(sample) * geometry.size.height)
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(color.opacity(0.7))
-                        .frame(width: 2, height: barHeight)
+            if isLoading {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                HStack(spacing: 1) {
+                    ForEach(Array(samples.enumerated()), id: \.offset) { _, sample in
+                        let barHeight = max(2, CGFloat(sample) * geometry.size.height)
+                        RoundedRectangle(cornerRadius: 1)
+                            .fill(color.opacity(0.7))
+                            .frame(width: 2, height: barHeight)
+                    }
                 }
+                .frame(maxHeight: .infinity, alignment: .center)
             }
-            .frame(maxHeight: .infinity, alignment: .center)
         }
         .onAppear { loadWaveform() }
     }
 
     private func loadWaveform() {
-        guard let file = try? AVAudioFile(forReading: url) else { return }
-        let format = file.processingFormat
-        let frameCount = UInt32(file.length)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
-        try? file.read(into: buffer)
-        guard let channelData = buffer.floatChannelData else { return }
-
-        let samplesPerPixel = max(1, Int(frameCount) / 200)
-        var result: [Float] = []
-
-        for i in stride(from: 0, to: Int(frameCount), by: samplesPerPixel) {
-            var maxValue: Float = 0
-            for j in 0..<samplesPerPixel {
-                if i + j < Int(frameCount) {
-                    maxValue = max(maxValue, abs(channelData[0][i + j]))
-                }
+        // 后台线程解码音频，避免主线程卡顿
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let file = try? AVAudioFile(forReading: url) else {
+                DispatchQueue.main.async { isLoading = false }
+                return
             }
-            result.append(maxValue)
+
+            let format = file.processingFormat
+            let frameCount = UInt32(file.length)
+            let channelCount = Int(format.channelCount)
+
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+                DispatchQueue.main.async { isLoading = false }
+                return
+            }
+
+            try? file.read(into: buffer)
+            guard let channelData = buffer.floatChannelData else {
+                DispatchQueue.main.async { isLoading = false }
+                return
+            }
+
+            let samplesPerPixel = max(1, Int(frameCount) / 200)
+            var result: [Float] = []
+
+            for i in stride(from: 0, to: Int(frameCount), by: samplesPerPixel) {
+                var maxValue: Float = 0
+                for j in 0..<samplesPerPixel {
+                    if i + j < Int(frameCount) {
+                        // 混合左右声道：取所有声道的最大值
+                        for channel in 0..<channelCount {
+                            maxValue = max(maxValue, abs(channelData[channel][i + j]))
+                        }
+                    }
+                }
+                result.append(maxValue)
+            }
+
+            DispatchQueue.main.async {
+                samples = result
+                isLoading = false
+            }
         }
-        samples = result
     }
 }
 

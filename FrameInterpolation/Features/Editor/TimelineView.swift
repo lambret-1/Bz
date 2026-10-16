@@ -133,7 +133,12 @@ struct TimelineView: View {
                 appState.selectedSegmentID = selectedSegmentID == segment.id ? nil : segment.id
                 UISelectionFeedbackGenerator().selectionChanged()
             },
-            onTrim: { newStart, newEnd in
+            onTrimChanged: { newStart, newEnd in
+                // 实时预览：临时更新片段（不保存到撤销栈）
+                trimSegmentPreview(segment, start: newStart, end: newEnd)
+            },
+            onTrimEnded: { newStart, newEnd in
+                // 结束时保存（推入撤销栈）
                 trimSegment(segment, start: newStart, end: newEnd)
             }
         )
@@ -147,10 +152,11 @@ struct TimelineView: View {
             Triangle()
                 .fill(Color.accentPink)
                 .frame(width: 12, height: 8)
-            // 竖线
+            // 竖线（动态填充剩余高度，不硬编码）
             Rectangle()
                 .fill(Color.accentPink)
-                .frame(width: 2, height: 92)
+                .frame(width: 2)
+                .frame(maxHeight: .infinity)
         }
         .frame(maxHeight: .infinity, alignment: .top)
         .accessibilityLabel("播放头，当前第 \(currentFrame) 帧")
@@ -308,6 +314,23 @@ struct TimelineView: View {
             project.segments[index].duration = clampedEnd - clampedStart
         }
     }
+
+    /// 裁剪实时预览（不推入撤销栈，拖动结束时再调用trimSegment保存）
+    private func trimSegmentPreview(_ segment: VideoSegment, start: TimeInterval, end: TimeInterval) {
+        guard let project = appState.currentProject,
+              let index = project.segments.firstIndex(where: { $0.id == segment.id }) else { return }
+
+        let videoDuration = project.videoInfo.duration
+        let clampedStart = max(0, min(start, end - 0.1))
+        let clampedEnd = max(clampedStart + 0.1, min(end, videoDuration))
+
+        // 直接更新，不调用updateCurrentProject（避免每次拖动都保存）
+        if var updated = appState.currentProject {
+            updated.segments[index].startTime = clampedStart
+            updated.segments[index].duration = clampedEnd - clampedStart
+            appState.currentProject = updated
+        }
+    }
 }
 
 /// 片段卡片视图（独立组件，避免表达式过复杂）
@@ -319,7 +342,8 @@ struct SegmentCardView: View {
     let fps: Double
     let thumbnails: [Int: UIImage]
     let onTap: () -> Void
-    let onTrim: (TimeInterval, TimeInterval) -> Void
+    let onTrimChanged: (TimeInterval, TimeInterval) -> Void
+    let onTrimEnded: (TimeInterval, TimeInterval) -> Void
 
     private var segmentFrames: Int { max(1, Int(segment.duration * fps)) }
     private var segmentWidth: CGFloat { CGFloat(segmentFrames) * frameWidth }
@@ -340,9 +364,15 @@ struct SegmentCardView: View {
                 segmentLabel
             }
 
-            // 裁剪把手（选中时显示）
+            // 裁剪把手（选中时显示，实时反馈）
             if isSelected {
-                SegmentTrimOverlay(segment: segment, onTrim: onTrim)
+                SegmentTrimOverlay(
+                    segment: segment,
+                    frameWidth: frameWidth,
+                    fps: fps,
+                    onTrimChanged: onTrimChanged,
+                    onTrimEnded: onTrimEnded
+                )
             }
         }
         .frame(width: segmentWidth, height: 100)

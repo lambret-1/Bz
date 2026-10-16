@@ -5,8 +5,7 @@ import Photos
 import UIKit
 
 /// 结果预览页（独立 NavigationStack，全屏展示）
-/// 左右对比播放器 + 处理信息卡片 + 保存/分享/再次处理
-/// 左上角返回按钮 + 支持边缘左滑手势返回
+/// 上下对比播放器 + 处理信息卡片 + 保存/分享/再次处理
 struct ResultView: View {
     let outputURL: URL
     @EnvironmentObject var appState: AppState
@@ -17,6 +16,7 @@ struct ResultView: View {
     @State private var isPlaying = false
     @State private var isSaving = false
     @State private var timeObserver: Any?
+    @State private var shareAnchor: UIView?
 
     private var project: Project? { appState.currentProject }
     private var originalURL: URL? { project?.videoInfo.url }
@@ -25,7 +25,7 @@ struct ResultView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
-                    // 对比播放器
+                    // 对比播放器（上下排列，避免并排太小）
                     comparisonPlayer
 
                     // 处理信息卡片
@@ -42,9 +42,7 @@ struct ResultView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("完成") {
-                        appState.outputURL = nil
-                        appState.isProcessing = false
-                        appState.closeProjectDetail()
+                        dismiss()
                     }
                 }
             }
@@ -60,31 +58,34 @@ struct ResultView: View {
                     ToastView(message: message, style: appState.toastStyle)
                         .padding(.top, DesignTokens.Spacing.s)
                         .transition(.move(edge: .top).combined(with: .opacity))
+                        .zIndex(100)
                 }
             }
         }
     }
 
-    // MARK: - 对比播放器
+    // MARK: - 对比播放器（上下排列）
     private var comparisonPlayer: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 1) {
-                // 原始
-                VStack(spacing: 4) {
-                    Text("原始")
-                        .font(DesignTokens.Fonts.caption)
-                        .foregroundColor(DesignTokens.Colors.textSecondary)
-                    playerView(player: originalPlayer)
-                }
-                // 处理后
-                VStack(spacing: 4) {
-                    Text("处理后")
-                        .font(DesignTokens.Fonts.caption)
-                        .foregroundColor(DesignTokens.Colors.accent)
-                    playerView(player: processedPlayer)
-                }
+        VStack(spacing: DesignTokens.Spacing.s) {
+            // 原始
+            VStack(spacing: 4) {
+                Text("原始")
+                    .font(DesignTokens.Fonts.caption)
+                    .foregroundColor(DesignTokens.Colors.textSecondary)
+                CustomPlayerView(player: originalPlayer)
+                    .aspectRatio(16/9, contentMode: .fit)
+                    .cornerRadius(8)
             }
-            .frame(maxWidth: .infinity)
+
+            // 处理后
+            VStack(spacing: 4) {
+                Text("处理后")
+                    .font(DesignTokens.Fonts.caption)
+                    .foregroundColor(DesignTokens.Colors.accent)
+                CustomPlayerView(player: processedPlayer)
+                    .aspectRatio(16/9, contentMode: .fit)
+                    .cornerRadius(8)
+            }
 
             // 统一控制条
             HStack(spacing: DesignTokens.Spacing.m) {
@@ -115,12 +116,6 @@ struct ResultView: View {
         .padding(DesignTokens.Spacing.s)
         .background(DesignTokens.Colors.videoBackground)
         .cornerRadius(DesignTokens.Radius.m)
-    }
-
-    private func playerView(player: AVPlayer?) -> some View {
-        VideoPlayer(player: player)
-            .aspectRatio(16/9, contentMode: .fit)
-            .disabled(true) // 禁用原生控制，使用统一控制
     }
 
     // MARK: - 处理信息卡片
@@ -220,12 +215,20 @@ struct ResultView: View {
                         .foregroundColor(DesignTokens.Colors.textPrimary)
                 }
                 .accessibilityLabel("分享视频")
+                .background(
+                    // 用于iPad popover定位的隐藏锚点
+                    GeometryReader { geo in
+                        Color.clear
+                            .onAppear {
+                                shareAnchor = UIView()
+                            }
+                    }
+                )
             }
 
             Button {
-                appState.outputURL = nil
-                appState.isProcessing = false
-                // 回到项目详情页
+                // 再次处理：关闭结果页，回到编辑器
+                dismiss()
             } label: {
                 Text("再次处理")
                     .font(DesignTokens.Fonts.headline)
@@ -243,11 +246,24 @@ struct ResultView: View {
         }
         processedPlayer = AVPlayer(url: outputURL)
 
-        // 同步播放：监听处理后播放器的时间，同步到原始
+        // 同步播放：监听处理后播放器的时间，按比例同步到原始
+        // 补帧后时长不变，但为了兼容性，按实际时长比例同步
         if let processedPlayer = processedPlayer {
             let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
-            timeObserver = processedPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak originalPlayer] time in
-                originalPlayer?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            timeObserver = processedPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak originalPlayer, weak processedPlayer] time in
+                guard let originalPlayer = originalPlayer,
+                      let processedPlayer = processedPlayer else { return }
+
+                let processedDuration = CMTimeGetSeconds(processedPlayer.currentItem?.duration ?? .zero)
+                let originalDuration = CMTimeGetSeconds(originalPlayer.currentItem?.duration ?? .zero)
+
+                guard processedDuration > 0, originalDuration > 0 else { return }
+
+                // 按比例同步：原始时间 = 处理后时间 * (原始时长 / 处理后时长)
+                let ratio = originalDuration / processedDuration
+                let originalTime = CMTimeGetSeconds(time) * ratio
+                let syncedTime = CMTime(seconds: originalTime, preferredTimescale: 600)
+                originalPlayer.seek(to: syncedTime, toleranceBefore: .zero, toleranceAfter: .zero)
             }
         }
     }
@@ -290,24 +306,32 @@ struct ResultView: View {
         isSaving = true
 
         PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-            guard status == .authorized || status == .limited else {
+            switch status {
+            case .authorized, .limited:
+                PHPhotoLibrary.shared().performChanges {
+                    PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)
+                } completionHandler: { success, error in
+                    DispatchQueue.main.async {
+                        isSaving = false
+                        if success {
+                            appState.showToast("已保存到相册")
+                        } else {
+                            appState.showToast(error?.localizedDescription ?? "保存失败", style: .error)
+                        }
+                    }
+                }
+            case .denied, .restricted:
                 DispatchQueue.main.async {
                     isSaving = false
                     appState.showToast("没有相册写入权限，请在设置中开启", style: .error)
                 }
-                return
-            }
-
-            PHPhotoLibrary.shared().performChanges {
-                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: outputURL)
-            } completionHandler: { success, error in
+            case .notDetermined:
                 DispatchQueue.main.async {
                     isSaving = false
-                    if success {
-                        appState.showToast("已保存到相册")
-                    } else {
-                        appState.showToast(error?.localizedDescription ?? "保存失败", style: .error)
-                    }
+                }
+            @unknown default:
+                DispatchQueue.main.async {
+                    isSaving = false
                 }
             }
         }
@@ -320,15 +344,68 @@ struct ResultView: View {
             applicationActivities: nil
         )
 
+        // iPad popover 定位：使用当前窗口的中心点
         if let popover = activity.popoverPresentationController {
-            popover.sourceView = UIView()
-            popover.sourceRect = CGRect(x: UIScreen.main.bounds.midX, y: UIScreen.main.bounds.midY, width: 0, height: 0)
-            popover.permittedArrowDirections = []
+            if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+               let window = windowScene.keyWindow {
+                popover.sourceView = window
+                popover.sourceRect = CGRect(
+                    x: window.bounds.midX,
+                    y: window.bounds.midY,
+                    width: 0,
+                    height: 0
+                )
+                popover.permittedArrowDirections = []
+            }
         }
 
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
            let root = windowScene.keyWindow?.rootViewController {
             root.present(activity, animated: true)
         }
+    }
+}
+
+/// 自定义播放器视图（隐藏原生控制条，仅显示画面）
+struct CustomPlayerView: UIViewRepresentable {
+    let player: AVPlayer?
+
+    func makeUIView(context: Context) -> PlayerContainerView {
+        let view = PlayerContainerView()
+        view.player = player
+        return view
+    }
+
+    func updateUIView(_ uiView: PlayerContainerView, context: Context) {
+        uiView.player = player
+    }
+}
+
+/// 播放器容器视图（使用 AVPlayerLayer，无原生控件）
+final class PlayerContainerView: UIView {
+    var player: AVPlayer? {
+        didSet {
+            playerLayer.player = player
+        }
+    }
+
+    override class var layerClass: AnyClass {
+        AVPlayerLayer.self
+    }
+
+    private var playerLayer: AVPlayerLayer {
+        layer as! AVPlayerLayer
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        playerLayer.videoGravity = .resizeAspect
+        backgroundColor = .black
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        playerLayer.videoGravity = .resizeAspect
+        backgroundColor = .black
     }
 }

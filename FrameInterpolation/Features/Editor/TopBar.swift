@@ -75,17 +75,27 @@ struct TopBar: View {
             }
             .accessibilityLabel("选择处理任务")
 
-            // 导出按钮
+            // 导出按钮（处理中显示加载态）
             Button(action: onExport) {
-                Text("导出")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(.white)
-                    .frame(width: 72, height: 40)
-                    .background(appState.isProcessing ? Color.gray : Color.accentPink)
-                    .cornerRadius(8)
+                HStack(spacing: 6) {
+                    if appState.isProcessing {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(0.8)
+                        Text("处理中")
+                            .font(.system(size: 14, weight: .semibold))
+                    } else {
+                        Text("导出")
+                            .font(.system(size: 15, weight: .semibold))
+                    }
+                }
+                .foregroundColor(.white)
+                .frame(width: appState.isProcessing ? 96 : 72, height: 40)
+                .background(appState.isProcessing ? Color.gray.opacity(0.6) : Color.accentPink)
+                .cornerRadius(8)
             }
             .disabled(appState.isProcessing)
-            .accessibilityLabel("导出视频")
+            .accessibilityLabel(appState.isProcessing ? "正在处理中" : "导出视频")
         }
         .padding(.horizontal, 16)
         .frame(height: 56)

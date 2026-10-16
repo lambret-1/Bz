@@ -64,10 +64,14 @@ struct ProcessingView: View {
                 .foregroundColor(DesignTokens.Colors.textPrimary)
 
             // 预计剩余时间
-            if appState.estimatedRemaining > 1 {
-                Text("预计剩余时间：约 \(TimeFormatter.formatChinese(appState.estimatedRemaining))")
+            if appState.progress < 0.95 {
+                Text("预计剩余时间：约 \(TimeFormatter.formatChinese(max(appState.estimatedRemaining, 1)))")
                     .font(DesignTokens.Fonts.subheadline)
                     .foregroundColor(DesignTokens.Colors.textSecondary)
+            } else {
+                Text("即将完成…")
+                    .font(DesignTokens.Fonts.subheadline)
+                    .foregroundColor(DesignTokens.Colors.accent)
             }
 
             Spacer()
@@ -95,6 +99,12 @@ struct ProcessingView: View {
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false
+            // 移除热状态观察者
+            NotificationCenter.default.removeObserver(
+                self,
+                name: ProcessInfo.thermalStateDidChangeNotification,
+                object: nil
+            )
         }
         // 取消确认
         .confirmationDialog("确定要取消吗？", isPresented: $showCancelConfirm, titleVisibility: .visible) {

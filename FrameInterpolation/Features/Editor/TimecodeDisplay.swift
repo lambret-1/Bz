@@ -12,9 +12,15 @@ struct TimecodeDisplay: View {
     var body: some View {
         HStack(spacing: 8) {
             if isFrameMode {
-                Text("f\(String(format: "%03d", currentFrame)) / f\(String(format: "%03d", totalFrames))")
-                    .font(.system(size: 14, weight: .bold, design: .monospaced))
-                    .foregroundColor(Color.accentPink)
+                if totalFrames > 0 {
+                    Text("f\(String(format: "%03d", currentFrame)) / f\(String(format: "%03d", totalFrames))")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(Color.accentPink)
+                } else {
+                    Text("加载中…")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                        .foregroundColor(Color(uiColor: .systemGray))
+                }
 
                 if let thumbnail {
                     Image(uiImage: thumbnail)
@@ -25,9 +31,15 @@ struct TimecodeDisplay: View {
                         .clipped()
                 }
             } else {
-                Text(formatTime(currentTime) + " / " + formatTime(totalTime))
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(.topBarText)
+                if totalTime > 0 {
+                    Text(formatTime(currentTime) + " / " + formatTime(totalTime))
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(.topBarText)
+                } else {
+                    Text("00:00.000 / --:--.---")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(Color(uiColor: .systemGray))
+                }
             }
         }
     }

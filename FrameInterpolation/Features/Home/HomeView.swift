@@ -76,8 +76,11 @@ struct HomeView: View {
                 SettingsView()
                     .environmentObject(appState)
             }
-            // 处理中页（从首页横幅恢复时展示）
-            .fullScreenCover(isPresented: $appState.isProcessing) {
+            // 处理中页（仅从首页开始处理时展示，编辑器内部用ExportHUD）
+            .fullScreenCover(isPresented: Binding(
+                get: { appState.isProcessing && !appState.showProjectDetail },
+                set: { if !$0 { /* isProcessing由AppState管理 */ } }
+            )) {
                 ProcessingView()
                     .environmentObject(appState)
             }
@@ -210,24 +213,17 @@ struct ProjectCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
-            // 缩略图
+            // 缩略图（统一裁剪，避免两层圆角）
             ZStack(alignment: .bottomTrailing) {
-                RoundedRectangle(cornerRadius: DesignTokens.Radius.m)
-                    .fill(DesignTokens.Colors.bgTertiary)
-                    .frame(height: 100)
-
                 if let thumbnail = project.videoInfo.thumbnail {
                     Image(uiImage: thumbnail)
                         .resizable()
                         .scaledToFill()
-                        .frame(height: 100)
-                        .clipped()
-                        .cornerRadius(DesignTokens.Radius.m)
                 } else {
+                    DesignTokens.Colors.bgTertiary
                     Image(systemName: "video.fill")
                         .font(.system(size: 32))
                         .foregroundColor(DesignTokens.Colors.textSecondary)
-                        .frame(height: 100)
                 }
 
                 // 时长标签
@@ -241,6 +237,8 @@ struct ProjectCard: View {
                     .padding(6)
             }
             .frame(height: 100)
+            .cornerRadius(DesignTokens.Radius.m)
+            .clipped()
 
             // 项目名称
             Text(project.name)
