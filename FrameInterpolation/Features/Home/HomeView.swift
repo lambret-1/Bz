@@ -66,9 +66,9 @@ struct HomeView: View {
                     onCancel: { showPicker = false }
                 )
             }
-            // 项目详情页（独立全屏导航）
+            // 编辑器（独立全屏，新架构）
             .fullScreenCover(isPresented: $appState.showProjectDetail) {
-                ProjectDetailView()
+                EditorView()
                     .environmentObject(appState)
             }
             // 应用设置页（独立全屏导航）
