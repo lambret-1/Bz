@@ -23,7 +23,7 @@ targets:
       path: FrameInterpolation/Resources/Info.plist
       properties:
         CFBundleDisplayName: 视频增强工作台
-        CFBundleShortVersionString: "0.3.7"
+        CFBundleShortVersionString: "0.3.8"
         CFBundleVersion: "1"
         UILaunchScreen:
           UIColorName: BgPrimary
