@@ -521,10 +521,8 @@ final class VideoPipeline {
             if isCancelled {
                 reader.cancelReading()
                 writer.cancelWriting()
-                // 通知 RealESRGAN 引擎取消瓦片处理
-                if let realESRGAN = engine as? RealESRGANEngine {
-                    realESRGAN.cancel()
-                }
+                // 通知超分引擎取消瓦片处理
+                engine?.cancel()
                 throw PipelineError.cancelled
             }
 

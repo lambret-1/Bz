@@ -22,6 +22,9 @@ protocol SuperResolutionEngine: AnyObject {
 
     /// 输出放大倍数
     var scaleFactor: Int { get }
+
+    /// 取消当前处理（瓦片引擎中断瓦片循环）
+    func cancel()
 }
 
 // MARK: - 超分引擎工厂

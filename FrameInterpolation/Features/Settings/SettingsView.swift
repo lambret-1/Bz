@@ -61,15 +61,15 @@ struct SettingsView: View {
             }
             .safeAreaInset(edge: .bottom) {
                 PrimaryButton(title: startButtonTitle, isLoading: appState.isProcessing) {
-                    appState.startProcessing()
+                    // 先关闭设置页，等待全屏盖层消失后再启动处理
+                    // 避免与 HomeView 的 fullScreenCover 同时弹出导致冲突崩溃
+                    dismiss()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                        appState.startProcessing()
+                    }
                 }
                 .padding(DesignTokens.Spacing.m)
                 .background(DesignTokens.Colors.bgPrimary)
-            }
-            // 处理中页（独立全屏，覆盖在设置页之上）
-            .fullScreenCover(isPresented: $appState.isProcessing) {
-                ProcessingView()
-                    .environmentObject(appState)
             }
         }
     }
