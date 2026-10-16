@@ -7,7 +7,7 @@ import OSLog
 // MARK: - PiperSR 超分引擎
 
 /// PiperSR 2x 超分引擎
-/// 固定输入 640×360，输出 1280×720，ANE 原生优化
+/// 输入输出尺寸从模型描述动态读取，避免硬编码不匹配导致崩溃
 /// 模型文件缺失时 init 返回 nil，VideoPipeline 自动降级为 vImage 缩放
 final class PiperSREngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "PiperSREngine")
@@ -15,8 +15,8 @@ final class PiperSREngine: SuperResolutionEngine {
     // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .piperSR
-    let inputWidth: Int = 640
-    let inputHeight: Int = 360
+    let inputWidth: Int
+    let inputHeight: Int
     let scaleFactor: Int = 2
 
     // MARK: - 私有属性
@@ -26,10 +26,19 @@ final class PiperSREngine: SuperResolutionEngine {
     private let commandQueue: MTLCommandQueue
     private let preprocessPipeline: MTLComputePipelineState
 
-    /// 预分配输入 MTLBuffer（640×360×3×Float16）
+    /// 输入 MTLBuffer（NCHW Float16）
     private let inputBuffer: MTLBuffer
-    /// PixelBuffer 复用池
+    /// 输出 PixelBuffer 复用池
     private let pool = PixelBufferPool()
+
+    /// 模型输出的实际通道数（通常为 3）
+    private let outputChannels: Int
+    /// 模型输出的实际高度
+    private let outputHeight: Int
+    /// 模型输出的实际宽度
+    private let outputWidth: Int
+    /// 模型期望的输入数据类型
+    private let inputDataType: MLMultiArrayDataType
 
     // MARK: - 初始化
 
@@ -49,7 +58,38 @@ final class PiperSREngine: SuperResolutionEngine {
         }
         self.model = model
 
-        // 2. 初始化 Metal 预处理管线（复用 bgra_to_nchw shader）
+        // 2. 从模型描述动态读取输入输出尺寸
+        let inputDesc = model.modelDescription.inputDescriptionsByName["input"]
+        let outputDesc = model.modelDescription.outputDescriptionsByName["clip_0"]
+
+        // 输入数据类型：优先从模型描述读取
+        if let descDataType = inputDesc?.multiArrayConstraint?.dataType {
+            inputDataType = descDataType
+        } else {
+            inputDataType = .float16
+        }
+
+        // 输入尺寸：优先从模型描述读取，失败时使用默认 640x360
+        if let shape = inputDesc?.multiArrayConstraint?.shape as? [Int], shape.count >= 4 {
+            inputHeight = shape[2]
+            inputWidth = shape[3]
+        } else {
+            inputHeight = 360
+            inputWidth = 640
+        }
+
+        // 输出尺寸：优先从模型描述读取
+        if let shape = outputDesc?.multiArrayConstraint?.shape as? [Int], shape.count >= 4 {
+            outputChannels = shape[1]
+            outputHeight = shape[2]
+            outputWidth = shape[3]
+        } else {
+            outputChannels = 3
+            outputHeight = inputHeight * 2
+            outputWidth = inputWidth * 2
+        }
+
+        // 3. 初始化 Metal 预处理管线
         guard let queue = helper.device.makeCommandQueue(),
               let library = helper.device.makeDefaultLibrary(),
               let preprocessFunc = library.makeFunction(name: "bgra_to_nchw"),
@@ -59,7 +99,7 @@ final class PiperSREngine: SuperResolutionEngine {
         self.commandQueue = queue
         self.preprocessPipeline = preprocessPipeline
 
-        // 3. 预分配输入 MTLBuffer
+        // 4. 预分配输入 MTLBuffer（NCHW Float16）
         let plane = inputWidth * inputHeight
         let inputBytes = plane * 3 * MemoryLayout<Float16>.size
         guard let inputBuffer = helper.device.makeBuffer(length: inputBytes, options: .storageModeShared) else {
@@ -67,20 +107,19 @@ final class PiperSREngine: SuperResolutionEngine {
         }
         self.inputBuffer = inputBuffer
 
-        // 4. 配置输出 PixelBufferPool
-        pool.configure(width: inputWidth * scaleFactor, height: inputHeight * scaleFactor, format: kCVPixelFormatType_32BGRA)
+        // 5. 配置输出 PixelBufferPool
+        pool.configure(width: outputWidth, height: outputHeight, format: kCVPixelFormatType_32BGRA)
 
-        logger.info("PiperSR 引擎初始化成功，输入: \(self.inputWidth)x\(self.inputHeight)，输出: \(self.inputWidth * self.scaleFactor)x\(self.inputHeight * self.scaleFactor)")
+        logger.info("PiperSR 引擎初始化成功，输入: \(self.inputWidth)x\(self.inputHeight)，输出: \(self.outputWidth)x\(self.outputHeight)，通道: \(self.outputChannels)")
     }
 
     // MARK: - 公开方法
 
     /// 对单帧执行 2x 超分
-    /// - Parameter pixelBuffer: 输入帧（32BGRA），尺寸应为 640×360，不符时先缩放
-    /// - Returns: 1280×720 的 32BGRA 帧，失败返回 nil
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
         let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
+        guard srcWidth > 0, srcHeight > 0 else { return nil }
 
         // 1. 若输入尺寸不符，先缩放到模型输入尺寸
         var inputFrame = pixelBuffer
@@ -105,13 +144,33 @@ final class PiperSREngine: SuperResolutionEngine {
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
-        // 3. 创建 MLMultiArray 并推理
-        let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
-        guard let inputArray = try? MLMultiArray(shape: shape, dataType: .float16) else {
-            logger.error("创建输入 MLMultiArray 失败")
+        // 检查 GPU 执行结果
+        if commandBuffer.status != .completed {
+            logger.error("Metal 预处理执行失败，状态: \(commandBuffer.status.rawValue)")
             return nil
         }
-        memcpy(inputArray.dataPointer, inputBuffer.contents(), inputBuffer.length)
+
+        // 3. 创建 MLMultiArray 并推理
+        // 使用模型期望的数据类型，避免类型不匹配导致崩溃
+        let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
+        guard let inputArray = try? MLMultiArray(shape: shape, dataType: inputDataType) else {
+            logger.error("创建输入 MLMultiArray 失败，类型: \(inputDataType.rawValue)")
+            return nil
+        }
+
+        // 安全拷贝：Metal 输出是 Float16，若模型期望 Float32 需转换
+        if inputDataType == .float16 {
+            let copyLength = min(inputBuffer.length, inputArray.count * MemoryLayout<Float16>.size)
+            memcpy(inputArray.dataPointer, inputBuffer.contents(), copyLength)
+        } else if inputDataType == .float32 {
+            // Float16 → Float32 转换
+            let srcPtr = inputBuffer.contents().assumingMemoryBound(to: Float16.self)
+            let dstPtr = inputArray.dataPointer.assumingMemoryBound(to: Float32.self)
+            let count = min(inputBuffer.length / MemoryLayout<Float16>.size, inputArray.count)
+            for i in 0..<count {
+                dstPtr[i] = Float(srcPtr[i])
+            }
+        }
 
         guard let featureProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputArray]),
               let prediction = try? model.prediction(from: featureProvider),
@@ -120,15 +179,20 @@ final class PiperSREngine: SuperResolutionEngine {
             return nil
         }
 
-        // 4. NCHW Float16 → BGRA CVPixelBuffer
-        let outputWidth = inputWidth * scaleFactor
-        let outputHeight = inputHeight * scaleFactor
-        guard let outputBuffer = makePixelBuffer(from: outputArray, width: outputWidth, height: outputHeight) else {
+        // 4. 验证输出尺寸和数据类型，避免越界访问导致崩溃
+        let expectedCount = outputChannels * outputHeight * outputWidth
+        guard outputArray.count >= expectedCount else {
+            logger.error("模型输出尺寸不匹配，期望: \(expectedCount)，实际: \(outputArray.count)")
+            return nil
+        }
+
+        // 5. NCHW Float16 → BGRA CVPixelBuffer
+        guard let outputBuffer = makePixelBuffer(from: outputArray) else {
             logger.error("输出 PixelBuffer 创建失败")
             return nil
         }
 
-        // 5. 复制颜色空间附件
+        // 6. 复制颜色空间附件
         copyColorSpaceAttachments(from: pixelBuffer, to: outputBuffer)
 
         return outputBuffer
@@ -159,28 +223,28 @@ final class PiperSREngine: SuperResolutionEngine {
 
     // MARK: - NCHW Float16 → BGRA CVPixelBuffer
 
-    private func makePixelBuffer(from array: MLMultiArray, width: Int, height: Int) -> CVPixelBuffer? {
-        // 从池中获取输出缓冲区（池已配置为输出尺寸）
+    private func makePixelBuffer(from array: MLMultiArray) -> CVPixelBuffer? {
+        // 从池中获取输出缓冲区
         if let outputBuffer = pool.makeBuffer() {
-            return fillPixelBuffer(outputBuffer, from: array, width: width, height: height)
+            return fillPixelBuffer(outputBuffer, from: array)
         }
 
         // 池不可用时直接创建
         var buffer: CVPixelBuffer?
         let attrs = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferWidthKey: outputWidth,
+            kCVPixelBufferHeightKey: outputHeight,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
+        guard CVPixelBufferCreate(kCFAllocatorDefault, outputWidth, outputHeight, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
               let result = buffer else {
             return nil
         }
-        return fillPixelBuffer(result, from: array, width: width, height: height)
+        return fillPixelBuffer(result, from: array)
     }
 
-    private func fillPixelBuffer(_ outputBuffer: CVPixelBuffer, from array: MLMultiArray, width: Int, height: Int) -> CVPixelBuffer? {
+    private func fillPixelBuffer(_ outputBuffer: CVPixelBuffer, from array: MLMultiArray) -> CVPixelBuffer? {
         CVPixelBufferLockBaseAddress(outputBuffer, [])
         defer { CVPixelBufferUnlockBaseAddress(outputBuffer, []) }
 
@@ -188,24 +252,44 @@ final class PiperSREngine: SuperResolutionEngine {
         let dstBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
         let dst = dstBase.assumingMemoryBound(to: UInt8.self)
 
-        let plane = width * height
-        let srcPtr = array.dataPointer.assumingMemoryBound(to: Float16.self)
+        let plane = outputWidth * outputHeight
+        let totalPixels = min(plane, array.count / max(outputChannels, 1))
 
-        // NCHW → BGRA：R通道=plane*0, G通道=plane*1, B通道=plane*2
-        for y in 0..<height {
-            let rowOffset = y * dstBytesPerRow
-            for x in 0..<width {
-                let idx = y * width + x
-                // 钳制到 [0,1] 再转 [0,255]
-                let r = clampFloat16ToUInt8(srcPtr[0 * plane + idx])
-                let g = clampFloat16ToUInt8(srcPtr[1 * plane + idx])
-                let b = clampFloat16ToUInt8(srcPtr[2 * plane + idx])
-                let pixelOffset = rowOffset + x * 4
-                dst[pixelOffset + 0] = b  // BGRA: B
-                dst[pixelOffset + 1] = g  // G
-                dst[pixelOffset + 2] = r  // R
-                dst[pixelOffset + 3] = 255 // A
+        // 根据输出数据类型选择读取方式，避免类型不匹配导致崩溃
+        switch array.dataType {
+        case .float16:
+            let srcPtr = array.dataPointer.assumingMemoryBound(to: Float16.self)
+            for idx in 0..<totalPixels {
+                let y = idx / outputWidth
+                let x = idx % outputWidth
+                let pixelOffset = y * dstBytesPerRow + x * 4
+                let rIdx = 0 * plane + idx
+                let gIdx = 1 * plane + idx
+                let bIdx = 2 * plane + idx
+                guard rIdx < array.count, gIdx < array.count, bIdx < array.count else { break }
+                dst[pixelOffset + 0] = clampFloat16ToUInt8(srcPtr[bIdx])
+                dst[pixelOffset + 1] = clampFloat16ToUInt8(srcPtr[gIdx])
+                dst[pixelOffset + 2] = clampFloat16ToUInt8(srcPtr[rIdx])
+                dst[pixelOffset + 3] = 255
             }
+        case .float32:
+            let srcPtr = array.dataPointer.assumingMemoryBound(to: Float32.self)
+            for idx in 0..<totalPixels {
+                let y = idx / outputWidth
+                let x = idx % outputWidth
+                let pixelOffset = y * dstBytesPerRow + x * 4
+                let rIdx = 0 * plane + idx
+                let gIdx = 1 * plane + idx
+                let bIdx = 2 * plane + idx
+                guard rIdx < array.count, gIdx < array.count, bIdx < array.count else { break }
+                dst[pixelOffset + 0] = clampFloatToUInt8(srcPtr[bIdx])
+                dst[pixelOffset + 1] = clampFloatToUInt8(srcPtr[gIdx])
+                dst[pixelOffset + 2] = clampFloatToUInt8(srcPtr[rIdx])
+                dst[pixelOffset + 3] = 255
+            }
+        default:
+            logger.error("不支持的输出数据类型: \(array.dataType.rawValue)")
+            return nil
         }
 
         return outputBuffer
@@ -214,7 +298,15 @@ final class PiperSREngine: SuperResolutionEngine {
     /// 将 Float16 值钳制到 [0,1] 并转换为 UInt8 [0,255]
     private func clampFloat16ToUInt8(_ value: Float16) -> UInt8 {
         let f = Float(value)
+        if f.isNaN || f.isInfinite { return 0 }
         let clamped = max(0.0, min(1.0, f))
+        return UInt8(clamped * 255.0)
+    }
+
+    /// 将 Float32 值钳制到 [0,1] 并转换为 UInt8 [0,255]
+    private func clampFloatToUInt8(_ value: Float32) -> UInt8 {
+        if value.isNaN || value.isInfinite { return 0 }
+        let clamped = max(0.0, min(1.0, value))
         return UInt8(clamped * 255.0)
     }
 
