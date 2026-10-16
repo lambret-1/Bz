@@ -2,6 +2,9 @@ name: iOS Build
 
 on:
   push:
+  paths-ignore:
+  - '**.md'
+  - '资料/**'
     branches: [main, testping]
   workflow_dispatch:
 
