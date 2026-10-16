@@ -204,7 +204,7 @@ final class PiperSREngine: SuperResolutionEngine {
                 }
             }
         default:
-            logger.error("不支持的输入数据类型: \(inputDataType.rawValue)")
+            logger.error("不支持的输入数据类型: \(self.inputDataType.rawValue)")
             return nil
         }
 
