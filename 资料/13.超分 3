@@ -1,0 +1,305 @@
+Real-ESRGAN General-x4v3 超分模型开发文档（独立模式）
+
+项目：iOS 视频处理 App（testping 分支）
+功能：4x 超分辨率（独立模式，不与补帧串联）
+适用系统：iOS 16.0+
+文档版本：v1.0
+最后更新：2026-10-16
+
+1. 概述
+
+1.1 模型简介
+
+Real-ESRGAN General-x4v3 是 Real-ESRGAN 系列的轻量级通用超分模型，采用 SRVGGNetCompact 架构。与面向二次元或特定场景的模型不同，x4v3 专为真实世界退化（噪声、模糊、JPEG 压缩伪影）设计，在通用图像和视频上表现均衡。它是 Real-ESRGAN 系列中体积最小、速度最快的变体，适合移动端部署。
+
+1.2 核心参数
+
+参数 值
+参数量 1.21M（约 121 万）
+模型大小（FP32） 4.65 MB
+模型大小（INT8/W8A8） 1.25 MB
+CoreML FP16 包体 2.7 MB
+放大倍数 4x（支持可变 1x/2x/3x/4x）
+架构 SRVGGNetCompact，64 通道，PReLU 激活
+PSNR (参考) 26.76 dB（FP32）/ 26.33 dB（INT8）
+SSIM 0.78（FP32）/ 0.75（INT8）
+输入尺寸 128×128 瓦片
+输出尺寸 512×512（4x 放大）
+ANE 推理延迟 约 5.1 ms（Mac 参考）
+许可证 BSD-3-Clause
+
+1.3 在本项目中的定位
+
+Real-ESRGAN x4v3 作为 480p → 1080p 或 极低清素材恢复 场景的超分引擎，与 PiperSR 形成互补：
+
+场景 推荐模型
+720p → 1080p（普通低清） PiperSR（2x，ANE 原生）
+480p → 1080p 或更低（极低清） Real-ESRGAN x4v3（4x，通用恢复）
+1080p 及以上（高清） 跳过超分，仅补帧
+
+独立使用，不与 RIFE Lite 串联。用户每次处理只能选择一种模式：补帧或超分。
+
+2. 模型获取
+
+2.1 模型变体
+
+Hugging Face 上提供以下可用于 iOS 的变体：
+
+文件 格式 大小 用途
+real_esrgan_x4v3_coreml_all.pte Core ML (FP16) 2.7 MB iOS 推荐，ANE 原生
+real_esrgan_x4v3_xnnpack_fp32.pte ExecuTorch (FP32) 4.9 MB Android / 跨平台
+RealESRGAN_x4.mlpackage.zip Core ML (FP16) 59 MB 完整 4x 模型（512 输入）
+
+本项目使用 real_esrgan_x4v3_coreml_all.pte，该变体专为 Apple Neural Engine 优化，FP16 精度，iOS 独占，模型体积仅 2.7 MB。
+
+2.2 下载方式
+
+```bash
+# 通过 huggingface-cli 下载
+huggingface-cli download mlboydaisuke/Real-ESRGAN-x4v3-ExecuTorch \
+    real_esrgan_x4v3_coreml_all.pte \
+    --local-dir ./Models
+```
+
+或将 .pte 文件提交到仓库的 FrameInterpolation/Resources/ 目录。注意：.pte 通过 Git LFS 管理，确保 CI 拉取时 LFS 文件正常获取。
+
+3. 工程集成
+
+3.1 文件放置
+
+```
+FrameInterpolation/
+├── Core/
+│   └── SuperResolution/
+│       ├── RealESRGANEngine.swift        # 新增：Real-ESRGAN 推理引擎
+│       └── SuperResolutionConfig.swift   # 新增：超分配置（与 PiperSR 共用）
+├── Resources/
+│   └── real_esrgan_x4v3_coreml_all.pte
+```
+
+3.2 核心类设计
+
+```swift
+import CoreML
+import CoreVideo
+import Metal
+
+final class RealESRGANEngine {
+    private let model: MLModel
+    private let commandQueue: MTLCommandQueue
+
+    // Real-ESRGAN x4v3 固定瓦片尺寸
+    static let tileSize = 128
+    static let scale = 4
+
+    init?() {
+        guard let modelURL = Bundle.main.url(
+            forResource: "real_esrgan_x4v3_coreml_all",
+            withExtension: "mlmodelc"
+        ) else { return nil }
+
+        let config = MLModelConfiguration()
+        config.computeUnits = .all  // 强制调用 ANE
+
+        guard let model = try? MLModel(contentsOf: modelURL, configuration: config),
+              let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else { return nil }
+
+        self.model = model
+        self.commandQueue = queue
+    }
+
+    /// 对单帧执行 4x 超分（瓦片拼接）
+    /// - Parameter pixelBuffer: 原始分辨率的 BGRA CVPixelBuffer
+    /// - Returns: 4x 放大后的 BGRA CVPixelBuffer
+    func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+
+        // 1. 将帧分割为 128×128 瓦片（带重叠）
+        let tiles = splitIntoTiles(pixelBuffer, tileSize: Self.tileSize)
+
+        // 2. 逐瓦片推理
+        var upscaledTiles: [CVPixelBuffer] = []
+        for tile in tiles {
+            guard let inputArray = makeInputArray(from: tile) else { return nil }
+            guard let prediction = try? model.prediction(from: ["input": inputArray]),
+                  let outputArray = prediction.featureValue(for: "output")?.multiArrayValue else {
+                return nil
+            }
+            guard let outputTile = makePixelBuffer(from: outputArray) else { return nil }
+            upscaledTiles.append(outputTile)
+        }
+
+        // 3. 拼接瓦片（使用非重叠核心区域）
+        return stitchTiles(upscaledTiles, originalWidth: width, originalHeight: height)
+    }
+
+    // MARK: - Private
+    private func splitIntoTiles(_ buffer: CVPixelBuffer, tileSize: Int) -> [CVPixelBuffer] {
+        // 将帧分割为 tileSize × tileSize 的瓦片
+        // 瓦片之间保留 8px 重叠，避免拼接边界伪影
+        // 实现细节参考 Real-ESRGAN 官方 tile 处理逻辑
+        return [] // TODO: 实现
+    }
+
+    private func makeInputArray(from tile: CVPixelBuffer) -> MLMultiArray? {
+        // BGRA → NCHW FP16，归一化到 [0,1]
+        // 使用 Metal Compute Shader 加速格式转换
+        return nil // TODO: 实现
+    }
+
+    private func makePixelBuffer(from array: MLMultiArray) -> CVPixelBuffer? {
+        // NCHW FP16 → BGRA CVPixelBuffer
+        // 使用 CVPixelBufferPool 复用缓冲区
+        return nil // TODO: 实现
+    }
+
+    private func stitchTiles(_ tiles: [CVPixelBuffer], originalWidth: Int, originalHeight: Int) -> CVPixelBuffer? {
+        // 将瓦片拼接为完整帧
+        // 每个瓦片取非重叠核心区域，避免重叠区域重复
+        return nil // TODO: 实现
+    }
+}
+```
+
+3.3 关键注意：输出需 Clamp
+
+Real-ESRGAN x4v3 的输出不会被模型自动钳制到 [0,1] 范围。实测中，约 5.5% 的像素值超出 0-1 区间，范围为 -0.28 到 1.22。这是 GAN 超分模型的正常振铃效应，但必须在显示前手动 Clamp。
+
+```swift
+// 在 makePixelBuffer 中，将输出值钳制到 [0, 1]
+let clamped = max(0, min(1, value))
+```
+
+4. 管线集成
+
+4.1 超分模式管线（独立）
+
+```
+AVAssetReader 解码 → Real-ESRGAN 4x 超分（瓦片拼接）→ AVAssetWriter 编码（保持原帧率）
+```
+
+注意：
+
+· 帧率不变。30fps 输入，输出仍为 30fps。
+· PTS 不变。沿用原始时间戳，不重新计算。
+· 音频透传。使用与补帧模式相同的音频处理逻辑。
+· 分辨率 4x 放大。480p → 1920p，720p → 2880p（可能超出设备播放能力，需在 UI 上限制）。
+
+4.2 分辨率限制策略
+
+Real-ESRGAN 的 4x 放大可能导致输出分辨率过高：
+
+输入分辨率 4x 输出 建议
+360p (640×360) 1440p (2560×1440) 可接受
+480p (854×480) 1920p (3416×1920) 需限制，建议先缩放到 270p
+720p (1280×720) 2880p (5120×2880) 严重超出，建议先缩放到 360p
+
+推荐策略：在 UI 上固定超分模式为 “480p 增强”，即输入 480p 视频，先缩放到 360p，超分到 1440p，再缩放到 1080p 输出。
+
+4.3 瓦片拼接的性能考量
+
+Real-ESRGAN 的 128×128 瓦片处理意味着每帧需要多次推理：
+
+· 720p 帧（1280×720）→ 约 (1280/128) × (720/128) ≈ 10 × 6 = 60 个瓦片
+· 每个瓦片推理约 5 ms → 单帧约 300 ms
+
+这意味着 Real-ESRGAN 的视频处理速度远慢于 PiperSR。仅适合短视频或对画质要求极高的场景。
+
+5. UI 设计
+
+5.1 模式选择
+
+在首页或参数设置页，用户需先选择处理模式：
+
+```
+┌─────────────────────────────┐
+│  选择处理模式                 │
+│                             │
+│  ┌─────────┐  ┌─────────┐   │
+│  │ 补帧    │  │ 超分    │   │
+│  │ 让画面  │  │ 让画面  │   │
+│  │ 更流畅  │  │ 更清晰  │   │
+│  └─────────┘  └─────────┘   │
+│                             │
+│  超分引擎：Real-ESRGAN 4x    │
+│  适用：480p 及以下极低清素材  │
+└─────────────────────────────┘
+```
+
+5.2 超分模式的参数页
+
+```
+视频信息：
+- 原始分辨率：854 × 480
+- 输出分辨率：1920 × 1080（缩放到目标）
+- 帧率：保持 30fps 不变
+
+预估：
+- 预计耗时：约 3 分钟（瓦片拼接较慢）
+- 输出大小：约 120 MB
+```
+
+6. 性能与发热预期
+
+指标 Real-ESRGAN x4v3 PiperSR（对比）
+单瓦片推理耗时 ~5.1 ms（Mac 参考） ~22.5 ms（全帧）
+720p 单帧耗时 ~300 ms（约 60 瓦片） ~22.5 ms
+额外内存 ~80 MB（瓦片拼接缓冲） ~50 MB
+设备发热 较高（多次推理） 中等（单次推理）
+A16 处理速度 慢于实时（约 0.3x） 快于实时
+适用场景 极低清素材（480p 及以下） 720p → 1080p
+
+优势：Real-ESRGAN 的 4x 放大能力是 PiperSR 不具备的，适合处理极低分辨率的素材（如 360p 或 480p 的短剧）。但代价是速度远慢于 PiperSR，不适合长视频批量处理。
+
+性能提升参考：Core ML (FP16) 版本相比 XNNPACK (FP32) 版本在 iPhone 17 Pro 上快 3.5x 到 13.9x（中位数 12x），文件体积约为一半。
+
+7. 与 PiperSR 的对比总结
+
+维度 Real-ESRGAN x4v3 PiperSR
+参数量 1.21M 453K
+CoreML 包体 2.7 MB 928 KB
+放大倍数 4x 2x
+PSNR 26.76 dB (FP32) 37.54 dB (Set5)
+架构 SRVGGNetCompact 6 残差块 + PixelShuffle
+ANE 原生 ✅（CoreML FP16 版本） ✅（从零为 ANE 设计）
+输入方式 128×128 瓦片 640×360 全帧
+视频处理速度 慢（瓦片拼接） 快（单次推理）
+适用场景 480p 及以下极低清素材 720p → 1080p
+许可证 BSD-3-Clause AGPL-3.0 + PiperSR Model License
+
+选择建议：
+
+· PiperSR 作为主力引擎：720p → 1080p 的普通低清场景，速度最快，ANE 原生。
+· Real-ESRGAN 作为备用引擎：480p 及以下的极低清素材，4x 放大能力强，但速度慢。
+· 两者互斥使用，根据输入分辨率动态选择，不串联。
+
+8. 开发任务清单
+
+□ 下载 real_esrgan_x4v3_coreml_all.pte，提交到 Resources/
+□ 实现 RealESRGANEngine.swift（含瓦片拆分、推理、拼接）
+□ 实现输出 Clamp 逻辑（钳制到 [0,1]）
+□ 修改 PipelineMode 枚举：增加 .superResolutionRealESRGAN 分支
+□ 修改 VideoPipeline：根据模式分发到对应超分引擎
+□ 实现分辨率限制策略（防止 4x 输出过高）
+□ 修改 UI：增加引擎选择（PiperSR / Real-ESRGAN）
+□ 设备能力检测：根据芯片决定是否允许 Real-ESRGAN
+□ 真机测试：验证 480p → 1080p 的画质、帧率、音频
+
+9. 注意事项
+
+1. 瓦片拼接性能：Real-ESRGAN 每帧需要数十次推理，处理速度远慢于 PiperSR。建议在 UI 上明确标注“适合短视频”。
+2. 输出 Clamp 必须执行：GAN 超分模型的输出会超出 [0,1] 范围，不 Clamp 会导致画面出现异常亮点或色带。
+3. 分辨率限制：4x 放大对高分辨率输入会产生过大文件，建议仅对 480p 及以下启用。
+4. ANE 回退风险：虽然 CoreML FP16 版本设计为 ANE 原生，但在某些设备上可能因算子不支持而回退到 GPU/CPU。建议用 os_signpost 验证推理是否在 ANE 轨道上执行。
+5. 许可证：BSD-3-Clause，允许商业使用和修改，个人侧载项目无需额外授权。
+6. 音频处理逻辑完全复用，不需要为超分模式单独开发音频管线。
+7. 码率动态调整：超分后分辨率提升，数据量增加，输出码率应相应提高（如 2-3 倍），否则画质提升会被压缩抵消。
+
+10. 参考链接
+
+· Real-ESRGAN 官方仓库：https://github.com/xinntao/Real-ESRGAN
+· CoreML 转换模型：https://huggingface.co/mlboydaisuke/Real-ESRGAN-x4v3-ExecuTorch
+· CoreML 完整 4x 模型：https://huggingface.co/mlboydaisuke/Real-ESRGAN-x4-CoreML
+· 模型参数信息：https://aihub.qualcomm.com/models/real_esrgan_general_x4v3
