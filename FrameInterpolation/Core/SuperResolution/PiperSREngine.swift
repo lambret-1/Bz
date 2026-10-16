@@ -154,7 +154,7 @@ final class PiperSREngine: SuperResolutionEngine {
         // 使用模型期望的数据类型，避免类型不匹配导致崩溃
         let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
         guard let inputArray = try? MLMultiArray(shape: shape, dataType: inputDataType) else {
-            logger.error("创建输入 MLMultiArray 失败，类型: \(inputDataType.rawValue)")
+            logger.error("创建输入 MLMultiArray 失败，类型: \(self.inputDataType.rawValue)")
             return nil
         }
 
