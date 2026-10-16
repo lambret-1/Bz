@@ -1,8 +1,9 @@
-name: iOS Build
-
 on:
   push:
-    branches: [main, testping, CF]
+    branches: [main, testping]
+    paths-ignore:
+      - '**.md'
+      - '资料/**'
   workflow_dispatch:
 
 jobs:
