@@ -2,7 +2,7 @@ import SwiftUI
 
 /// 参数设置页（独立 NavigationStack，全屏展示）
 /// 左上角返回按钮 + 支持边缘左滑手势返回（NavigationStack 原生支持）
-/// 支持补帧与超分两种互斥模式，超分模式下可选择 PiperSR / Real-ESRGAN 引擎
+/// 支持补帧与超分两种互斥模式，超分模式下可选择 Fast-SRGAN / Real-ESRGAN 引擎
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) private var dismiss
@@ -372,7 +372,7 @@ struct SettingsView: View {
 
         if isSuperResolutionMode {
             // 超分模式耗时估算
-            let defaultSpeed: Double = appState.superResolutionEngine == .piperSR ? 1.2 : 0.3
+            let defaultSpeed: Double = appState.superResolutionEngine == .fastSRGAN ? 1.0 : 0.3
             let speedFactor = appState.measuredSpeedFactor ?? defaultSpeed
             var base = video.duration / speedFactor
 

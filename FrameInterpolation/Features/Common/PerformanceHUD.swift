@@ -3,7 +3,7 @@ import SwiftUI
 // MARK: - 性能监控悬浮 HUD
 
 /// 开发期性能监控悬浮窗：实时显示 FPS、CPU、内存
-/// 仅在 Debug 构建中显示，可拖动调整位置，点击展开/收起
+/// 深色半透明背景，高对比度文字，可拖动调整位置，点击展开/收起
 struct PerformanceHUD: View {
     @ObservedObject var monitor: PerformanceMonitor
     @State private var isExpanded = true
@@ -18,55 +18,61 @@ struct PerformanceHUD: View {
                     isExpanded.toggle()
                 }
             } label: {
-                HStack(spacing: 6) {
+                HStack(spacing: 8) {
                     Image(systemName: "gauge.medium")
-                        .font(.caption2)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.white)
                     Text("性能")
-                        .font(.caption2.weight(.semibold))
-                    Spacer()
-                    Text("\(monitor.fps) FPS")
-                        .font(.caption2.weight(.bold))
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(.white)
+                    Spacer(minLength: 4)
+                    Text("\(monitor.fps)")
+                        .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .foregroundColor(fpsColor)
+                    Text("FPS")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.white.opacity(0.6))
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 8))
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.6))
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
-                .frame(width: 140)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .frame(width: 160)
             }
             .buttonStyle(.plain)
 
             // 展开区域：CPU + 内存
             if isExpanded {
                 Divider()
-                VStack(spacing: 4) {
+                    .background(Color.white.opacity(0.15))
+                VStack(spacing: 6) {
                     metricRow(
                         icon: "cpu",
                         label: "CPU",
-                        value: String(format: "%.1f%%", monitor.cpuUsage),
+                        value: String(format: "%.0f%%", monitor.cpuUsage),
                         color: cpuColor
                     )
                     metricRow(
                         icon: "memorychip",
                         label: "内存",
-                        value: String(format: "%.1f MB", monitor.memoryUsageMB),
+                        value: String(format: "%.0f MB", monitor.memoryUsageMB),
                         color: memoryColor
                     )
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
             }
         }
         .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(.ultraThinMaterial)
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.black.opacity(0.75))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5)
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.white.opacity(0.2), lineWidth: 0.5)
                 )
         )
-        .foregroundColor(.white)
-        .shadow(color: .black.opacity(0.3), radius: 8, x: 0, y: 2)
+        .shadow(color: .black.opacity(0.5), radius: 12, x: 0, y: 4)
         .offset(x: dragOffset.width, y: dragOffset.height)
         .gesture(
             DragGesture()
@@ -80,24 +86,24 @@ struct PerformanceHUD: View {
                     lastDragOffset = dragOffset
                 }
         )
-        .padding(.top, 60) // 避开状态栏/导航栏
+        .padding(.top, 60)
         .padding(.trailing, 12)
     }
 
     // MARK: - 指标行
 
     private func metricRow(icon: String, label: String, value: String, color: Color) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             Image(systemName: icon)
-                .font(.system(size: 10))
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(.white.opacity(0.7))
-                .frame(width: 14)
+                .frame(width: 16)
             Text(label)
-                .font(.caption2)
+                .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.white.opacity(0.7))
-            Spacer()
+            Spacer(minLength: 4)
             Text(value)
-                .font(.caption2.weight(.semibold))
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
                 .foregroundColor(color)
         }
     }

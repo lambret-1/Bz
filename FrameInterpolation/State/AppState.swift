@@ -39,7 +39,7 @@ final class AppState: ObservableObject {
     /// 处理模式：补帧或超分（二者互斥）
     @Published var selectedMode: PipelineMode = .interpolation(.x2)
     /// 超分引擎类型（仅超分模式生效）
-    @Published var superResolutionEngine: SuperResolutionEngineType = .piperSR
+    @Published var superResolutionEngine: SuperResolutionEngineType = .fastSRGAN
     /// 是否显示性能监控 HUD（FPS/CPU/内存），默认开启
     @Published var showPerformanceHUD: Bool = UserDefaults.standard.bool(forKey: "BzShowPerformanceHUD") {
         didSet {
@@ -390,7 +390,7 @@ final class AppState: ObservableObject {
         showSettings = false
         selectedVideo = nil
         selectedMode = .interpolation(.x2)
-        superResolutionEngine = .piperSR
+        superResolutionEngine = .fastSRGAN
         stage = .idle
         progress = 0
         processedFrames = 0

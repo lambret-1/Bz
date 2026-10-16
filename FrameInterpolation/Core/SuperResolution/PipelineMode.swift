@@ -4,7 +4,7 @@ import Foundation
 
 /// 视频处理模式：补帧与超分互斥，每次处理只能选择一种
 /// - 补帧模式：使用 RIFE Lite 提升帧率（2x / 4x）
-/// - 超分模式：使用 PiperSR 或 Real-ESRGAN 提升分辨率，帧率保持不变
+/// - 超分模式：使用 Fast-SRGAN 或 Real-ESRGAN 提升分辨率，帧率保持不变
 enum PipelineMode: Equatable {
     /// 补帧模式，关联补帧倍数
     case interpolation(FrameMultiplier)
@@ -48,8 +48,8 @@ enum PipelineMode: Equatable {
 
 /// 超分引擎类型枚举
 enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
-    /// PiperSR：2x 超分，640×360 全帧输入，ANE 原生，速度快
-    case piperSR = "PiperSR"
+    /// Fast-SRGAN：4x 超分，128×128 瓦片，轻量快速，适合通用场景
+    case fastSRGAN = "Fast-SRGAN"
     /// Real-ESRGAN x4v3：4x 超分，128×128 瓦片拼接，适合极低清素材
     case realESRGAN = "Real-ESRGAN"
 
@@ -58,8 +58,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     /// 显示名称
     var displayName: String {
         switch self {
-        case .piperSR:
-            return "PiperSR 2x"
+        case .fastSRGAN:
+            return "Fast-SRGAN 4x"
         case .realESRGAN:
             return "Real-ESRGAN 4x"
         }
@@ -68,8 +68,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     /// 放大倍数
     var scaleFactor: Int {
         switch self {
-        case .piperSR:
-            return 2
+        case .fastSRGAN:
+            return 4
         case .realESRGAN:
             return 4
         }
@@ -78,18 +78,18 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     /// 引擎描述
     var engineDescription: String {
         switch self {
-        case .piperSR:
-            return "720p → 1080p，速度快，适合普通低清视频"
+        case .fastSRGAN:
+            return "4x 放大，轻量快速，适合通用低清视频"
         case .realESRGAN:
-            return "480p → 1080p，4x 放大，适合极低清素材（速度较慢）"
+            return "4x 放大，细节恢复强，适合极低清素材（速度较慢）"
         }
     }
 
     /// 推荐输入最大高度（超过此高度建议先缩放）
     var recommendedInputMaxHeight: Int {
         switch self {
-        case .piperSR:
-            return 720
+        case .fastSRGAN:
+            return 540
         case .realESRGAN:
             return 480
         }
@@ -98,8 +98,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     /// 模型文件名（不含扩展名）
     var modelFileName: String {
         switch self {
-        case .piperSR:
-            return "PiperSR_2x_video_720p"
+        case .fastSRGAN:
+            return "fast_srgan"
         case .realESRGAN:
             return "real_esrgan_x4v3"
         }

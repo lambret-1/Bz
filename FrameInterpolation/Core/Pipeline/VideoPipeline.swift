@@ -4,7 +4,7 @@ import OSLog
 import Accelerate
 
 /// 视频处理管线：解码 → 补帧/超分 → 编码 + 音频透传
-/// 支持补帧模式（2x/4x）与超分模式（PiperSR 2x / Real-ESRGAN 4x），两种模式互斥
+/// 支持补帧模式（2x/4x）与超分模式（Fast-SRGAN 4x / Real-ESRGAN 4x），两种模式互斥
 /// 模型缺失时自动降级：补帧→空转（帧率不变），超分→vImage缩放
 final class VideoPipeline {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "VideoPipeline")

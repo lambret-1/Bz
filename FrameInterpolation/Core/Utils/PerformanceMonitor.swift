@@ -33,10 +33,15 @@ final class PerformanceMonitor: ObservableObject {
         guard !isRunning else { return }
         isRunning = true
 
-        // FPS 计数
-        let link = CADisplayLink(target: self, selector: #selector(handleDisplayLink(_:)))
+        // FPS 计数（使用弱引用代理避免循环引用）
+        let displayLinkProxy = DisplayLinkProxy { [weak self] link in
+            self?.handleDisplayLink(link)
+        }
+        let link = CADisplayLink(target: displayLinkProxy, selector: #selector(DisplayLinkProxy.handle(_:)))
         link.add(to: .main, forMode: .common)
         displayLink = link
+        // 保持代理引用
+        objc_setAssociatedObject(link, &DisplayLinkProxy.associatedKey, displayLinkProxy, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
 
         // 每秒更新一次 CPU 和内存
         updateTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -54,12 +59,13 @@ final class PerformanceMonitor: ObservableObject {
         updateTimer = nil
         isRunning = false
         fpsCount = 0
+        fpsLastTime = 0
         previousCPUInfo = nil
     }
 
     // MARK: - FPS 计数
 
-    @objc private func handleDisplayLink(_ link: CADisplayLink) {
+    private func handleDisplayLink(_ link: CADisplayLink) {
         fpsCount += 1
         let now = CACurrentMediaTime()
         if fpsLastTime == 0 {
@@ -118,7 +124,6 @@ final class PerformanceMonitor: ObservableObject {
         }
 
         // 与上一次采样的差值计算 CPU 占比
-        let now = Date().timeIntervalSince1970
         if let prev = previousCPUInfo {
             let userDiff = Double(totalUserTime - prev.userTime) / 1_000_000.0
             let systemDiff = Double(totalSystemTime - prev.systemTime) / 1_000_000.0
@@ -143,5 +148,21 @@ final class PerformanceMonitor: ObservableObject {
         }
         guard kerr == KERN_SUCCESS else { return 0 }
         return Double(taskInfo.resident_size) / 1024.0 / 1024.0
+    }
+}
+
+// MARK: - CADisplayLink 弱引用代理
+
+/// 用于打破 CADisplayLink 对 target 的强引用循环
+private final class DisplayLinkProxy: NSObject {
+    static var associatedKey = 0
+    private let handler: (CADisplayLink) -> Void
+
+    init(handler: @escaping (CADisplayLink) -> Void) {
+        self.handler = handler
+    }
+
+    @objc func handle(_ link: CADisplayLink) {
+        handler(link)
     }
 }
