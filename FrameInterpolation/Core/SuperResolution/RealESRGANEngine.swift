@@ -217,7 +217,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
             height: (tileSize + 15) / 16,
             depth: 1
         )
-        encoder.dispatchThreadgroups(threadGrid, threadsPerThreadGroup: threadGroup)
+        encoder.dispatchThreadgroups(threadGrid, threadsPerThreadgroup: threadGroup)
         encoder.endEncoding()
     }
 
