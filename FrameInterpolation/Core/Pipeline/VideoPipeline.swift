@@ -240,31 +240,55 @@ final class VideoPipeline {
         // MARK: 配置 Writer（仅视频，音频后续用 AVAssetExportSession 合成）
         let writer = try AVAssetWriter(outputURL: tempVideoURL, fileType: .mp4)
 
-        // 按分辨率设置H.264码率，避免默认低码率导致油画感模糊
-        let maxDimension = max(outputWidth, outputHeight)
-        let bitRate: Int
-        if maxDimension >= 1920 {
-            bitRate = 20_000_000  // 1080p 20Mbps
-        } else if maxDimension >= 1280 {
-            bitRate = 10_000_000  // 720p 10Mbps
+        // 按像素数比例动态计算码率，优先使用 HEVC 降低开销
+        // 原理：放大分辨率 = 像素数增加 = 需要更高码率承载新增细节
+        // HEVC 相比 H.264 压缩效率提升约 40%，相同画质下码率可降低
+        let inputWidth = Int(naturalSize.width)
+        let inputHeight = Int(naturalSize.height)
+        let inputPixelCount = max(inputWidth * inputHeight, 1)
+        let outputPixelCount = outputWidth * outputHeight
+        let pixelScaleRatio = Double(outputPixelCount) / Double(inputPixelCount)
+
+        // 输入视频原始码率（estimatedDataRate 单位 bps）
+        let inputBitRate = Double(videoTrack.estimatedDataRate)
+        // 基础码率：输入码率 × 像素数放大比例；输入码率无效时按分辨率兜底
+        let baseBitRate: Double
+        if inputBitRate > 100_000 {
+            baseBitRate = inputBitRate * pixelScaleRatio
         } else {
-            bitRate = 5_000_000   // 更低分辨率 5Mbps
+            // 兜底：按输出像素数计算，每百万像素约 4Mbps（HEVC）
+            baseBitRate = Double(outputPixelCount) / 1_000_000.0 * 4_000_000
         }
 
-        let videoWriterInput = AVAssetWriterInput(
-            mediaType: .video,
-            outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: outputWidth,
-                AVVideoHeightKey: outputHeight,
-                AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: bitRate,
-                    AVVideoMaxKeyFrameIntervalKey: 60,
-                    AVVideoAllowFrameReorderingKey: false
-                ]
-            ]
-        )
-        videoWriterInput.expectsMediaDataInRealTime = false
+        // HEVC 效率系数：相同画质下比 H.264 节省约 35% 码率
+        let hevcEfficiencyFactor = 0.65
+        // 码率上下限：最低 2Mbps，最高 60Mbps（避免超大文件）
+        let targetBitRate = max(2_000_000, min(60_000_000, Int(baseBitRate * hevcEfficiencyFactor)))
+
+        logger.info("编码配置: HEVC, 输入码率 \(inputBitRate/1_000_000)Mbps, 像素放大 \(String(format: "%.2f", pixelScaleRatio))x, 输出码率 \(Double(targetBitRate)/1_000_000)Mbps")
+
+        // 优先使用 HEVC，不支持时降级为 H.264（码率相应提高，因为 H.264 效率较低）
+        let videoWriterInput: AVAssetWriterInput
+        if let hevcInput = makeVideoWriterInput(
+            codec: .hevc,
+            width: outputWidth,
+            height: outputHeight,
+            bitRate: targetBitRate,
+            writer: writer
+        ) {
+            videoWriterInput = hevcInput
+            logger.info("使用 HEVC 编码")
+        } else {
+            let h264BitRate = min(80_000_000, Int(Double(targetBitRate) / hevcEfficiencyFactor))
+            videoWriterInput = makeVideoWriterInput(
+                codec: .h264,
+                width: outputWidth,
+                height: outputHeight,
+                bitRate: h264BitRate,
+                writer: writer
+            )!
+            logger.warning("HEVC 不可用，降级为 H.264 编码，码率 \(Double(h264BitRate)/1_000_000)Mbps")
+        }
         videoWriterInput.transform = transform
 
         let pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -276,10 +300,6 @@ final class VideoPipeline {
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
         )
-        guard writer.canAdd(videoWriterInput) else {
-            throw PipelineError.writerConfigurationFailed
-        }
-        writer.add(videoWriterInput)
 
         // MARK: 启动读写
         guard reader.startReading() else {
@@ -569,6 +589,47 @@ final class VideoPipeline {
                 inputFrameIndex += 1
             }
         }
+    }
+
+    // MARK: - 创建视频写入输入（支持 HEVC/H.264，自动检测兼容性）
+
+    /// 创建视频写入输入，自动检测编码兼容性并添加到 writer
+    /// - Returns: 创建成功返回 AVAssetWriterInput（已添加到 writer），不支持该编码返回 nil
+    private func makeVideoWriterInput(
+        codec: AVVideoCodecType,
+        width: Int,
+        height: Int,
+        bitRate: Int,
+        writer: AVAssetWriter
+    ) -> AVAssetWriterInput? {
+        var compressionProperties: [String: Any] = [
+            AVVideoAverageBitRateKey: bitRate,
+            AVVideoMaxKeyFrameIntervalKey: 60
+        ]
+
+        if codec == .hevc {
+            compressionProperties[AVVideoAllowFrameReorderingKey] = true
+            compressionProperties[AVVideoProfileLevelKey] = AVVideoProfileLevelHEVCMainAutoLevel
+        } else {
+            compressionProperties[AVVideoAllowFrameReorderingKey] = false
+        }
+
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: codec,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: compressionProperties
+            ]
+        )
+        input.expectsMediaDataInRealTime = false
+
+        guard writer.canAdd(input) else {
+            return nil
+        }
+        writer.add(input)
+        return input
     }
 
     // MARK: - 合成音频（AVMutableComposition + AVAssetExportSession）
