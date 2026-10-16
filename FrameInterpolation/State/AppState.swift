@@ -179,6 +179,8 @@ final class AppState: ObservableObject {
         isProcessing = true
         progress = 0
         processedFrames = 0
+        // 根据视频时长和帧率计算总帧数，用于进度页显示"已处理 X / Y 帧"
+        totalFrames = max(Int((video.duration * video.originalFPS).rounded()), 1)
         stage = .decoding
         processingStartTime = Date()
 
@@ -200,8 +202,12 @@ final class AppState: ObservableObject {
                 guard let self = self else { return }
                 self.progress = value
                 self.stage = stage
-                // 基于已用时间和进度估算剩余时间
-                if let start = self.processingStartTime, value > 0.01 {
+                // 根据进度计算已处理帧数
+                if self.totalFrames > 0 {
+                    self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
+                }
+                // 基于已用时间和进度估算剩余时间（超分模式进度更新细，降低阈值到 0.1%）
+                if let start = self.processingStartTime, value > 0.001 {
                     let elapsed = Date().timeIntervalSince(start)
                     self.estimatedRemaining = elapsed * (1.0 - value) / value
                 }

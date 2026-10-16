@@ -512,6 +512,11 @@ final class VideoPipeline {
 
         var inputFrameIndex = 0
 
+        // 超分处理较慢，立即报告初始进度，避免用户误以为卡死
+        Task { @MainActor in
+            progress(0.0, usingAI ? .superResolving : .decoding)
+        }
+
         while reader.status == .reading {
             if isCancelled {
                 reader.cancelReading()
@@ -529,8 +534,9 @@ final class VideoPipeline {
             }
 
             // 进度计算（超分模式一进一出，inputFrameIndex == outputFrameIndex）
+            // 超分每帧处理较慢，使用 0.1% 阈值确保进度条及时更新
             let progressValue = min(Double(inputFrameIndex) / Double(totalInputFrames), 0.99)
-            if progressValue - lastProgressReport >= 0.01 {
+            if progressValue - lastProgressReport >= 0.001 {
                 lastProgressReport = progressValue
                 let stage: ProcessingStage = usingAI ? .superResolving : .decoding
                 Task { @MainActor in
