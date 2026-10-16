@@ -89,10 +89,10 @@ final class VideoPipeline {
         case .interpolation(let m):
             effectiveMultiplier = interpolator != nil ? m.rawValue : 1
             modeDescription = "补帧\(effectiveMultiplier)x"
-        case .superResolution(let engineType):
+        case .superResolution(let engineType, let scale):
             effectiveMultiplier = 1 // 超分模式帧率不变
             currentSuperResolutionEngine = engineType
-            modeDescription = "超分\(engineType.displayName)"
+            modeDescription = "超分\(engineType.shortName)\(scale.label)"
         }
 
         logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 模式:\(modeDescription), 快速模式:\(fastMode), 分辨率:\(outputResolution.rawValue)")
@@ -167,24 +167,29 @@ final class VideoPipeline {
 
         // 超分模式帧率不变，补帧模式按倍数提升
         let outputFPS: Double
-        let superResolutionScale: Int
+        /// 用户选择的超分放大倍数（1-4x）
+        let targetScale: Int
+        /// 模型原生放大倍数（固定 4x）
+        let nativeScale: Int
         switch mode {
         case .interpolation:
             outputFPS = inputFPS * Double(multiplier)
-            superResolutionScale = 1
-        case .superResolution(let engineType):
+            targetScale = 1
+            nativeScale = 1
+        case .superResolution(let engineType, let scale):
             outputFPS = inputFPS // 超分模式帧率保持不变
-            superResolutionScale = engineType.scaleFactor
+            targetScale = scale.rawValue
+            nativeScale = engineType.nativeScaleFactor
         }
 
         let durationSeconds = CMTimeGetSeconds(asset.duration)
         let totalInputFrames = max(Int(durationSeconds * inputFPS), 1)
 
-        // 输出尺寸（超分模式先放大，再根据 outputResolution 缩放）
+        // 输出尺寸（按用户选择的放大倍数计算）
         let naturalSize = videoTrack.naturalSize
         let transform = videoTrack.preferredTransform
-        var outputWidth = Int(naturalSize.width) * superResolutionScale
-        var outputHeight = Int(naturalSize.height) * superResolutionScale
+        var outputWidth = Int(naturalSize.width) * targetScale
+        var outputHeight = Int(naturalSize.height) * targetScale
 
         // 计算目标高度（保持宽高比）
         let targetHeight: Int?
@@ -332,7 +337,7 @@ final class VideoPipeline {
                 outputFrameIndex: &outputFrameIndex,
                 lastProgressReport: &lastProgressReport
             )
-        case .superResolution(let engineType):
+        case .superResolution(let engineType, let scale):
             try runSuperResolutionLoop(
                 reader: reader,
                 videoReaderOutput: videoReaderOutput,
@@ -341,6 +346,8 @@ final class VideoPipeline {
                 pixelBufferAdaptor: pixelBufferAdaptor,
                 outputFPS: outputFPS,
                 engineType: engineType,
+                targetScale: scale,
+                nativeScale: nativeScale,
                 needsScaling: needsScaling,
                 outputWidth: outputWidth,
                 outputHeight: outputHeight,
@@ -515,6 +522,8 @@ final class VideoPipeline {
         pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
         outputFPS: Double,
         engineType: SuperResolutionEngineType,
+        targetScale: SuperResolutionScale,
+        nativeScale: Int,
         needsScaling: Bool,
         outputWidth: Int,
         outputHeight: Int,
@@ -523,11 +532,15 @@ final class VideoPipeline {
         outputFrameIndex: inout Int,
         lastProgressReport: inout Double
     ) throws {
-        // 加载超分引擎（模型缺失时为 nil，降级为 vImage 缩放）
-        let engine = SuperResolutionEngineFactory.makeEngine(type: engineType)
+        // 1x 模式或模型缺失时跳过 AI 超分，直接复制/缩放帧
+        let needsAI = targetScale.needsAISuperResolution
+        let engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
         let usingAI = engine != nil
-        if engine == nil {
+        if needsAI && engine == nil {
             logger.warning("\(engineType.displayName) 模型未加载，超分模式降级为 vImage 缩放")
+        }
+        if !needsAI {
+            logger.info("超分倍数 1x，跳过 AI 推理，直接透传帧")
         }
 
         var inputFrameIndex = 0
@@ -541,7 +554,6 @@ final class VideoPipeline {
             if isCancelled {
                 reader.cancelReading()
                 writer.cancelWriting()
-                // 通知超分引擎取消瓦片处理
                 engine?.cancel()
                 throw PipelineError.cancelled
             }
@@ -552,7 +564,6 @@ final class VideoPipeline {
             }
 
             // 进度计算（超分模式一进一出，inputFrameIndex == outputFrameIndex）
-            // 超分每帧处理较慢，使用 0.1% 阈值确保进度条及时更新
             let progressValue = min(Double(inputFrameIndex) / Double(totalInputFrames), 0.99)
             if progressValue - lastProgressReport >= 0.001 {
                 lastProgressReport = progressValue
@@ -563,23 +574,37 @@ final class VideoPipeline {
             }
 
             autoreleasepool {
-                // 超分处理：引擎可用走 AI 超分，否则降级为 vImage 缩放
-                let upscaledFrame: CVPixelBuffer
-                if let engine = engine,
-                   let aiFrame = engine.upscale(pixelBuffer) {
-                    upscaledFrame = aiFrame
+                let processedFrame: CVPixelBuffer
+
+                if !needsAI {
+                    // 1x 模式：直接使用原帧
+                    processedFrame = pixelBuffer
+                } else if let engine = engine,
+                          let aiFrame = engine.upscale(pixelBuffer) {
+                    // AI 超分（原生 4x），若目标倍数 < 4x 则缩放到目标尺寸
+                    if targetScale.rawValue < nativeScale {
+                        let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
+                        let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
+                        let targetW = srcWidth * targetScale.rawValue
+                        let targetH = srcHeight * targetScale.rawValue
+                        processedFrame = self.scalePixelBuffer(aiFrame, to: targetW, targetH) ?? aiFrame
+                    } else {
+                        processedFrame = aiFrame
+                    }
                 } else {
-                    // 降级：直接缩放到输出尺寸（vImage 高质量缩放）
-                    let srWidth = CVPixelBufferGetWidth(pixelBuffer) * engineType.scaleFactor
-                    let srHeight = CVPixelBufferGetHeight(pixelBuffer) * engineType.scaleFactor
-                    upscaledFrame = scalePixelBuffer(pixelBuffer, to: srWidth, srHeight) ?? pixelBuffer
+                    // 降级：vImage 缩放到目标尺寸
+                    let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
+                    let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
+                    let targetW = srcWidth * targetScale.rawValue
+                    let targetH = srcHeight * targetScale.rawValue
+                    processedFrame = self.scalePixelBuffer(pixelBuffer, to: targetW, targetH) ?? pixelBuffer
                 }
 
                 // 复制颜色空间附件
-                copyColorSpaceAttachments(from: pixelBuffer, to: upscaledFrame)
+                copyColorSpaceAttachments(from: pixelBuffer, to: processedFrame)
 
                 // 最终输出缩放（根据 outputResolution 限制）
-                let finalFrame = needsScaling ? self.scalePixelBuffer(upscaledFrame, to: outputWidth, outputHeight) ?? upscaledFrame : upscaledFrame
+                let finalFrame = needsScaling ? self.scalePixelBuffer(processedFrame, to: outputWidth, outputHeight) ?? processedFrame : processedFrame
 
                 // 超分模式帧率不变，PTS 按 outputFPS 等间隔排列
                 let currentPTS = CMTime(value: Int64(outputFrameIndex), timescale: Int32(outputFPS))

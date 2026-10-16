@@ -33,6 +33,7 @@ struct SettingsView: View {
 
                     // 超分模式专属参数
                     if isSuperResolutionMode {
+                        superResolutionScaleSection
                         superResolutionEngineSection
                     }
 
@@ -155,7 +156,7 @@ struct SettingsView: View {
                     icon: "sparkles",
                     isSelected: isSuperResolutionMode
                 ) {
-                    appState.selectedMode = .superResolution(appState.superResolutionEngine)
+                    appState.selectedMode = .superResolution(appState.superResolutionEngine, appState.superResolutionScale)
                 }
             }
         }
@@ -208,6 +209,23 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - 超分放大倍数
+
+    private var superResolutionScaleSection: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.s) {
+            Text("放大倍数")
+                .font(.headline)
+            SegmentedPicker(
+                items: SuperResolutionScale.allCases,
+                selection: $appState.superResolutionScale,
+                label: { $0.label }
+            )
+            Text(appState.superResolutionScale == .x1 ? "1x 不执行 AI 推理，仅复制帧（用于对比基准）" : "模型原生 4x，\(appState.superResolutionScale.label) 通过 4x 超分后缩放实现")
+                .font(.caption)
+                .foregroundColor(DesignTokens.Colors.textSecondary)
+        }
+    }
+
     // MARK: - 超分引擎选择
 
     private var superResolutionEngineSection: some View {
@@ -226,7 +244,7 @@ struct SettingsView: View {
         let isSelected = appState.superResolutionEngine == engine
         return Button {
             appState.superResolutionEngine = engine
-            appState.selectedMode = .superResolution(engine)
+            appState.selectedMode = .superResolution(engine, appState.superResolutionScale)
         } label: {
             HStack(spacing: DesignTokens.Spacing.m) {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
@@ -334,7 +352,7 @@ struct SettingsView: View {
 
         if isSuperResolutionMode {
             // 超分模式：分辨率提升，数据量增加，帧率不变
-            let scaleFactor = Double(appState.superResolutionEngine.scaleFactor)
+            let scaleFactor = Double(appState.superResolutionScale.rawValue)
             let resolutionFactor: Double = appState.outputResolution == .p1080 ? 1.0 : (appState.outputResolution == .p720 ? 0.5 : scaleFactor)
             return String(format: "%.0f", base * resolutionFactor * 1.5)
         } else {
@@ -350,6 +368,13 @@ struct SettingsView: View {
 
         if isSuperResolutionMode {
             // 超分模式耗时估算
+            if appState.superResolutionScale == .x1 {
+                // 1x 模式不执行 AI 推理，仅复制帧，速度极快
+                let seconds = max(video.duration / 10.0, 1)
+                if seconds < 60 { return String(format: "约 %.0f 秒", seconds) }
+                return String(format: "约 %.1f 分钟", seconds / 60)
+            }
+
             let defaultSpeed: Double = appState.superResolutionEngine == .fastSRGAN ? 1.0 : 0.3
             let speedFactor = appState.measuredSpeedFactor ?? defaultSpeed
             var base = video.duration / speedFactor
@@ -407,7 +432,7 @@ struct SettingsView: View {
 
     private var outputResolutionText: String {
         guard let video = appState.selectedVideo else { return "—" }
-        let scale = appState.superResolutionEngine.scaleFactor
+        let scale = appState.superResolutionScale.rawValue
         var outWidth = video.width * scale
         var outHeight = video.height * scale
 

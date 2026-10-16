@@ -4,20 +4,20 @@ import Foundation
 
 /// 视频处理模式：补帧与超分互斥，每次处理只能选择一种
 /// - 补帧模式：使用 RIFE Lite 提升帧率（2x / 4x）
-/// - 超分模式：使用 Fast-SRGAN 或 Real-ESRGAN 提升分辨率，帧率保持不变
+/// - 超分模式：使用 Fast-SRGAN 或 Real-ESRGAN 提升分辨率，帧率保持不变，放大倍数 1-4x 可调
 enum PipelineMode: Equatable {
     /// 补帧模式，关联补帧倍数
     case interpolation(FrameMultiplier)
-    /// 超分模式，关联超分引擎类型
-    case superResolution(SuperResolutionEngineType)
+    /// 超分模式，关联超分引擎类型和放大倍数（1-4x）
+    case superResolution(SuperResolutionEngineType, SuperResolutionScale)
 
     /// 显示名称
     var displayName: String {
         switch self {
         case .interpolation(let multiplier):
             return "补帧 \(multiplier.label)"
-        case .superResolution(let engine):
-            return "超分 \(engine.displayName)"
+        case .superResolution(let engine, let scale):
+            return "超分 \(engine.shortName) \(scale.label)"
         }
     }
 
@@ -26,8 +26,8 @@ enum PipelineMode: Equatable {
         switch self {
         case .interpolation(let multiplier):
             return "AI补帧（\(multiplier.label)）"
-        case .superResolution(let engine):
-            return "AI超分（\(engine.displayName)）"
+        case .superResolution(let engine, let scale):
+            return "AI超分（\(engine.shortName) \(scale.label)）"
         }
     }
 
@@ -44,6 +44,24 @@ enum PipelineMode: Equatable {
     }
 }
 
+// MARK: - 超分放大倍数（1-4x 可调）
+
+/// 超分放大倍数：模型原生 4x，1x/2x/3x 通过 4x 超分后缩放到目标尺寸实现
+enum SuperResolutionScale: Int, CaseIterable, Identifiable {
+    case x1 = 1
+    case x2 = 2
+    case x3 = 3
+    case x4 = 4
+
+    var id: Int { rawValue }
+
+    /// 显示标签
+    var label: String { "\(rawValue)x" }
+
+    /// 是否需要执行 AI 超分（1x 时可跳过，直接复制帧）
+    var needsAISuperResolution: Bool { rawValue > 1 }
+}
+
 // MARK: - 超分引擎类型
 
 /// 超分引擎类型枚举
@@ -55,33 +73,34 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// 显示名称
-    var displayName: String {
+    /// 短名称（用于显示）
+    var shortName: String {
         switch self {
-        case .fastSRGAN:
-            return "Fast-SRGAN 4x"
-        case .realESRGAN:
-            return "Real-ESRGAN 4x"
+        case .fastSRGAN: return "Fast-SRGAN"
+        case .realESRGAN: return "Real-ESRGAN"
         }
     }
 
-    /// 放大倍数
-    var scaleFactor: Int {
+    /// 显示名称（含原生放大倍数）
+    var displayName: String {
         switch self {
         case .fastSRGAN:
-            return 4
+            return "Fast-SRGAN（原生4x）"
         case .realESRGAN:
-            return 4
+            return "Real-ESRGAN（原生4x）"
         }
     }
+
+    /// 模型原生放大倍数
+    var nativeScaleFactor: Int { 4 }
 
     /// 引擎描述
     var engineDescription: String {
         switch self {
         case .fastSRGAN:
-            return "4x 放大，轻量快速，适合通用低清视频"
+            return "轻量快速，适合通用低清视频"
         case .realESRGAN:
-            return "4x 放大，细节恢复强，适合极低清素材（速度较慢）"
+            return "细节恢复强，适合极低清素材（速度较慢）"
         }
     }
 

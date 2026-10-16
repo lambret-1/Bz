@@ -42,6 +42,8 @@ final class AppState: ObservableObject {
     @Published var selectedMode: PipelineMode = .interpolation(.x2)
     /// 超分引擎类型（仅超分模式生效）
     @Published var superResolutionEngine: SuperResolutionEngineType = .fastSRGAN
+    /// 超分放大倍数（1-4x 可调，仅超分模式生效）
+    @Published var superResolutionScale: SuperResolutionScale = .x4
 
     // MARK: - 处理中
     @Published var progress: Double = 0
@@ -174,7 +176,7 @@ final class AppState: ObservableObject {
         case .interpolation:
             mode = .interpolation(frameMultiplier)
         case .superResolution:
-            mode = .superResolution(superResolutionEngine)
+            mode = .superResolution(superResolutionEngine, superResolutionScale)
         }
 
         logger.info("开始处理: \(video.fileName, privacy: .public), 模式:\(mode.displayName)")
@@ -237,8 +239,8 @@ final class AppState: ObservableObject {
                         self.processingMode = self.pipeline.isUsingAIInterpolation
                             ? "AI补帧（\(self.frameMultiplier.label)）"
                             : "空转管线（帧率不变）"
-                    case .superResolution(let engineType):
-                        self.processingMode = "AI超分（\(engineType.displayName)）"
+                    case .superResolution(let engineType, let scale):
+                        self.processingMode = "AI超分（\(engineType.shortName) \(scale.label)）"
                     }
 
                     // 追加最近记录（超分模式帧率不变）
@@ -395,6 +397,7 @@ final class AppState: ObservableObject {
         selectedVideo = nil
         selectedMode = .interpolation(.x2)
         superResolutionEngine = .fastSRGAN
+        superResolutionScale = .x4
         stage = .idle
         progress = 0
         processedFrames = 0
