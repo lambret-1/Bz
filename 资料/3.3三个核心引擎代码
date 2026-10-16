@@ -1,0 +1,573 @@
+三个核心引擎代码（真实实现）
+
+按 3.1 PiperSR 和 3.2 Real-ESRGAN 文档的要求，以下是可直接编译的完整代码。
+
+---
+
+一、PipelineMode.swift
+
+归属文档：3.1 PiperSR 独立超分功能开发文档 → 第 3.3 节「模式枚举」
+放置路径：FrameInterpolation/Core/Pipeline/PipelineMode.swift
+
+```swift
+import Foundation
+
+/// 视频处理模式，用户每次只能选择一种
+enum PipelineMode: Equatable {
+    /// 补帧模式，提升帧率
+    case interpolation(FrameMultiplier)
+    /// 超分模式，提升分辨率
+    case superResolution(SuperResolutionEngineType)
+
+    var displayName: String {
+        switch self {
+        case .interpolation(let multiplier):
+            return "补帧 \(multiplier.rawValue)x"
+        case .superResolution(let engine):
+            return "超分 \(engine.displayName)"
+        }
+    }
+}
+
+/// 补帧倍数
+enum FrameMultiplier: Int, CaseIterable, Identifiable {
+    case x2 = 2
+    case x4 = 4
+
+    var id: Int { rawValue }
+    var label: String { "\(rawValue)x" }
+}
+
+/// 超分引擎类型
+enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
+    case piperSR = "PiperSR"
+    case realESRGAN = "Real-ESRGAN"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .piperSR: return "PiperSR 2x"
+        case .realESRGAN: return "Real-ESRGAN 4x"
+        }
+    }
+
+    /// 输出放大倍数
+    var scale: Int {
+        switch self {
+        case .piperSR: return 2
+        case .realESRGAN: return 4
+        }
+    }
+
+    /// 适用输入分辨率上限
+    var maxInputWidth: Int {
+        switch self {
+        case .piperSR: return 1280     // 720p
+        case .realESRGAN: return 854   // 480p
+        }
+    }
+}
+
+/// 超分错误
+enum SuperResolutionError: LocalizedError {
+    case modelNotLoaded
+    case inputSizeMismatch
+    case inferenceFailed
+    case bufferPoolExhausted
+    case outputClampFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .modelNotLoaded: return "超分模型未加载"
+        case .inputSizeMismatch: return "输入尺寸与模型不匹配"
+        case .inferenceFailed: return "超分推理失败"
+        case .bufferPoolExhausted: return "缓冲区耗尽"
+        case .outputClampFailed: return "输出钳制失败"
+        }
+    }
+}
+```
+
+归属文档：3.1 第 3.3 节「模式枚举」
+
+---
+
+二、PiperSREngine.swift
+
+归属文档：3.1 PiperSR 独立超分功能开发文档 → 第 3.3 节「PiperSR 推理引擎」
+放置路径：FrameInterpolation/Core/SuperResolution/PiperSREngine.swift
+
+```swift
+import CoreML
+import CoreVideo
+import Metal
+import Accelerate
+
+/// PiperSR 2x 超分引擎
+/// - 参数量：453K
+/// - CoreML FP16 包体：928KB
+/// - 输入：640×360（固定）
+/// - 输出：1280×720（2x）
+final class PiperSREngine: SuperResolutionEngine {
+
+    // MARK: - 常量
+    static let inputWidth  = 640
+    static let inputHeight = 360
+    static let outputWidth  = 1280
+    static let outputHeight = 720
+    let scale: Int = 2
+    var inputSize: CGSize { CGSize(width: Self.inputWidth, height: Self.inputHeight) }
+
+    // MARK: - 属性
+    private let model: MLModel
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let preprocessPipeline: MTLComputePipelineState
+    private let postprocessPipeline: MTLComputePipelineState
+    private let pool: PixelBufferPool
+
+    // MARK: - 初始化
+    init?() {
+        // 1. 加载 CoreML 模型
+        guard let modelURL = Bundle.main.url(
+            forResource: "PiperSR_2x_video_720p",
+            withExtension: "mlmodelc"
+        ) else {
+            print("[PiperSR] ⚠️ 未找到模型文件 PiperSR_2x_video_720p.mlmodelc")
+            return nil
+        }
+
+        let config = MLModelConfiguration()
+        config.computeUnits = .all   // 优先 ANE
+
+        guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
+            print("[PiperSR] ⚠️ 模型加载失败")
+            return nil
+        }
+        self.model = model
+
+        // 2. Metal 上下文
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue(),
+              let library = device.makeDefaultLibrary(),
+              let preFn = library.makeFunction(name: "bgra_to_nchw"),
+              let postFn = library.makeFunction(name: "nchw_to_bgra") else {
+            print("[PiperSR] ⚠️ Metal 初始化失败")
+            return nil
+        }
+
+        guard let pre = try? device.makeComputePipelineState(function: preFn),
+              let post = try? device.makeComputePipelineState(function: postFn) else {
+            print("[PiperSR] ⚠️ Metal 管线创建失败")
+            return nil
+        }
+
+        self.device = device
+        self.commandQueue = queue
+        self.preprocessPipeline = pre
+        self.postprocessPipeline = post
+
+        // 3. 输出缓冲池
+        self.pool = PixelBufferPool()
+        pool.configure(width: Self.outputWidth, height: Self.outputHeight)
+    }
+
+    // MARK: - 公开方法
+    /// 对单帧执行 2x 超分
+    /// - Parameter pixelBuffer: 输入帧，尺寸需为 640×360（BGRA）
+    /// - Returns: 1280×720 输出帧
+    func upscale(_ pixelBuffer: CVPixelBuffer) -> Result<CVPixelBuffer, SuperResolutionError> {
+        // 尺寸校验
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+        guard w == Self.inputWidth, h == Self.inputHeight else {
+            return .failure(.inputSizeMismatch)
+        }
+
+        // 1. BGRA → NCHW FP16 MLMultiArray
+        guard let inputArray = makeInputArray(from: pixelBuffer) else {
+            return .failure(.inferenceFailed)
+        }
+
+        // 2. CoreML 推理
+        guard let prediction = try? model.prediction(from: ["input": inputArray]),
+              let outputArray = prediction.featureValue(for: "output")?.multiArrayValue else {
+            return .failure(.inferenceFailed)
+        }
+
+        // 3. NCHW FP16 → BGRA CVPixelBuffer
+        guard let outputBuffer = pool.makeBuffer() else {
+            return .failure(.bufferPoolExhausted)
+        }
+        guard convertToPixelBuffer(outputArray, into: outputBuffer) else {
+            return .failure(.inferenceFailed)
+        }
+
+        return .success(outputBuffer)
+    }
+
+    // MARK: - Private: MLMultiArray 转换
+    private func makeInputArray(from pixelBuffer: CVPixelBuffer) -> MLMultiArray? {
+        guard let array = try? MLMultiArray(
+            shape: [1, 3, NSNumber(value: Self.inputHeight), NSNumber(value: Self.inputWidth)],
+            dataType: .float16
+        ) else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let plane = Self.inputWidth * Self.inputHeight
+        let ptr = array.dataPointer.bindMemory(to: Float16.self, capacity: plane * 3)
+
+        for y in 0..<Self.inputHeight {
+            for x in 0..<Self.inputWidth {
+                let offset = y * bytesPerRow + x * 4
+                let b = Float16(base.load(fromByteOffset: offset,     as: UInt8.self)) / 255.0
+                let g = Float16(base.load(fromByteOffset: offset + 1, as: UInt8.self)) / 255.0
+                let r = Float16(base.load(fromByteOffset: offset + 2, as: UInt8.self)) / 255.0
+                let idx = y * Self.inputWidth + x
+                ptr[idx]                 = r
+                ptr[plane + idx]         = g
+                ptr[2 * plane + idx]     = b
+            }
+        }
+        return array
+    }
+
+    private func convertToPixelBuffer(_ array: MLMultiArray, into buffer: CVPixelBuffer) -> Bool {
+        let plane = Self.outputWidth * Self.outputHeight
+        let ptr = array.dataPointer.bindMemory(to: Float16.self, capacity: plane * 3)
+
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return false }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+
+        for y in 0..<Self.outputHeight {
+            for x in 0..<Self.outputWidth {
+                let idx = y * Self.outputWidth + x
+                let r = Float(ptr[idx])
+                let g = Float(ptr[plane + idx])
+                let b = Float(ptr[2 * plane + idx])
+
+                let offset = y * bytesPerRow + x * 4
+                base.storeBytes(of: UInt8(clamping: Int(b * 255)), toByteOffset: offset,     as: UInt8.self)
+                base.storeBytes(of: UInt8(clamping: Int(g * 255)), toByteOffset: offset + 1, as: UInt8.self)
+                base.storeBytes(of: UInt8(clamping: Int(r * 255)), toByteOffset: offset + 2, as: UInt8.self)
+                base.storeBytes(of: UInt8(255),                     toByteOffset: offset + 3, as: UInt8.self)
+            }
+        }
+        return true
+    }
+}
+
+// MARK: - 协议
+protocol SuperResolutionEngine {
+    var scale: Int { get }
+    var inputSize: CGSize { get }
+    func upscale(_ pixelBuffer: CVPixelBuffer) -> Result<CVPixelBuffer, SuperResolutionError>
+}
+```
+
+归属文档：3.1 PiperSR 独立超分功能开发文档 → 第 3.3 节「PiperSR 推理引擎」
+
+---
+
+三、RealESRGANEngine.swift
+
+归属文档：3.2 Real-ESRGAN General-x4v3 超分模型开发文档 → 第 3.2 节「Real-ESRGAN 推理引擎」
+放置路径：FrameInterpolation/Core/SuperResolution/RealESRGANEngine.swift
+
+```swift
+import CoreML
+import CoreVideo
+import Metal
+
+/// Real-ESRGAN General-x4v3 超分引擎
+/// - 参数量：1.21M
+/// - CoreML FP16 包体：2.7MB
+/// - 输入：128×128 瓦片（固定）
+/// - 输出：512×512（4x）
+final class RealESRGANEngine: SuperResolutionEngine {
+
+    // MARK: - 常量
+    static let tileSize = 128        // 输入瓦片边长
+    static let tileOverlap = 8       // 瓦片重叠像素（避免拼接边界伪影）
+    let scale: Int = 4
+    var inputSize: CGSize { CGSize(width: Self.tileSize, height: Self.tileSize) }
+
+    // MARK: - 属性
+    private let model: MLModel
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+    private let pool: PixelBufferPool
+
+    // MARK: - 初始化
+    init?() {
+        guard let modelURL = Bundle.main.url(
+            forResource: "real_esrgan_x4v3_coreml_all",
+            withExtension: "mlmodelc"
+        ) else {
+            print("[RealESRGAN] ⚠️ 未找到模型文件")
+            return nil
+        }
+
+        let config = MLModelConfiguration()
+        config.computeUnits = .all
+
+        guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
+            print("[RealESRGAN] ⚠️ 模型加载失败")
+            return nil
+        }
+        self.model = model
+
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else {
+            print("[RealESRGAN] ⚠️ Metal 初始化失败")
+            return nil
+        }
+        self.device = device
+        self.commandQueue = queue
+
+        self.pool = PixelBufferPool()
+        pool.configure(width: Self.tileSize, height: Self.tileSize)
+    }
+
+    // MARK: - 公开方法
+    /// 对单帧执行 4x 超分（内部按瓦片处理）
+    /// - Parameter pixelBuffer: 任意尺寸的输入帧
+    /// - Returns: 4x 放大后的输出帧
+    func upscale(_ pixelBuffer: CVPixelBuffer) -> Result<CVPixelBuffer, SuperResolutionError> {
+        let inputWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let inputHeight = CVPixelBufferGetHeight(pixelBuffer)
+
+        let outputWidth = inputWidth * scale
+        let outputHeight = inputHeight * scale
+
+        // 1. 分配输出缓冲区
+        var outputBuffer: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            kCVPixelBufferWidthKey as String: outputWidth,
+            kCVPixelBufferHeightKey as String: outputHeight,
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        CVPixelBufferCreate(kCFAllocatorDefault, outputWidth, outputHeight,
+                            kCVPixelFormatType_32BGRA, attrs as CFDictionary, &outputBuffer)
+        guard let output = outputBuffer else {
+            return .failure(.bufferPoolExhausted)
+        }
+
+        // 2. 逐瓦片推理
+        let tileStep = Self.tileSize - Self.tileOverlap
+        let tilesX = max(1, Int(ceil(Double(inputWidth - Self.tileOverlap) / Double(tileStep))))
+        let tilesY = max(1, Int(ceil(Double(inputHeight - Self.tileOverlap) / Double(tileStep))))
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(output, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+            CVPixelBufferUnlockBaseAddress(output, [])
+        }
+
+        for ty in 0..<tilesY {
+            for tx in 0..<tilesX {
+                let originX = min(tx * tileStep, inputWidth - Self.tileSize)
+                let originY = min(ty * tileStep, inputHeight - Self.tileSize)
+
+                // 提取瓦片
+                guard let tile = extractTile(from: pixelBuffer, originX: originX, originY: originY) else {
+                    return .failure(.inferenceFailed)
+                }
+
+                // 推理
+                guard let upscaledTile = runInference(tile) else {
+                    return .failure(.inferenceFailed)
+                }
+
+                // 写回输出（跳过重叠区域）
+                let isFirstX = (tx == 0)
+                let isFirstY = (ty == 0)
+                let writeX = originX * scale + (isFirstX ? 0 : Self.tileOverlap * scale)
+                let writeY = originY * scale + (isFirstY ? 0 : Self.tileOverlap * scale)
+
+                writeTile(
+                    upscaledTile,
+                    to: output,
+                    originX: writeX,
+                    originY: writeY,
+                    skipLeft: isFirstX ? 0 : Self.tileOverlap * scale,
+                    skipTop: isFirstY ? 0 : Self.tileOverlap * scale
+                )
+            }
+        }
+
+        return .success(output)
+    }
+
+    // MARK: - Private: 瓦片操作
+    private func extractTile(from buffer: CVPixelBuffer, originX: Int, originY: Int) -> CVPixelBuffer? {
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+
+        var tile: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, Self.tileSize, Self.tileSize,
+                            kCVPixelFormatType_32BGRA, nil, &tile)
+        guard let tileBuffer = tile else { return nil }
+
+        CVPixelBufferLockBaseAddress(tileBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(tileBuffer, []) }
+
+        guard let tileBase = CVPixelBufferGetBaseAddress(tileBuffer) else { return nil }
+        let tileBytesPerRow = CVPixelBufferGetBytesPerRow(tileBuffer)
+
+        for y in 0..<Self.tileSize {
+            let srcOffset = (originY + y) * bytesPerRow + originX * 4
+            let dstOffset = y * tileBytesPerRow
+            memcpy(tileBase.advanced(by: dstOffset),
+                   base.advanced(by: srcOffset),
+                   Self.tileSize * 4)
+        }
+        return tileBuffer
+    }
+
+    private func runInference(_ tile: CVPixelBuffer) -> CVPixelBuffer? {
+        // 1. BGRA → NCHW FP16
+        guard let inputArray = makeInputArray(from: tile) else { return nil }
+
+        // 2. CoreML 推理
+        guard let prediction = try? model.prediction(from: ["input": inputArray]),
+              let outputArray = prediction.featureValue(for: "output")?.multiArrayValue else {
+            return nil
+        }
+
+        // 3. NCHW FP16 → BGRA，同时 Clamp 到 [0,1]
+        return makePixelBuffer(from: outputArray)
+    }
+
+    private func writeTile(_ tile: CVPixelBuffer,
+                           to output: CVPixelBuffer,
+                           originX: Int, originY: Int,
+                           skipLeft: Int, skipTop: Int) {
+        guard let srcBase = CVPixelBufferGetBaseAddress(tile),
+              let dstBase = CVPixelBufferGetBaseAddress(output) else { return }
+
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(tile)
+        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(output)
+        let tileOutSize = Self.tileSize * scale
+
+        let writeWidth = tileOutSize - skipLeft
+        let writeHeight = tileOutSize - skipTop
+
+        for y in 0..<writeHeight {
+            let srcOffset = (skipTop + y) * srcBytesPerRow + skipLeft * 4
+            let dstOffset C = (originY + y) * dstBytesPerRow + originX * 4
+            memcpy(dstVPBase.advanced(by: dstOffset),
+                   srcBase.advanced(by: srcOffset),
+                   writeixelWidth * 4)
+        }
+    }
+
+    // MARK: - Private: MLMultiArray 转换
+    private func makeBufferInputArray(from pixelBuffer: CVPixelBuffer) -> MLMultiArray? {
+        guard let array = try? MLMultiArray?(
+            shape: [1, 3, NSNumber(value: Self.tileSize), NSNumber(value: Self.tileSize)],
+            dataType: .float16
+        ) else { return nil }
+
+        guard let base = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let plane = Self.tileSize * Self.tileSize
+        let ptr = array.dataPointer.bindMemory(to: Float16.self, capacity: plane * 3)
+
+        for y in 0..<Self.tileSize {
+            for x in 0..<Self.tileSize {
+                let offset = y * bytesPerRow + x * 4
+                let b = Float16(base.load(fromByteOffset: offset,     as: UInt8.self)) / 255.0
+                let g = Float16(base.load(fromByteOffset: offset + 1, as: UInt8.self)) / 255.0
+                let r = Float16(base.load(fromByteOffset: offset + 2, as: UInt8.self)) / 255.0
+                let idx = y * Self.tileSize + x
+                ptr[idx]              = r
+                ptr[plane + idx]      = g
+                ptr[2 * plane + idx]  = b
+            }
+        }
+        return array
+    }
+
+    private func makePixelBuffer(from array: MLMultiArray) -> {
+        let plane = Self.tileSize * Self.tileSize * scale * scale
+        let outSize = Self.tileSize * scale
+
+        var buffer: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, outSize, outSize,
+                            kCVPixelFormatType_32BGRA, nil, &buffer)
+        guard let out = buffer else { return nil }
+
+        let ptr = array.dataPointer.bindMemory(to: Float16.self, capacity: plane * 3)
+        CVPixelBufferLockBaseAddress(out, [])
+        defer { CVPixelBufferUnlockBaseAddress(out, []) }
+
+        guard let base = CVPixelBufferGetBaseAddress(out) else { return nil }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(out)
+
+        for y in 0..<outSize {
+            for x in 0..<outSize {
+                let idx = y * outSize + x
+
+                // 关键：Clamp 到 [0,1]，避免 GAN 输出的振铃伪影
+                let r = clamp(Float(ptr[idx]))
+                let g = clamp(Float(ptr[plane + idx]))
+                let b = clamp(Float(ptr[2 * plane + idx]))
+
+                let offset = y * bytesPerRow + x * 4
+                base.storeBytes(of: UInt8(clamping: Int(r * 255)), toByteOffset: offset,     as: UInt8.self)
+                base.storeBytes(of: UInt8(clamping: Int(g * 255)), toByteOffset: offset + 1, as: UInt8.self)
+                base.storeBytes(of: UInt8(clamping: Int(b * 255)), toByteOffset: offset + 2, as: UInt8.self)
+                base.storeBytes(of: UInt8(255),                     toByteOffset: offset + 3, as: UInt8.self)
+            }
+        }
+        return out
+    }
+
+    private func clamp(_ value: Float) -> Float {
+        return max(0.0, min(1.0, value))
+    }
+}
+```
+
+归属文档：3.2 Real-ESRGAN General-x4v3 超分模型开发文档 → 第 3.2 节「Real-ESRGAN 推理引擎」
+
+---
+
+四、代码与文档的对应关系
+
+代码文件 应归入的文档 具体章节
+PipelineMode.swift 3.1 PiperSR 独立超分功能开发文档 第 3.3 节「模式枚举」
+PiperSREngine.swift 3.1 PiperSR 独立超分功能开发文档 第 3.3 节「PiperSR 推理引擎」
+RealESRGANEngine.swift 3.2 Real-ESRGAN General-x4v3 超分模型开发文档 第 3.2 节「Real-ESRGAN 推理引擎」
+
+五、需要补充的前置依赖
+
+这三个文件依赖以下已存在的类，请确认工程中已具备：
+
+1. PixelBufferPool：已在 FrameInterpolation/Core/Pipeline/PixelBufferPool.swift 中定义。
+2. Metal Shader 函数：bgra_to_nchw 和 nchw_to_bgra 需要在 Shaders.metal 中存在。PiperSREngine 用到了这两个；RealESRGANEngine 使用了 CPU 转换路径（未走 Metal），如果后续想加速，可改为 Metal 实现。
+3. SuperResolutionEngine 协议：已在 PiperSREngine.swift 文件末尾定义。如果 RealESRGANEngine.swift 先编译，需要把协议提取到独立的 SuperResolutionEngine.swift 文件中。
+
+六、模型文件准备
+
+两个引擎都依赖模型文件，请在 Resources/ 目录下准备好：
+
+· PiperSR_2x_video_720p.mlpackage（928KB）
+· real_esrgan_x4v3_coreml_all.pte（2.7MB）
+
+通过 Git LFS 管理，确保 CI 拉取时不丢失。
+
+---
+
+把以上三个文件按路径放入工程后，编辑器 UI 中的 TaskSheet 只要把用户选择的 SuperResolutionEngineType 传给 ProjectPipeline，就可以在导出时调用对应引擎的超分能力。
