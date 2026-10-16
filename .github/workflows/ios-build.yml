@@ -1,6 +1,6 @@
 on:
   push:
-    branches: [main, testping]
+    branches: [main, testping, CF]
     paths-ignore:
       - '**.md'
       - '资料/**'
