@@ -9,11 +9,9 @@ final class DraftStore {
     private init() {}
 
     /// 保存草稿
-    func saveDraft(appState: AppState) {
-        if let project = appState.currentProject {
-            if let data = try? JSONEncoder().encode(project.segments) {
-                UserDefaults.standard.set(data, forKey: segmentsKey)
-            }
+    func saveDraft(segments: [VideoSegment]) {
+        if let data = try? JSONEncoder().encode(segments) {
+            UserDefaults.standard.set(data, forKey: segmentsKey)
         }
     }
 

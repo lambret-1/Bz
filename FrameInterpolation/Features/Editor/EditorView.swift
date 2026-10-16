@@ -103,7 +103,9 @@ struct EditorView: View {
     // MARK: - 草稿保存
     private func saveDraft() {
         draftIndicator.triggerSave()
-        DraftStore.shared.saveDraft(appState: appState)
+        if let segments = appState.currentProject?.segments {
+            DraftStore.shared.saveDraft(segments: segments)
+        }
     }
 
     // MARK: - 关闭编辑器
