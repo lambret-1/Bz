@@ -53,12 +53,12 @@ jobs:
           NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
           echo "新版本: $NEW_VERSION"
           
-          # 更新 project.yml
-          sed -i "s/CFBundleShortVersionString: \"$CURRENT\"/CFBundleShortVersionString: \"$NEW_VERSION\"/" project.yml
+          # 更新 project.yml（macOS sed 需要 -i ''）
+          sed -i '' "s/CFBundleShortVersionString: \"$CURRENT\"/CFBundleShortVersionString: \"$NEW_VERSION\"/" project.yml
           
           # 同步更新 Info.plist（如果存在）
           if [ -f FrameInterpolation/Resources/Info.plist ]; then
-            sed -i "s/<string>$CURRENT<\/string>/<string>$NEW_VERSION<\/string>/" FrameInterpolation/Resources/Info.plist
+            sed -i '' "s/<string>$CURRENT<\/string>/<string>$NEW_VERSION<\/string>/" FrameInterpolation/Resources/Info.plist
           fi
           
           echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
