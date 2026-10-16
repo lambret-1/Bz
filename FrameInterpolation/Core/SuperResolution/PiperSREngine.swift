@@ -115,7 +115,7 @@ final class PiperSREngine: SuperResolutionEngine {
 
         guard let featureProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputArray]),
               let prediction = try? model.prediction(from: featureProvider),
-              let outputArray = prediction.featureValue(for: "output")?.multiArrayValue else {
+              let outputArray = prediction.featureValue(for: "clip_0")?.multiArrayValue else {
             logger.error("Core ML 推理失败")
             return nil
         }
