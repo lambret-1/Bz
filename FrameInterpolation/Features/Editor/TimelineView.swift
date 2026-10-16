@@ -256,7 +256,7 @@ struct TimelineView: View {
 
     // MARK: - 缩略图加载
     private func loadSegmentThumbnails(_ segment: VideoSegment) {
-        let startFrame = Int(segment.sourceStart * fps)
+        let startFrame = Int(segment.startTime * fps)
         let frameCount = max(1, Int(segment.duration * fps))
         let step = max(1, frameCount / 10)
 
