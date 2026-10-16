@@ -634,7 +634,6 @@ final class VideoPipeline {
 
         if codec == .hevc {
             compressionProperties[AVVideoAllowFrameReorderingKey] = true
-            compressionProperties[AVVideoProfileLevelKey] = AVVideoProfileLevelHEVCMainAutoLevel
         } else {
             compressionProperties[AVVideoAllowFrameReorderingKey] = false
         }
