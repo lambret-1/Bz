@@ -143,7 +143,8 @@ final class AppState: ObservableObject {
         logger.info("开始导入视频: \(url.lastPathComponent, privacy: .public)")
         stage = .decoding
 
-        Task {
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
             do {
                 let info = try await MediaImporter.loadVideoInfo(from: url)
                 self.selectedVideo = info
