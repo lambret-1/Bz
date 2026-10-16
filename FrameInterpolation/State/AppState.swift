@@ -284,7 +284,7 @@ final class AppState: ObservableObject {
     }
 
     /// 更新当前项目（保存修改）
-    private func updateCurrentProject(_ mutation: (inout Project) -> Void) {
+    func updateCurrentProject(_ mutation: (inout Project) -> Void) {
         guard let project = currentProject,
               let index = projects.firstIndex(where: { $0.id == project.id }) else { return }
         var updated = project
@@ -332,7 +332,7 @@ final class AppState: ObservableObject {
             undoStack.append(current)
         }
         updateCurrentProject { $0.segments = next }
-        showToast("已重做", style: .info)
+        showToast("已重做", style: .warning)
     }
 
     /// 在播放头位置分切当前片段
@@ -843,17 +843,19 @@ final class AppState: ObservableObject {
                 // 找到匹配的视频，创建项目
                 let videoInfo = VideoInfo(
                     url: tempURL,
+                    fileName: record.fileName,
                     duration: 0,
+                    originalFPS: 30,
+                    originalSizeMB: 0,
                     width: 0,
                     height: 0,
-                    originalFPS: 30,
-                    fileSize: 0,
+                    codecFormat: "未知",
                     bitRateMbps: 0
                 )
                 let project = Project(
+                    name: record.fileName,
                     videoInfo: videoInfo,
-                    segments: segments,
-                    enhancement: EnhancementConfig()
+                    segments: segments
                 )
                 currentProject = project
                 selectedVideo = videoInfo

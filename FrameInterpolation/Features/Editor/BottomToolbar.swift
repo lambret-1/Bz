@@ -80,7 +80,7 @@ struct BottomToolbar: View {
         case "音量":
             appState.showToast("音量调节开发中", style: .warning)
         case "收起":
-            appState.showToast("收起时间线", style: .info)
+            appState.showToast("收起时间线", style: .warning)
         default:
             break
         }

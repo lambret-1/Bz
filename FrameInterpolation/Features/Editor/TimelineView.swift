@@ -122,67 +122,22 @@ struct TimelineView: View {
 
     // MARK: - 片段卡片
     private func segmentCard(_ segment: VideoSegment, index: Int) -> some View {
-        let isSelected = selectedSegmentID == segment.id
-        let segmentFrames = max(1, Int(segment.duration * fps))
-        let segmentWidth = CGFloat(segmentFrames) * frameWidth
-
-        return ZStack(alignment: .leading) {
-            // 胶片缩略图背景
-            HStack(spacing: 0) {
-                ForEach(0..<min(segmentFrames, 20), id: \.self) { frameOffset in
-                    let absoluteFrame = Int(segment.sourceStart * fps) + frameOffset
-                    if let thumb = thumbnails[absoluteFrame] {
-                        Image(uiImage: thumb)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: max(segmentWidth / CGFloat(min(segmentFrames, 20)), 1), height: 80)
-                            .clipped()
-                    } else {
-                        Rectangle()
-                            .fill(Color(uiColor: .tertiarySystemBackground))
-                            .frame(width: max(segmentWidth / CGFloat(min(segmentFrames, 20)), 1), height: 80)
-                    }
-                }
+        SegmentCardView(
+            segment: segment,
+            index: index,
+            isSelected: selectedSegmentID == segment.id,
+            frameWidth: frameWidth,
+            fps: fps,
+            thumbnails: thumbnails,
+            onTap: {
+                appState.selectedSegmentID = selectedSegmentID == segment.id ? nil : segment.id
+                UISelectionFeedbackGenerator().selectionChanged()
+            },
+            onTrim: { newStart, newEnd in
+                trimSegment(segment, start: newStart, end: newEnd)
             }
-            .onAppear { loadSegmentThumbnails(segment) }
-
-            // 选中态边框
-            RoundedRectangle(cornerRadius: 4)
-                .stroke(isSelected ? Color.accentPink : Color.clear, lineWidth: 2)
-
-            // 片段序号
-            if isSelected {
-                VStack {
-                    HStack {
-                        Text("片段 \(index + 1)")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.accentPink)
-                            .cornerRadius(4)
-                        Spacer()
-                    }
-                    Spacer()
-                }
-                .padding(4)
-            }
-
-            // 裁剪把手（选中时显示）
-            if isSelected {
-                SegmentTrimOverlay(segment: segment) { newStart, newEnd in
-                    trimSegment(segment, start: newStart, end: newEnd)
-                }
-            }
-        }
-        .frame(width: segmentWidth, height: 100)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            appState.selectedSegmentID = isSelected ? nil : segment.id
-            UISelectionFeedbackGenerator().selectionChanged()
-        }
-        .accessibilityLabel("片段 \(index + 1)，时长 \(String(format: "%.1f", segment.duration))秒")
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        )
+        .onAppear { loadSegmentThumbnails(segment) }
     }
 
     // MARK: - 播放头（帧吸附）
@@ -349,9 +304,88 @@ struct TimelineView: View {
         let clampedEnd = max(clampedStart + 0.1, min(end, videoDuration))
 
         appState.updateCurrentProject { project in
-            project.segments[index].sourceStart = clampedStart
-            project.segments[index].sourceEnd = clampedEnd
+            project.segments[index].startTime = clampedStart
+            project.segments[index].duration = clampedEnd - clampedStart
         }
+    }
+}
+
+/// 片段卡片视图（独立组件，避免表达式过复杂）
+struct SegmentCardView: View {
+    let segment: VideoSegment
+    let index: Int
+    let isSelected: Bool
+    let frameWidth: CGFloat
+    let fps: Double
+    let thumbnails: [Int: UIImage]
+    let onTap: () -> Void
+    let onTrim: (TimeInterval, TimeInterval) -> Void
+
+    private var segmentFrames: Int { max(1, Int(segment.duration * fps)) }
+    private var segmentWidth: CGFloat { CGFloat(segmentFrames) * frameWidth }
+    private var thumbnailCount: Int { min(segmentFrames, 20) }
+    private var thumbWidth: CGFloat { max(segmentWidth / CGFloat(thumbnailCount), 1) }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            // 胶片缩略图背景
+            filmstripBackground
+
+            // 选中态边框
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(isSelected ? Color.accentPink : Color.clear, lineWidth: 2)
+
+            // 片段序号
+            if isSelected {
+                segmentLabel
+            }
+
+            // 裁剪把手（选中时显示）
+            if isSelected {
+                SegmentTrimOverlay(segment: segment, onTrim: onTrim)
+            }
+        }
+        .frame(width: segmentWidth, height: 100)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onTap)
+        .accessibilityLabel("片段 \(index + 1)，时长 \(String(format: "%.1f", segment.duration))秒")
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+    }
+
+    private var filmstripBackground: some View {
+        HStack(spacing: 0) {
+            ForEach(0..<thumbnailCount, id: \.self) { frameOffset in
+                let absoluteFrame = Int(segment.startTime * fps) + frameOffset
+                if let thumb = thumbnails[absoluteFrame] {
+                    Image(uiImage: thumb)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: thumbWidth, height: 80)
+                        .clipped()
+                } else {
+                    Rectangle()
+                        .fill(Color(uiColor: .tertiarySystemBackground))
+                        .frame(width: thumbWidth, height: 80)
+                }
+            }
+        }
+    }
+
+    private var segmentLabel: some View {
+        VStack {
+            HStack {
+                Text("片段 \(index + 1)")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.accentPink)
+                    .cornerRadius(4)
+                Spacer()
+            }
+            Spacer()
+        }
+        .padding(4)
     }
 }
 
