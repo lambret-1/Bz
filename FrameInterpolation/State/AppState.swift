@@ -52,6 +52,7 @@ final class AppState: ObservableObject {
     @Published var selectedVideo: VideoInfo?
     @Published var frameMultiplier: FrameMultiplier = .x2
     @Published var outputResolution: OutputResolution = .auto
+    @Published var outputFPS: OutputFPSMode = .original
     @Published var fastMode: Bool = false
 
     // MARK: - 处理中

@@ -257,6 +257,15 @@ enum OutputResolution: String, CaseIterable, Identifiable, Codable {
     var id: String { rawValue }
 }
 
+// MARK: - 输出帧率模式
+enum OutputFPSMode: String, CaseIterable, Identifiable, Codable {
+    case original = "保持原样"
+    case fps60 = "60fps"
+    case fps120 = "120fps"
+
+    var id: String { rawValue }
+}
+
 // MARK: - 任务标签类型
 enum TaskTagType {
     case frameInterpolation

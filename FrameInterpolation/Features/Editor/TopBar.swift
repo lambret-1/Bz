@@ -7,20 +7,40 @@ struct TopBar: View {
     let onExport: () -> Void
     @State private var showTaskSheet = false
 
-    /// 任务标签显示逻辑
+    /// 任务标签显示逻辑（与TaskSheet联动）
     private var taskLabel: String {
         guard let project = appState.currentProject else { return "未导入" }
 
-        let resolution = "\(project.videoInfo.height)P"
+        // 分辨率：优先显示用户选择的输出分辨率
+        let resolution: String
+        switch appState.outputResolution {
+        case .auto:
+            resolution = "\(project.videoInfo.height)P"
+        case .p720:
+            resolution = "720P"
+        case .p1080:
+            resolution = "1080P"
+        }
+
+        // 帧率：优先显示用户选择的输出帧率
+        let fpsLabel: String
+        switch appState.outputFPS {
+        case .original:
+            fpsLabel = "\(Int(project.videoInfo.originalFPS))fps"
+        case .fps60:
+            fpsLabel = "60fps"
+        case .fps120:
+            fpsLabel = "120fps"
+        }
 
         switch project.enhancement.mode {
         case .frameInterpolation:
-            let fps = Int(project.videoInfo.originalFPS) * project.enhancement.frameMultiplier.rawValue
-            return "补帧 \(fps)fps · \(resolution)"
+            let multiplier = project.enhancement.frameMultiplier.rawValue
+            return "补帧 \(multiplier)x · \(resolution) · \(fpsLabel)"
         case .superResolution:
             return "超分 \(project.enhancement.srModel.rawValue) · \(resolution)"
         case .none:
-            return resolution
+            return "\(resolution) · \(fpsLabel)"
         }
     }
 

@@ -5,24 +5,53 @@ struct TaskSheet: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.dismiss) private var dismiss
 
+    // 基础设置（临时状态，应用时同步到AppState）
+    @State private var tempResolution: OutputResolution = .auto
+    @State private var tempFPS: OutputFPSMode = .original
+    @State private var tempBitrate: BitrateMode = .auto
+
+    // AI增强设置
     @State private var tempMode: EnhancementMode = .none
     @State private var tempMultiplier: FrameMultiplier = .x2
     @State private var tempSRModel: SuperResolutionModel = .piperSR
+
+    // 轻量增强设置
     @State private var tempSharpen: Bool = false
     @State private var tempSharpenStrength: Double = 0.4
     @State private var tempDenoise: Bool = false
     @State private var tempDenoiseStrength: Double = 0.3
 
     var body: some View {
-        NavigationView {
+        NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
                     // 基础设置
                     VStack(alignment: .leading, spacing: 16) {
                         Text("基础设置").font(.headline)
-                        settingRow("分辨率", value: .constant("原画"), options: ["原画", "720P", "1080P", "4K"])
-                        settingRow("帧率", value: .constant("保持原样"), options: ["保持原样", "60fps", "120fps"])
-                        settingRow("码率", value: .constant("自动"), options: ["自动", "高画质", "均衡", "小体积"])
+
+                        // 分辨率（真实绑定）
+                        Picker("分辨率", selection: $tempResolution) {
+                            ForEach(OutputResolution.allCases) { option in
+                                Text(option.rawValue).tag(option)
+                            }
+                        }
+                        .pickerStyle(.menu)
+
+                        // 帧率（真实绑定）
+                        Picker("帧率", selection: $tempFPS) {
+                            ForEach(OutputFPSMode.allCases) { option in
+                                Text(option.rawValue).tag(option)
+                            }
+                        }
+                        .pickerStyle(.menu)
+
+                        // 码率（真实绑定）
+                        Picker("码率", selection: $tempBitrate) {
+                            ForEach(BitrateMode.allCases) { option in
+                                Text(option.rawValue).tag(option)
+                            }
+                        }
+                        .pickerStyle(.menu)
                     }
                     .padding()
                     .background(Color(uiColor: .secondarySystemBackground))
@@ -77,6 +106,9 @@ struct TaskSheet: View {
 
                     // 重置按钮
                     Button("重置任务") {
+                        tempResolution = .auto
+                        tempFPS = .original
+                        tempBitrate = .auto
                         tempMode = .none
                         tempMultiplier = .x2
                         tempSRModel = .piperSR
@@ -107,6 +139,12 @@ struct TaskSheet: View {
     }
 
     private func loadCurrentConfig() {
+        // 基础设置
+        tempResolution = appState.outputResolution
+        tempFPS = appState.outputFPS
+        tempBitrate = appState.currentProject?.exportSettings.bitrateMode ?? .auto
+
+        // AI增强设置
         guard let project = appState.currentProject else { return }
         tempMode = project.enhancement.mode
         tempMultiplier = project.enhancement.frameMultiplier
@@ -118,6 +156,16 @@ struct TaskSheet: View {
     }
 
     private func applyConfig() {
+        // 基础设置同步到AppState
+        appState.outputResolution = tempResolution
+        appState.outputFPS = tempFPS
+
+        // 码率同步到project.exportSettings
+        appState.updateCurrentProject { project in
+            project.exportSettings.bitrateMode = tempBitrate
+        }
+
+        // AI增强设置
         appState.setEnhancementMode(tempMode)
         if tempMode == .frameInterpolation {
             appState.setFrameMultiplier(tempMultiplier)
@@ -130,19 +178,6 @@ struct TaskSheet: View {
             config.sharpenIntensity = tempSharpenStrength
             config.denoiseEnabled = tempDenoise
             config.denoiseIntensity = tempDenoiseStrength
-        }
-    }
-
-    private func settingRow(_ title: String, value: Binding<String>, options: [String]) -> some View {
-        HStack {
-            Text(title).foregroundColor(.secondary)
-            Spacer()
-            Picker(title, selection: value) {
-                ForEach(options, id: \.self) { option in
-                    Text(option).tag(option)
-                }
-            }
-            .pickerStyle(.menu)
         }
     }
 }
