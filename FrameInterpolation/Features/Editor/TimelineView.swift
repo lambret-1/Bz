@@ -3,13 +3,14 @@ import AVFoundation
 
 /// 缩放级别
 enum ZoomLevel: CGFloat, CaseIterable {
-    case l0 = 2.0    // 宏观（每帧2pt）
+    case l0 = 4.0    // 宏观（每帧4pt，确保最小可交互宽度）
     case l1 = 8.0    // 中观（每帧8pt，缩略图可辨认）
     case l2 = 20.0   // 微观（每帧20pt）
     case l3 = 40.0   // 逐帧（每帧40pt）
 }
 
 /// 时间线视图：刻度尺 + 片段卡片 + 播放头 + 缩放 + 逐帧 + 音频轨 + 转场
+/// 单 ScrollView 架构：刻度尺与片段轨道同步滚动，避免双 ScrollView 不同步
 struct TimelineView: View {
     @EnvironmentObject var appState: AppState
     @State private var currentZoom: ZoomLevel = .l1
@@ -20,6 +21,7 @@ struct TimelineView: View {
     @State private var transitionDuration: TimeInterval = 0.3
     @State private var timeObserver: Any?
     @State private var isScrubbing = false
+    @State private var viewAlive = true  // 标记视图存活，避免异步回调写入已销毁视图
 
     private var selectedSegmentID: UUID? { appState.selectedSegmentID }
 
@@ -40,11 +42,45 @@ struct TimelineView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // 刻度尺
-            rulerView
-
-            // 片段轨道（含胶片缩略图 + 选中态 + 裁剪把手）
-            segmentTrackView
+            // 统一滚动区域：刻度尺 + 片段轨道在同一个 ScrollView 内，保证同步
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(spacing: 0) {
+                    // 刻度尺
+                    rulerView
+                    // 片段轨道（含胶片缩略图 + 选中态 + 裁剪把手）
+                    segmentTrackView
+                }
+                .padding(.horizontal, UIScreen.main.bounds.width / 2)
+            }
+            .frame(height: 124)  // 24(刻度尺) + 100(片段轨道)
+            .background(Color.timelineBg)
+            // 缩放手势（用 simultaneousGesture 避免与滚动手势冲突）
+            .simultaneousGesture(
+                MagnificationGesture()
+                    .onEnded { value in
+                        if value > 1.0 {
+                            if let idx = ZoomLevel.allCases.firstIndex(of: currentZoom),
+                               idx < ZoomLevel.allCases.count - 1 {
+                                currentZoom = ZoomLevel.allCases[idx + 1]
+                            }
+                        } else {
+                            if let idx = ZoomLevel.allCases.firstIndex(of: currentZoom), idx > 0 {
+                                currentZoom = ZoomLevel.allCases[idx - 1]
+                            }
+                        }
+                        UISelectionFeedbackGenerator().selectionChanged()
+                    }
+            )
+            // 拖动开始/结束时设置 isScrubbing，防止播放器回调抢帧号
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { _ in
+                        if !isScrubbing { isScrubbing = true }
+                    }
+                    .onEnded { _ in
+                        isScrubbing = false
+                    }
+            )
 
             // 逐帧微调（L2/L3 显示）
             if currentZoom == .l2 || currentZoom == .l3 {
@@ -62,59 +98,42 @@ struct TimelineView: View {
             bottomControls
         }
         .background(Color.timelineBg)
-        .onAppear { setupPlayerObserver() }
-        .onDisappear { removePlayerObserver() }
+        .onAppear {
+            viewAlive = true
+            setupPlayerObserver()
+        }
+        .onDisappear {
+            viewAlive = false
+            removePlayerObserver()
+        }
     }
 
     // MARK: - 刻度尺
     private var rulerView: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 0) {
-                ForEach(0..<max(totalFrames, 1), id: \.self) { index in
-                    if index % 10 == 0 {
-                        Text("\(index)f")
-                            .font(.system(size: 10))
-                            .foregroundColor(.gray)
-                            .frame(width: frameWidth * 10, alignment: .leading)
-                    }
+        HStack(spacing: 0) {
+            ForEach(0..<max(totalFrames, 1), id: \.self) { index in
+                if index % 10 == 0 {
+                    Text("\(index)f")
+                        .font(.system(size: 10))
+                        .foregroundColor(.gray)
+                        .frame(width: frameWidth * 10, alignment: .leading)
                 }
             }
-            .padding(.horizontal, UIScreen.main.bounds.width / 2)
         }
         .frame(height: 24)
-        .background(Color.timelineBg)
         .accessibilityLabel("时间刻度尺")
     }
 
     // MARK: - 片段轨道
     private var segmentTrackView: some View {
-        ZStack {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
-                        segmentCard(segment, index: index)
-                    }
+        ZStack(alignment: .top) {
+            HStack(spacing: 0) {
+                ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
+                    segmentCard(segment, index: index)
                 }
-                .padding(.horizontal, UIScreen.main.bounds.width / 2)
             }
-            .gesture(
-                MagnificationGesture()
-                    .onEnded { value in
-                        if value > 1.0 {
-                            if let idx = ZoomLevel.allCases.firstIndex(of: currentZoom),
-                               idx < ZoomLevel.allCases.count - 1 {
-                                currentZoom = ZoomLevel.allCases[idx + 1]
-                            }
-                        } else {
-                            if let idx = ZoomLevel.allCases.firstIndex(of: currentZoom), idx > 0 {
-                                currentZoom = ZoomLevel.allCases[idx - 1]
-                            }
-                        }
-                        UISelectionFeedbackGenerator().selectionChanged()
-                    }
-            )
 
-            // 播放头固定居中（帧吸附）
+            // 播放头固定居中（帧吸附），ZStack 顶部对齐
             playheadView
         }
         .frame(height: 100)
@@ -152,7 +171,7 @@ struct TimelineView: View {
             Triangle()
                 .fill(Color.accentPink)
                 .frame(width: 12, height: 8)
-            // 竖线（动态填充剩余高度，不硬编码）
+            // 竖线（填充剩余高度）
             Rectangle()
                 .fill(Color.accentPink)
                 .frame(width: 2)
@@ -242,13 +261,15 @@ struct TimelineView: View {
     // MARK: - 播放器观察者（播放头与播放器同步）
     private func setupPlayerObserver() {
         guard let player = PlayerManager.shared.player else { return }
-        let interval = CMTime(seconds: 0.033, preferredTimescale: 600) // ~30fps
-        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
-            guard !isScrubbing else { return }
+        // 降低刷新频率到 20fps（0.05s），减少主线程压力
+        let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self, self.viewAlive else { return }
+            guard !self.isScrubbing else { return }  // 拖动时不覆盖帧号
             let seconds = CMTimeGetSeconds(time)
-            let frame = Int(seconds * fps)
-            if frame != currentFrame {
-                currentFrame = frame
+            let frame = Int(seconds * self.fps)
+            if frame != self.currentFrame {
+                self.currentFrame = frame
             }
         }
     }
@@ -260,11 +281,12 @@ struct TimelineView: View {
         timeObserver = nil
     }
 
-    // MARK: - 缩略图加载
+    // MARK: - 缩略图加载（加载20个，与显示数量一致）
     private func loadSegmentThumbnails(_ segment: VideoSegment) {
         let startFrame = Int(segment.startTime * fps)
         let frameCount = max(1, Int(segment.duration * fps))
-        let step = max(1, frameCount / 10)
+        let thumbnailCount = min(frameCount, 20)  // 与 SegmentCardView 显示数量一致
+        let step = max(1, frameCount / thumbnailCount)
 
         for i in stride(from: 0, to: frameCount, by: step) {
             loadThumbnailIfNeeded(at: startFrame + i)
@@ -275,7 +297,8 @@ struct TimelineView: View {
         guard thumbnails[index] == nil,
               let url = appState.currentProject?.videoInfo.url else { return }
 
-        let time = CMTime(value: Int64(index), timescale: Int32(fps))
+        // 用 600 timescale 避免 fps 截断（29.97fps 不会变 29）
+        let time = CMTime(value: Int64(Double(index) * 600 / fps), timescale: 600)
         let asset = AVURLAsset(url: url)
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
@@ -283,10 +306,14 @@ struct TimelineView: View {
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
 
-        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { [weak self] _, cgImage, _, _, _ in
+            guard let self = self, self.viewAlive else { return }  // 检查视图存活
             if let cgImage {
                 let image = UIImage(cgImage: cgImage)
-                DispatchQueue.main.async { thumbnails[index] = image }
+                DispatchQueue.main.async {
+                    guard self.viewAlive else { return }
+                    self.thumbnails[index] = image
+                }
             }
         }
     }
@@ -409,7 +436,7 @@ struct SegmentCardView: View {
                     .foregroundColor(.white)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(Color.accentPink)
+                    .background(Color.accentPink.opacity(0.8))
                     .cornerRadius(4)
                 Spacer()
             }
