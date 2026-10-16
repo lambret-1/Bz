@@ -1,4 +1,5 @@
 import CoreVideo
+import CoreMedia
 import Foundation
 
 // MARK: - 处理后的帧
