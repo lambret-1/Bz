@@ -251,13 +251,18 @@ final class AppState: ObservableObject {
 
     /// 复制项目
     func duplicateProject(_ project: Project) {
-        var copy = project
-        copy.id = UUID()
-        copy.name = "\(project.name) 副本"
-        copy.status = .draft
-        copy.outputURL = nil
-        copy.createdAt = Date()
-        copy.updatedAt = Date()
+        let copy = Project(
+            id: UUID(),
+            name: "\(project.name) 副本",
+            videoInfo: project.videoInfo,
+            segments: project.segments,
+            enhancement: project.enhancement,
+            exportSettings: project.exportSettings,
+            status: .draft,
+            outputURL: nil,
+            createdAt: Date(),
+            updatedAt: Date()
+        )
         projects.insert(copy, at: 0)
         saveProjects()
         showToast("已复制项目")
@@ -353,8 +358,12 @@ final class AppState: ObservableObject {
         guard let project = currentProject,
               let index = project.segments.firstIndex(where: { $0.id == segment.id }) else { return }
         pushUndo()
-        var copy = segment
-        copy.id = UUID()
+        let copy = VideoSegment(
+            id: UUID(),
+            startTime: segment.startTime,
+            duration: segment.duration,
+            thumbnailData: segment.thumbnailData
+        )
         updateCurrentProject {
             $0.segments.insert(copy, at: index + 1)
         }
