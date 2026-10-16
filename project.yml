@@ -22,8 +22,8 @@ targets:
     info:
       path: FrameInterpolation/Resources/Info.plist
       properties:
-        CFBundleDisplayName: AI 补帧
-        CFBundleShortVersionString: "0.2.5"
+        CFBundleDisplayName: 视频增强工作台
+        CFBundleShortVersionString: "0.3.0"
         CFBundleVersion: "1"
         UILaunchScreen:
           UIColorName: BgPrimary

@@ -59,7 +59,8 @@ enum MediaImporter {
         let sizeMB = Double(fileSize) / 1024 / 1024
 
         // 生成缩略图（失败不影响主流程）
-        let thumbnail = try? await generateThumbnail(asset: asset)
+        let thumbnailImage = try? await generateThumbnail(asset: asset)
+        let thumbnailData = thumbnailImage?.jpegData(compressionQuality: 0.6)
 
         let durationSeconds = CMTimeGetSeconds(resolvedDuration)
 
@@ -75,7 +76,7 @@ enum MediaImporter {
             height: height,
             codecFormat: codecFormat,
             bitRateMbps: bitRateMbps,
-            thumbnail: thumbnail
+            thumbnailData: thumbnailData
         )
     }
 

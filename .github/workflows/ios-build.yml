@@ -2,7 +2,7 @@ name: iOS Build
 
 on:
   push:
-    branches: [main, testping]
+    branches: [main, testping, CF]
   workflow_dispatch:
 
 jobs:

@@ -475,3 +475,24 @@ FrameInterpolation/
 9. 热降级仅提示，不自动改参数。
 10. 不做多轨道，只做单轨增强。
 11. 不上架 App Store，侧载分发。
+
+---
+
+## 版本记录
+
+### v0.3.0 — UI 细化全面落地
+
+按照「资料/1.UI 细化」规格完成全部 UI 页面重构：
+
+- **设计系统**：DesignTokens 精确配色（深色/浅色双模式）、字体令牌、间距圆角统一
+- **组件库**：PrimaryButton（按下态 scale+opacity）、CardView（浅色阴影）、SegmentedPicker、TaskTag、ToastView、RingProgressView、EmptyStateView、CollapsibleSectionHeader、InfoRow、ToolbarActionButton
+- **首页**：项目网格（2列 LazyVGrid）+ ProjectCard（缩略图/时长/任务标签/状态）+ 空状态 + 长按菜单（重命名/复制/删除）
+- **项目详情页**：视频预览（AVPlayer 封装+自定义控制条）+ 时间线（播放头拖拽+片段卡片横向滚动）+ 编辑工具栏（分切/复制/删除/撤销）+ 增强任务（补帧/超分互斥单选+清晰度折叠区+音频修复）+ 导出设置入口 + 底部固定开始按钮
+- **处理中页**：唯一进度环 + 任务清单（完成/进行中/等待三态）+ 热状态提示 + 取消确认
+- **结果页**：左右对比播放器（同步播放）+ 处理信息卡片 + 保存/分享/再次处理
+- **导出设置页**：编码/码率/容器/音频 Picker + 预计输出实时计算
+- **设置页**：通用（触觉反馈/屏幕常亮）+ 默认导出设置 + 存储（缓存清理）+ 关于
+- **状态管理**：项目制持久化、片段编辑撤销栈、增强配置互斥校验
+- **导航**：全部独立 fullScreenCover + NavigationStack，左上角返回按钮 + 边缘左滑手势
+
+所有页面适配深色/浅色模式、动态字体、VoiceOver，按钮最小点击区域 44pt。
