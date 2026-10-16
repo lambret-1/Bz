@@ -1,0 +1,328 @@
+PiperSR 超分模型开发文档（iOS 端侧集成）
+
+项目：iOS 视频补帧 App
+模型：PiperSR-2x
+适用系统：iOS 16.0+
+文档版本：v1.0
+最后更新：2026-10-16
+
+1. 概述
+
+1.1 模型简介
+
+PiperSR 是首个专为 Apple Neural Engine（ANE）从零设计的开源超分辨率模型，由 ModelPiper 团队开发。与 Real-ESRGAN、ESPCN 等为 GPU 设计的模型不同，PiperSR 的每一层操作都经过验证可在 ANE 上原生执行，不存在静默回退到 GPU/CPU 的情况。
+
+1.2 核心参数
+
+参数 值
+参数量 453K
+CoreML FP16 包体 928 KB
+放大倍数 2x
+PSNR (Set5) 37.54 dB
+架构 6 个残差块，64 通道，SiLU 激活，PixelShuffle 上采样
+ANE 推理延迟 22.5 ms（640×360 → 1280×720）
+视频吞吐量 44.4 FPS（M2 Max）
+许可证 代码 AGPL-3.0，权重 PiperSR Model License
+
+1.3 在本项目中的定位
+
+PiperSR 作为 720p → 1080p 场景的超分引擎，与 RIFE Lite 补帧管线串联使用。管线顺序为：解码 → PiperSR 超分 → RIFE Lite 补帧 → 编码。仅对低分辨率输入（≤ 720p）启用，1080p 及以上输入跳过超分。
+
+2. 模型获取
+
+2.1 模型变体
+
+Hugging Face 上提供以下变体：
+
+文件 用途 输入 → 输出
+PiperSR_2x.mlpackage 静态图像（128px 瓦片） 128×128 → 256×256
+PiperSR_2x_video_720p.mlpackage 视频（全帧，BN 融合） 640×360 → 1280×720
+PiperSR_2x_256.mlpackage 静态图像（256px 瓦片） 256×256 → 512×512
+
+本项目使用 PiperSR_2x_video_720p.mlpackage，该变体专为视频管线设计，支持全帧推理，避免瓦片拼接带来的调度开销和边界伪影。
+
+2.2 下载方式
+
+```bash
+# 通过 huggingface-cli 下载
+huggingface-cli download ModelPiper/PiperSR-2x \
+    PiperSR_2x_video_720p.mlpackage \
+    --local-dir ./Models
+```
+
+或将 .mlpackage 文件直接提交到仓库的 FrameInterpolation/Resources/ 目录。注意：.mlpackage 通过 Git LFS 管理，确保 CI 拉取时 LFS 文件正常获取。
+
+3. 工程集成
+
+3.1 文件放置
+
+```
+FrameInterpolation/
+├── Core/
+│   └── SuperResolution/
+│       ├── PiperSREngine.swift        # 新增：超分推理引擎
+│       └── SuperResolutionConfig.swift # 新增：超分配置
+├── Resources/
+│   └── PiperSR_2x_video_720p.mlpackage
+```
+
+3.2 核心类设计
+
+```swift
+import CoreML
+import CoreVideo
+import Metal
+
+final class PiperSREngine {
+    private let model: MLModel
+    private let device: MTLDevice
+    private let commandQueue: MTLCommandQueue
+
+    // PiperSR 固定输入尺寸
+    static let inputWidth  = 640
+    static let inputHeight = 360
+    static let outputWidth  = 1280
+    static let outputHeight = 720
+
+    init?() {
+        guard let modelURL = Bundle.main.url(
+            forResource: "PiperSR_2x_video_720p",
+            withExtension: "mlmodelc"
+        ) else { return nil }
+
+        let config = MLModelConfiguration()
+        config.computeUnits = .all  // 优先 ANE
+
+        guard let model = try? MLModel(contentsOf: modelURL, configuration: config),
+              let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else { return nil }
+
+        self.model = model
+        self.device = device
+        self.commandQueue = queue
+    }
+
+    /// 对单帧执行 2x 超分
+    /// - Parameter pixelBuffer: 640×360 BGRA CVPixelBuffer
+    /// - Returns: 1280×720 BGRA CVPixelBuffer，失败返回 nil
+    func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        // 1. CVPixelBuffer → MLMultiArray (NCHW FP16)
+        guard let inputArray = makeInputArray(from: pixelBuffer) else { return nil }
+
+        // 2. Core ML 推理
+        guard let prediction = try? model.prediction(from: [
+            "input": inputArray
+        ]) else { return nil }
+
+        // 3. 获取输出并转换为 CVPixelBuffer
+        guard let outputArray = prediction.featureValue(for: "output")?.multiArrayValue else {
+            return nil
+        }
+
+        return makePixelBuffer(from: outputArray)
+    }
+
+    // MARK: - Private
+    private func makeInputArray(from pixelBuffer: CVPixelBuffer) -> MLMultiArray? {
+        // BGRA → NCHW FP16，归一化到 [0,1]
+        // 使用 Metal Compute Shader 加速格式转换
+        // 具体实现参考 FrameInterpolator 的预处理逻辑
+        // ...
+        return nil // 占位
+    }
+
+    private func makePixelBuffer(from array: MLMultiArray) -> CVPixelBuffer? {
+        // NCHW FP16 → BGRA CVPixelBuffer
+        // 使用 CVPixelBufferPool 复用缓冲区
+        // ...
+        return nil // 占位
+    }
+}
+```
+
+3.3 配置类
+
+```swift
+import Foundation
+
+enum SuperResolutionMode: String, CaseIterable, Identifiable {
+    case disabled = "关闭"
+    case auto = "自动（推荐）"
+    case force = "强制开启"
+
+    var id: String { rawValue }
+}
+
+struct SuperResolutionConfig {
+    /// 根据输入分辨率决定是否启用超分
+    static func shouldEnable(
+        inputWidth: Int,
+        mode: SuperResolutionMode
+    ) -> Bool {
+        switch mode {
+        case .disabled:
+            return false
+        case .force:
+            return true
+        case .auto:
+            // 仅对 ≤ 720p 输入启用
+            return inputWidth <= 1280
+        }
+    }
+
+    /// 判断输入是否需要缩放到模型固定尺寸
+    static func needsResize(inputWidth: Int, inputHeight: Int) -> Bool {
+        return inputWidth != PiperSREngine.inputWidth ||
+               inputHeight != PiperSREngine.inputHeight
+    }
+}
+```
+
+4. 管线集成
+
+4.1 VideoPipeline 修改
+
+在 VideoPipeline 的推理阶段（inferenceStage 或 processSegment）中，在调用 RIFE Lite 插帧之前插入 PiperSR 超分步骤：
+
+```swift
+// 在推理阶段，每帧解码后、插帧前
+if let srEngine = superResolutionEngine,
+   SuperResolutionConfig.shouldEnable(inputWidth: originalWidth, mode: srMode) {
+
+    // 缩放到 640×360（如需要）
+    let resized = resizeBuffer(pixelBuffer, to: CGSize(
+        width: PiperSREngine.inputWidth,
+        height: PiperSREngine.inputHeight
+    ))
+
+    // 执行超分
+    if let upscaled = srEngine.upscale(resized) {
+        // 用超分后的帧替换原始帧，继续进入 RIFE 插帧
+        processedBuffer = upscaled
+    }
+}
+```
+
+4.2 管线顺序
+
+```
+AVAssetReader 解码
+      ↓
+  [可选] PiperSR 2x 超分
+      ↓
+  RIFE Lite 插帧
+      ↓
+  AVAssetWriter 编码
+```
+
+注意：PiperSR 的 2x 放大发生在 RIFE 之前，因此 RIFE 的输入尺寸从原始分辨率变为超分后的分辨率（如 640×360 → 1280×720）。需要相应调整 FrameInterpolator 的 inputWidth / inputHeight。
+
+4.3 内存与性能考量
+
+指标 数值
+单帧超分推理 ~22.5 ms（ANE）
+单帧超分 + 插帧 ~50–70 ms
+额外内存 输入 640×360 BGRA ≈ 0.88 MB，输出 1280×720 BGRA ≈ 3.5 MB
+
+超分使每帧的处理时间增加约 50%，但在 A16 及以上设备上仍可保持近实时处理。
+
+5. 模型转换（可选）
+
+如果官方提供的 .mlpackage 无法直接使用（如输入尺寸不匹配），可通过 GitHub Actions 重新转换：
+
+```python
+import coremltools as ct
+import torch
+
+# 加载 PiperSR PyTorch 权重
+model = load_pipersr_weights("pipersr_2x.pth")
+model.eval()
+
+# 固定输入尺寸 640×360
+example_input = torch.randn(1, 3, 360, 640)
+
+# Trace
+traced = torch.jit.trace(model, example_input)
+
+# 转换为 Core ML
+mlmodel = ct.convert(
+    traced,
+    inputs=[ct.TensorType(name="input", shape=(1, 3, 360, 640))],
+    outputs=[ct.TensorType(name="output")],
+    minimum_deployment_target=ct.target.iOS16,
+    compute_precision=ct.precision.FLOAT16,
+    convert_to="mlprogram"
+)
+
+mlmodel.save("PiperSR_2x_video_720p.mlpackage")
+```
+
+关键约束：所有操作必须 ANE 原生执行。转换后使用 MLModel 的 computeUnits = .all，并通过 os_signpost 验证推理是否在 ANE 上完成。
+
+6. 性能调优
+
+6.1 ANE 利用率验证
+
+```swift
+let signposter = OSSignposter(subsystem: "com.yourapp.frameinterpolation", category: "sr")
+let state = signposter.beginInterval("PiperSR-Inference")
+let output = srEngine.upscale(pixelBuffer)
+signposter.endInterval("PiperSR-Inference", state)
+```
+
+在 Instruments 中使用 os_signpost 模板，确认 PiperSR-Inference 区间出现在 ANE 轨道上，而非 GPU 或 CPU 轨道。
+
+6.2 设备降级策略
+
+设备芯片 超分策略
+A16 及以上 启用 PiperSR，1080p 输出
+A14 / A15 启用 PiperSR，720p 输出
+A13 及以下 关闭 PiperSR，直接补帧
+
+通过 DeviceCapability.tier 判断，在 UI 中自动禁用超分选项。
+
+6.3 热状态降级
+
+在 ThermalMonitor 中增加超分降级逻辑：
+
+```swift
+var effectiveSRMode: SuperResolutionMode {
+    if ThermalMonitor.shared.shouldDegrade {
+        return .disabled  // 过热时关闭超分
+    }
+    return userSRMode
+}
+```
+
+7. 验证清单
+
+测试项 方法 预期
+模型加载 启动 App，观察 Console 日志 无崩溃，模型成功加载
+超分效果 720p 输入 → 输出对比 画面细节明显提升，无伪影
+ANE 验证 Instruments os_signpost 推理区间在 ANE 轨道
+内存峰值 Instruments Allocations 额外内存 < 50 MB
+热降级 连续处理至 thermal serious 超分自动关闭，处理继续
+低端设备 A13 设备测试 超分选项被禁用，补帧正常
+
+8. 附录
+
+8.1 参考链接
+
+· PiperSR 官方博客：https://modelpiper.com/blog/pipersr-open-source-ane-super-resolution
+· Hugging Face 模型：https://huggingface.co/ModelPiper/PiperSR-2x
+· GitHub 仓库：https://github.com/ModelPiper/PiperSR
+
+8.2 许可证提醒
+
+PiperSR 代码采用 AGPL-3.0，模型权重采用 PiperSR Model License。个人侧载使用无需额外授权，但如需商用或公开分发，需联系 ModelPiper 获取商业许可。本项目为个人侧载用途，符合许可范围。
+
+8.3 与 Real-ESRGAN 的对比
+
+维度 PiperSR Real-ESRGAN General-x4v3
+参数量 453K 1.21M
+CoreML 包体 928 KB 2.7 MB (FP16)
+放大倍数 2x 4x
+ANE 原生 ✅ 完全原生 ⚠️ 可能回退
+适用场景 720p → 1080p 极低清 → 4x
+
+对于本项目的 720p → 1080p 场景，PiperSR 的 2x 精准匹配和 ANE 原生架构使其成为更优选择。
