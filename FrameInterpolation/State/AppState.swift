@@ -40,6 +40,12 @@ final class AppState: ObservableObject {
     @Published var selectedMode: PipelineMode = .interpolation(.x2)
     /// 超分引擎类型（仅超分模式生效）
     @Published var superResolutionEngine: SuperResolutionEngineType = .piperSR
+    /// 是否显示性能监控 HUD（FPS/CPU/内存），默认开启
+    @Published var showPerformanceHUD: Bool = UserDefaults.standard.bool(forKey: "BzShowPerformanceHUD") {
+        didSet {
+            UserDefaults.standard.set(showPerformanceHUD, forKey: "BzShowPerformanceHUD")
+        }
+    }
 
     // MARK: - 处理中
     @Published var progress: Double = 0

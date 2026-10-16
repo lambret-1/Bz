@@ -39,6 +39,9 @@ struct SettingsView: View {
                     // 输出分辨率（两种模式共用）
                     resolutionSection
 
+                    // 性能监控开关
+                    performanceMonitorCard
+
                     // 预估信息
                     estimatedInfoCard
 
@@ -286,6 +289,25 @@ struct SettingsView: View {
                 }
                 Spacer()
                 Toggle("", isOn: $appState.fastMode)
+                    .labelsHidden()
+            }
+        }
+    }
+
+    // MARK: - 性能监控开关
+
+    private var performanceMonitorCard: some View {
+        CardView {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("性能监控")
+                        .font(.headline)
+                    Text("悬浮显示 FPS / CPU / 内存占用")
+                        .font(.caption)
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                }
+                Spacer()
+                Toggle("", isOn: $appState.showPerformanceHUD)
                     .labelsHidden()
             }
         }

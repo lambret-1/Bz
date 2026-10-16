@@ -2,12 +2,10 @@ import SwiftUI
 import UserNotifications
 
 /// 根视图，持有全局 AppState，承载首页导航栈
-/// Debug 模式下右上角悬浮性能监控 HUD（FPS / CPU / 内存）
+/// 右上角悬浮性能监控 HUD（FPS / CPU / 内存），可在设置中开关
 struct ContentView: View {
     @StateObject private var appState = AppState()
-    #if DEBUG
     @StateObject private var performanceMonitor = PerformanceMonitor()
-    #endif
 
     var body: some View {
         NavigationStack {
@@ -18,25 +16,21 @@ struct ContentView: View {
         .onAppear {
             // 请求通知权限（用于切后台提醒）
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
-            #if DEBUG
             performanceMonitor.start()
-            #endif
         }
         .onDisappear {
-            #if DEBUG
             performanceMonitor.stop()
-            #endif
         }
         // 监听应用进入后台
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             appState.applicationDidEnterBackground()
         }
-        // Debug 性能监控悬浮窗
-        #if DEBUG
+        // 性能监控悬浮窗（设置中可开关）
         .overlay(alignment: .topTrailing) {
-            PerformanceHUD(monitor: performanceMonitor)
-                .padding(.top, 4)
+            if appState.showPerformanceHUD {
+                PerformanceHUD(monitor: performanceMonitor)
+                    .padding(.top, 4)
+            }
         }
-        #endif
     }
 }
