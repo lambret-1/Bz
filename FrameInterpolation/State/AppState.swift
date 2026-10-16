@@ -36,6 +36,10 @@ final class AppState: ObservableObject {
     @Published var frameMultiplier: FrameMultiplier = .x2
     @Published var outputResolution: OutputResolution = .auto
     @Published var fastMode: Bool = false
+    /// 处理模式：补帧或超分（二者互斥）
+    @Published var selectedMode: PipelineMode = .interpolation(.x2)
+    /// 超分引擎类型（仅超分模式生效）
+    @Published var superResolutionEngine: SuperResolutionEngineType = .piperSR
 
     // MARK: - 处理中
     @Published var progress: Double = 0
@@ -154,14 +158,23 @@ final class AppState: ObservableObject {
 
     // MARK: - 开始处理
 
-    /// 启动视频处理管线（补帧 + 音频透传，模型缺失时自动降级为空转）
+    /// 启动视频处理管线（补帧或超分，二者互斥，模型缺失时自动降级）
     func startProcessing() {
         guard let video = selectedVideo else {
             showToast("未选择视频", style: .error)
             return
         }
 
-        logger.info("开始处理: \(video.fileName, privacy: .public), 倍数\(self.frameMultiplier.label)")
+        // 确保 selectedMode 与当前选择同步
+        let mode: PipelineMode
+        switch selectedMode {
+        case .interpolation:
+            mode = .interpolation(frameMultiplier)
+        case .superResolution:
+            mode = .superResolution(superResolutionEngine)
+        }
+
+        logger.info("开始处理: \(video.fileName, privacy: .public), 模式:\(mode.displayName)")
 
         isProcessing = true
         progress = 0
@@ -180,7 +193,7 @@ final class AppState: ObservableObject {
         pipeline.process(
             inputURL: video.url,
             outputURL: outputURL,
-            multiplier: frameMultiplier.rawValue,
+            mode: mode,
             fastMode: fastMode,
             outputResolution: outputResolution,
             progress: { [weak self] value, stage in
@@ -202,11 +215,25 @@ final class AppState: ObservableObject {
                     self.progress = 1.0
                     self.estimatedRemaining = 0
                     self.outputURL = url
-                    self.processingMode = self.pipeline.isUsingAIInterpolation
-                        ? "AI补帧（\(self.frameMultiplier.label)）"
-                        : "空转管线（帧率不变）"
-                    // 追加最近记录
-                    let outputFPS = (self.selectedVideo?.originalFPS ?? 30) * Double(self.frameMultiplier.rawValue)
+
+                    // 根据实际模式设置处理描述
+                    switch mode {
+                    case .interpolation:
+                        self.processingMode = self.pipeline.isUsingAIInterpolation
+                            ? "AI补帧（\(self.frameMultiplier.label)）"
+                            : "空转管线（帧率不变）"
+                    case .superResolution(let engineType):
+                        self.processingMode = "AI超分（\(engineType.displayName)）"
+                    }
+
+                    // 追加最近记录（超分模式帧率不变）
+                    let outputFPS: Double
+                    switch mode {
+                    case .interpolation:
+                        outputFPS = (self.selectedVideo?.originalFPS ?? 30) * Double(self.frameMultiplier.rawValue)
+                    case .superResolution:
+                        outputFPS = self.selectedVideo?.originalFPS ?? 30
+                    }
                     self.appendRecentRecord(outputURL: url, outputFPS: outputFPS)
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
@@ -350,6 +377,8 @@ final class AppState: ObservableObject {
         isProcessingMinimized = false
         showSettings = false
         selectedVideo = nil
+        selectedMode = .interpolation(.x2)
+        superResolutionEngine = .piperSR
         stage = .idle
         progress = 0
         processedFrames = 0

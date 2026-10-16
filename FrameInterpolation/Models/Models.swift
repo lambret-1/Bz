@@ -71,6 +71,7 @@ enum ProcessingStage: String {
     case idle = "准备中"
     case decoding = "正在解码视频…"
     case inferring = "AI 正在计算光流…"
+    case superResolving = "AI 正在超分增强…"
     case encoding = "正在编码输出…"
     case finished = "处理完成"
     case failed = "处理失败"

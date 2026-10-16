@@ -11,7 +11,7 @@ struct HomeView: View {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
                 // 顶部标题
                 HStack {
-                    Text("补帧")
+                    Text("视频增强")
                         .font(.largeTitle.bold())
                     Spacer()
                 }
@@ -23,10 +23,10 @@ struct HomeView: View {
                             .font(.system(size: 48))
                             .foregroundColor(DesignTokens.Colors.accent)
 
-                        Text("导入视频开始补帧")
+                        Text("导入视频开始增强")
                             .font(.headline)
 
-                        Text("支持 30fps → 60fps，完全本地处理")
+                        Text("支持 AI 补帧与超分辨率，完全本地处理")
                             .font(.subheadline)
                             .foregroundColor(DesignTokens.Colors.textSecondary)
                             .multilineTextAlignment(.center)
@@ -101,7 +101,7 @@ struct HomeView: View {
                             .progressViewStyle(.linear)
                             .frame(width: 80)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("补帧中 \(Int(appState.progress * 100))%")
+                            Text("处理中 \(Int(appState.progress * 100))%")
                                 .font(.caption.weight(.medium))
                             Text(appState.stage.rawValue)
                                 .font(.caption2)
