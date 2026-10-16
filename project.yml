@@ -33,6 +33,6 @@ targets:
         NSPhotoLibraryAddUsageDescription: 需要保存补帧后的视频到相册
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.lambret.bz
+        PRODUCT_BUNDLE_IDENTIFIER: com.lambret.test
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor

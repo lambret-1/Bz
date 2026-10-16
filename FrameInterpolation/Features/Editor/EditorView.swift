@@ -3,8 +3,12 @@ import SwiftUI
 /// 编辑器主容器：TopBar + PreviewArea + PlaybackControlBar + TimelineView + BottomToolbar
 struct EditorView: View {
     @EnvironmentObject var appState: AppState
+    @StateObject private var draftIndicator = DraftSaveIndicator()
     @State private var showCloseAlert = false
     @State private var showResult = false
+    @State private var showStorageAlert = false
+    @State private var requiredMB = 0
+    @State private var availableMB = 0
 
     var body: some View {
         ZStack {
@@ -15,6 +19,13 @@ struct EditorView: View {
                     onClose: { showCloseAlert = true },
                     onExport: { prepareExport() }
                 )
+                .overlay(alignment: .bottom) {
+                    if draftIndicator.showSaved {
+                        DraftSavedToast()
+                            .padding(.bottom, -20)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }
 
                 PreviewArea()
                 PlaybackControlBar()
@@ -48,12 +59,22 @@ struct EditorView: View {
         }
         .alert("放弃编辑？", isPresented: $showCloseAlert) {
             Button("取消", role: .cancel) {}
+            Button("保存草稿并退出") {
+                saveDraft()
+                closeEditor()
+            }
             Button("放弃", role: .destructive) {
                 closeEditor()
             }
         } message: {
             Text("当前编辑将不会保存，确定要退出吗？")
         }
+        .storageAlert(
+            isPresented: $showStorageAlert,
+            requiredMB: requiredMB,
+            availableMB: availableMB,
+            onCleanCache: { cleanCache() }
+        )
         .onChange(of: appState.outputURL) { newValue in
             if newValue != nil {
                 showResult = true
@@ -64,12 +85,48 @@ struct EditorView: View {
     // MARK: - 导出准备
     private func prepareExport() {
         guard appState.currentProject != nil else { return }
+
+        // 检查磁盘空间
+        let estimated = estimateOutputSizeMB()
+        let available = availableStorageMB()
+
+        if estimated > available {
+            requiredMB = estimated
+            availableMB = available
+            showStorageAlert = true
+            return
+        }
+
         appState.startProcessing()
+    }
+
+    // MARK: - 草稿保存
+    private func saveDraft() {
+        draftIndicator.triggerSave()
+        DraftStore.shared.saveDraft(appState: appState)
     }
 
     // MARK: - 关闭编辑器
     private func closeEditor() {
         PlayerManager.shared.release()
         appState.closeProjectDetail()
+    }
+
+    // MARK: - 存储空间
+    private func estimateOutputSizeMB() -> Int {
+        guard let video = appState.currentProject?.videoInfo else { return 0 }
+        return Int(video.duration * 2.0)
+    }
+
+    private func availableStorageMB() -> Int {
+        guard let path = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            return 0
+        }
+        let values = try? path.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        return Int((values?.volumeAvailableCapacityForImportantUsage ?? 0) / 1_048_576)
+    }
+
+    private func cleanCache() {
+        appState.clearCache()
     }
 }

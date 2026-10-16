@@ -31,12 +31,44 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-spm-
 
-      - name: 读取版本号
-        id: version
+      - name: 自动递增版本号
+        id: bump_version
         run: |
-          VERSION=$(grep 'CFBundleShortVersionString' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "版本号: $VERSION"
+          # 读取当前版本号
+          CURRENT=$(grep 'CFBundleShortVersionString' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "当前版本: $CURRENT"
+          
+          # 解析版本号 主.次.补丁
+          MAJOR=$(echo $CURRENT | cut -d. -f1)
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+          
+          # 补丁位+1，超过9则进位
+          PATCH=$((PATCH + 1))
+          if [ $PATCH -gt 9 ]; then
+            PATCH=0
+            MINOR=$((MINOR + 1))
+          fi
+          
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "新版本: $NEW_VERSION"
+          
+          # 更新 project.yml
+          sed -i "s/CFBundleShortVersionString: \"$CURRENT\"/CFBundleShortVersionString: \"$NEW_VERSION\"/" project.yml
+          
+          # 同步更新 Info.plist（如果存在）
+          if [ -f FrameInterpolation/Resources/Info.plist ]; then
+            sed -i "s/<string>$CURRENT<\/string>/<string>$NEW_VERSION<\/string>/" FrameInterpolation/Resources/Info.plist
+          fi
+          
+          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          
+          # 提交版本递增（[skip ci] 避免触发循环构建）
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add project.yml FrameInterpolation/Resources/Info.plist 2>/dev/null
+          git commit -m "chore: 版本自动递增 v$NEW_VERSION [skip ci]" || echo "无版本变更"
+          git push || echo "推送失败，继续构建"
 
       - name: 生成 Xcode 工程
         run: xcodegen generate
@@ -56,7 +88,7 @@ jobs:
       - name: 导出未签名 IPA
         run: |
           BRANCH=${GITHUB_REF_NAME}
-          VERSION=${{ steps.version.outputs.version }}
+          VERSION=${{ steps.bump_version.outputs.version }}
           IPA_NAME="AI补帧_${BRANCH}_v${VERSION}.ipa"
           mkdir -p build/Payload
           cp -r build/FrameInterpolation.xcarchive/Products/Applications/FrameInterpolation.app build/Payload/
@@ -68,6 +100,6 @@ jobs:
       - name: 上传 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: AI补帧_${{ github.ref_name }}_v${{ steps.version.outputs.version }}
+          name: AI补帧_${{ github.ref_name }}_v${{ steps.bump_version.outputs.version }}
           path: build/${{ steps.export.outputs.ipa_name }}
           retention-days: 30
