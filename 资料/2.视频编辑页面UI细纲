@@ -1,0 +1,527 @@
+iOS 视频增强工作台 · 视频编辑页面 UI 细纲
+
+页面定位：项目详情页（ProjectDetailView），用户导入视频后进入的核心编辑页面。
+设计目标：预览 → 剪辑 → 增强 → 导出，单页完成全部编辑操作，路径最短。
+导航方式：独立 fullScreenCover + NavigationStack，左上角返回按钮 + 边缘左滑手势返回。
+最低 iOS：16.0，SwiftUI + AVFoundation。
+
+═══════════════════════════════════════════════════════
+1. 页面整体结构
+═══════════════════════════════════════════════════════
+
+```
+NavigationStack（独立导航栈）
+├── 导航栏：返回按钮 + 项目名称（inline）
+└── ScrollView（可滚动内容区）
+    ├── 视频预览区（VideoPreviewContainer）
+    ├── 时间线卡片（CardView 包裹）
+    │   ├── 播放头进度条（含时间码）
+    │   ├── 片段卡片横向滚动列表
+    │   └── 编辑工具栏（分切/复制/删除/撤销）
+    ├── 增强任务区域
+    │   ├── 区域标题「视频增强」
+    │   ├── 互斥单选组：补帧 / 超分
+    │   │   ├── 补帧选中 → 倍数 SegmentedPicker + 快速模式 Toggle
+    │   │   └── 超分选中 → 模型 SegmentedPicker
+    │   ├── AI 模型状态提示（条件显示）
+    │   ├── 互斥提示文案
+    │   ├── 清晰度增强折叠区（降噪/锐化/对比度/色彩）
+    │   └── 音频修复 Toggle
+    ├── 导出设置入口（点击跳转 ExportSettingsView）
+    └── 底部安全区占位（避免内容被固定按钮遮挡）
+└── safeAreaInset(edge: .bottom) 固定按钮区
+    ├── 顶部分割线（1pt border）
+    └── [开始处理并导出] PrimaryButton（撑满，左右 16pt）
+```
+
+页面背景：bgPrimary。
+所有卡片使用 CardView（bgSecondary 背景，圆角 16pt，内边距 16pt）。
+卡片间距：spacingL（24pt）。
+内容区左右边距：spacingM（16pt）。
+
+═══════════════════════════════════════════════════════
+2. 导航栏
+═══════════════════════════════════════════════════════
+
+规格：
+· 标题：项目名称（project.name），inline 模式，超长截断
+· 左上角：返回按钮「‹ 返回」，accent 色，点击关闭页面并清理播放状态
+· 右上角：无按钮（编辑操作全部在页面内完成）
+· 背景：透明，跟随 ScrollView 滚动
+
+返回行为：
+· 点击返回 → isPlaying = false → appState.closeProjectDetail() → dismiss
+· 边缘左滑手势：NavigationStack 原生支持，与返回按钮等效
+· 返回不丢失编辑内容：项目已持久化，下次打开恢复
+
+═══════════════════════════════════════════════════════
+3. 视频预览区
+═══════════════════════════════════════════════════════
+
+3.1 布局
+
+```
+┌──────────────────────────────────────┐
+│                                      │
+│         AVPlayer 视图（16:9）         │
+│         背景强制纯黑                   │
+│                                      │
+│  ┌───┐                               │
+│  │ ▶ │  00:05 / 00:12               │  ← 底部半透明控制条（高44pt）
+│  └───┘                               │
+└──────────────────────────────────────┘
+```
+
+3.2 规格
+
+· 宽高比：16:9（aspectRatio(16/9, contentMode: .fit)）
+· 宽度：撑满内容区
+· 背景：videoBackground（纯黑，深浅色模式一致）
+· 圆角：radiusM（12pt）
+· 视频填充：AVLayerVideoGravity.resizeAspect（保持比例，不裁剪）
+
+3.3 播放控制条
+
+· 位置：底部叠加，高 44pt
+· 背景：线性渐变（顶部透明 → 底部 70% 黑）
+· 左侧：播放/暂停按钮（44×44，白色，SF Symbols play.fill / pause.fill）
+· 播放按钮右侧：当前时间码（monoCaption，白色）+ 「/」+ 总时长（monoCaption，80% 白）
+· 右侧：无内容（预留全屏按钮位，当前版本不实现）
+
+3.4 交互
+
+· 单击视频画面 → 切换播放/暂停（与播放按钮等效）
+· 双击 → 预留（当前版本不实现全屏）
+· 播放结束 → 自动暂停，seek 到 0，isPlaying = false
+· 页面 disappear → 自动暂停，防止后台播放
+
+3.5 实现要点
+
+· 使用 UIViewControllerRepresentable 封装 AVPlayerViewController
+· showsPlaybackControls = false（使用自定义控制条）
+· addPeriodicTimeObserver 每 0.1 秒回调当前时间
+· 时间更新同步到 @State currentTime，驱动播放头进度条
+· dismantleUIViewController 中 pause + player = nil，防止内存泄漏
+
+═══════════════════════════════════════════════════════
+4. 时间线区域
+═══════════════════════════════════════════════════════
+
+时间线区域用 CardView 包裹，内部包含三部分：播放头进度条、片段卡片列表、编辑工具栏。
+
+4.1 播放头进度条
+
+```
+┌──────────────────────────────────────────┐
+│ 00:05    ▬▬▬▬▬●─────────────    00:12   │
+│           ↑播放头（12pt圆点）             │
+└──────────────────────────────────────────┘
+```
+
+规格：
+· 高度：32pt
+· 左侧：当前时间码（monoCaption，accent 色），固定宽 50pt，左对齐
+· 右侧：总时长（monoCaption，textSecondary），固定宽 50pt，右对齐
+· 中间：进度条
+  · 背景轨道：bgTertiary，高 2pt，圆角 1pt
+  · 已播放进度：accent 色，高 2pt
+  · 播放头：accent 色圆点，直径 12pt，随进度移动
+· 总时长来源：project.videoInfo.duration（源视频总时长）
+
+交互：
+· 点击进度条任意位置 → seek 到该时间点，isPlaying = false
+· 拖动播放头 → 实时 seek，isPlaying = false，手指松开后保持暂停
+· 拖动时视频画面实时预览跟随
+
+4.2 片段卡片列表
+
+```
+┌──────────────────────────────────────────┐
+│ ┌────┐ ┌────┐ ┌────┐ ┌────┐            │
+│ │[1] │ │[2] │ │[3] │ │    │  横向滚动   │
+│ │3.5s│ │2.0s│ │6.5s│ │    │            │
+│ └────┘ └────┘ └────┘ └────┘            │
+│  ↑选中（accent 2pt边框+scale1.05）       │
+└──────────────────────────────────────────┘
+```
+
+规格：
+· 布局：ScrollView(.horizontal)，横向滚动，不显示滚动指示器
+· 卡片尺寸：宽 100pt，高 70pt（固定，不随屏幕缩放）
+· 卡片间距：spacingS（8pt）
+· 卡片内容：
+  · 背景：bgTertiary，圆角 radiusS（8pt）
+  · 缩略图：16:9 填充，clipped，取片段起始帧
+  · 左上角：序号标签（黑色半透明底，白色 caption2 粗体）
+  · 右下角：时长标签（黑色半透明底，白色 monoCaption）
+  · 无缩略图时：film SF Symbol，textSecondary 色
+· 选中态：2pt accent 边框 + scaleEffect(1.05) + easeOut 0.15s 动画
+· 未选中态：无边框，scale 1.0
+
+交互：
+· 点击卡片 → 选中该片段，selectedSegmentID 更新
+· 再次点击已选中卡片 → 取消选中（selectedSegmentID = nil）
+· 长按卡片 → 预留拖动排序（当前版本通过编辑工具栏操作）
+
+片段数据模型：
+```
+VideoSegment {
+    id: UUID
+    startTime: TimeInterval   // 源视频起点
+    duration: TimeInterval    // 持续时长
+    thumbnailData: Data?      // 起始帧缩略图
+}
+```
+
+4.3 编辑工具栏
+
+```
+┌──────────────────────────────────────────┐
+│  [✂️分切] [📋复制] [🗑️删除] [↩️撤销]  │
+└──────────────────────────────────────────┘
+```
+
+规格：
+· 高度：56pt
+· 背景：bgSecondary（与卡片同色，无额外背景）
+· 圆角：radiusM（12pt）
+· 每个按钮：宽 80pt，图标 + 文字垂直排列，图标 18pt，文字 12pt medium
+· 禁用态：textSecondary 色，opacity 0.4
+· 按钮间距：0（等分填充）
+
+按钮禁用逻辑：
+· 分切：播放头必须位于某个片段内部，且距离片段两端 > 0.05s
+· 复制：必须先选中一个片段（selectedSegmentID != nil）
+· 删除：必须选中片段，且 segments.count > 1（至少保留 1 个）
+· 撤销：undoStack 非空（有可撤销的编辑操作）
+
+操作行为：
+· 分切：在 currentTime 位置将当前片段切为两段，生成新缩略图，pushUndo，触觉反馈，Toast「已分切」
+· 复制：在选中片段后方插入副本（新 UUID），pushUndo，触觉反馈，Toast「已复制片段」
+· 删除：删除选中片段，pushUndo，触觉反馈，Toast「已删除，可撤销」，selectedSegmentID = nil
+· 撤销：弹出 undoStack 栈顶，恢复 segments，Toast「已撤销」
+
+撤销栈：
+· 每次分切/复制/删除/排序前，将当前 segments 快照压入 undoStack
+· 最多保留 20 步，超出移除最旧记录
+· 关闭页面时清空 undoStack
+
+═══════════════════════════════════════════════════════
+5. 增强任务区域
+═══════════════════════════════════════════════════════
+
+5.1 区域标题
+
+· 文字：「视频增强」，headline 字体，textPrimary
+· 无右侧操作
+
+5.2 互斥单选组（补帧 / 超分）
+
+```
+┌──────────────────────────────────────┐
+│ ○ 补帧                               │
+│   ┌────┬────┐                       │
+│   │ 2x │ 4x │  SegmentedPicker      │
+│   └────┴────┘                       │
+│ ⚡ 快速模式              [Toggle]    │
+│ 静态画面自动帧混合，运动画面AI插值    │
+└──────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│ ● 超分                               │
+│   ┌──────────┬──────────┐           │
+│   │ PiperSR  │Real-ESRGAN│          │
+│   └──────────┴──────────┘           │
+└──────────────────────────────────────┘
+⚠️ 补帧与超分无法同时使用，切换将取消当前选择
+```
+
+单选卡片规格：
+· 高度：自适应（选中时约 100pt，未选中约 60pt）
+· 圆角：radiusM（12pt）
+· 未选中：bgTertiary 背景，无边框
+· 选中：accent 10% 背景 + 2pt accent 边框
+· 左侧：单选圆圈（circle / largecircle.fill.circle，22pt）
+· 标题：图标 + 文字（headline），图标 15pt
+· 子选项：选中时显示，未选中时隐藏（带动画）
+
+补帧子选项：
+· 倍数 SegmentedPicker：FrameMultiplier.allCases（2x / 4x），宽 120pt
+· 快速模式 Toggle：
+  · 标题：⚡ 快速模式
+  · 副文案：静态画面自动帧混合，运动画面AI插值（caption，textSecondary）
+  · 开启后 fastMode = true，传入 VideoPipeline
+  · 任务标签增加「快速」标记
+
+超分子选项：
+· 模型 SegmentedPicker：SuperResolutionModel.allCases（PiperSR / Real-ESRGAN），宽 200pt
+· 当前版本超分模型尚未接入管线，选择后 UI 状态保存但处理时按原分辨率导出
+
+互斥逻辑：
+· 选择补帧 → 自动取消超分（mode = .frameInterpolation）
+· 选择超分 → 自动取消补帧（mode = .superResolution）
+· 再次点击已选中项 → 取消选择（mode = .none）
+· 切换时触觉反馈 UIImpactFeedbackGenerator(.light)
+
+互斥提示：
+· 当 mode != .none 时显示灰色提示文案
+· 文案：「补帧与超分无法同时使用，切换将取消当前选择」
+· 图标：info.circle，caption，textSecondary
+
+5.3 AI 模型状态提示
+
+· 当 appState.isUsingAI == false（RIFE Lite 模型未加载）时显示
+· 位置：互斥组下方，灰色提示
+· 文案：「AI 模型未就绪，将以透传模式导出，帧率不变」
+· 图标：exclamationmark.triangle，warning 色
+· 模型加载成功时不显示
+
+5.4 清晰度增强折叠区
+
+```
+┌──────────────────────────────────────┐
+│  清晰度增强              [展开 ▼]    │  ← 高44pt，点击展开/收起
+├──────────────────────────────────────┤
+│  降噪           [Toggle]             │
+│  ▬▬▬▬▬●▬▬▬▬▬ 0.5                   │
+│                                      │
+│  锐化           [Toggle]             │
+│  ▬▬▬▬▬▬▬●▬▬▬ 0.4                   │
+│                                      │
+│  对比度         [Toggle]             │
+│  ▬▬▬▬▬●▬▬▬▬▬ 1.1                   │
+│                                      │
+│  色彩           [Toggle]             │
+│  ▬▬▬▬▬●▬▬▬▬▬ 1.05                  │
+└──────────────────────────────────────┘
+```
+
+规格：
+· 外层：CardView 包裹
+· 标题行：CollapsibleSectionHeader，高 44pt，chevron 旋转动画
+· 展开动画：easeInOut(duration: 0.3)
+· 每项结构：
+  · 第一行：图标（20pt，textSecondary）+ 标签（subheadline）+ Toggle（右侧）
+  · 第二行：Slider（accent 色）+ 数值（monoCaption，右对齐，宽 45pt）
+· Toggle 关闭时 Slider 禁用（opacity 0.4）
+
+参数范围：
+· 降噪：0.0 – 1.0，默认 0.5
+· 锐化：0.0 – 1.0，默认 0.4
+· 对比度：0.8 – 1.5，默认 1.1
+· 色彩：0.5 – 1.5，默认 1.05
+
+当前状态：清晰度增强 Metal Shader 尚未接入管线，UI 状态保存但处理时不生效。
+
+5.5 音频修复
+
+```
+┌──────────────────────────────────────┐
+│ 🔊 音频修复              [Toggle]    │
+│ 保持原始音频，修复容器兼容问题        │
+└──────────────────────────────────────┘
+```
+
+规格：
+· CardView 包裹
+· 左侧：图标（speaker.wave.2，accent 色）+ 标题（headline）+ 副文案（caption，textSecondary）
+· 右侧：Toggle
+· 当前版本：Toggle 状态保存，管线始终执行原音轨透传合成（AVAssetExportSession Passthrough）
+
+═══════════════════════════════════════════════════════
+6. 导出设置入口
+═══════════════════════════════════════════════════════
+
+```
+┌──────────────────────────────────────┐
+│ ⚙️ 导出设置                     >    │
+│ 编码 H.264 · 1080p · 码率自动        │  ← caption 摘要
+└──────────────────────────────────────┘
+```
+
+规格：
+· CardView 包裹（无内边距差异，直接使用）
+· 左侧：gearshape 图标（textSecondary）+ 标题「导出设置」（headline）+ 摘要（caption，textSecondary）
+· 右侧：chevron.right（textSecondary）
+· 摘要内容：编码 · 分辨率 · 码率模式（从 project.exportSettings 读取）
+· 点击 → appState.showExportSettings = true → fullScreenCover 展示 ExportSettingsView
+
+═══════════════════════════════════════════════════════
+7. 底部固定按钮
+═══════════════════════════════════════════════════════
+
+```
+┌──────────────────────────────────────┐
+│ ─────────────────────────────────── │  ← 1pt border 分割线
+│                                      │
+│    [  开始处理并导出  ]               │  ← PrimaryButton，高52，撑满
+│                                      │
+└──────────────────────────────────────┘
+```
+
+规格：
+· 使用 safeAreaInset(edge: .bottom) 固定在底部
+· 背景：bgPrimary
+· 顶部分割线：1pt，border 色
+· 按钮：PrimaryButton，撑满宽度，左右边距 16pt
+· 按钮文字：「开始处理并导出」
+· 加载态：isLoading = appState.isProcessing，显示 ProgressView
+· 禁用条件：segments.isEmpty（正常不会发生）
+
+点击行为：
+· isPlaying = false（停止预览）
+· appState.startProcessing() → 构建任务清单 → 启动 VideoPipeline
+· isProcessing = true → fullScreenCover 展示 ProcessingView
+
+═══════════════════════════════════════════════════════
+8. 状态管理与数据流
+═══════════════════════════════════════════════════════
+
+8.1 页面本地状态
+
+```
+@State currentTime: TimeInterval = 0     // 播放头时间
+@State isPlaying: Bool = false            // 播放状态
+@State selectedSegmentID: UUID? = nil     // 选中片段
+```
+
+8.2 全局状态（AppState）
+
+```
+@Published currentProject: Project?       // 当前编辑项目
+@Published showExportSettings: Bool       // 导出设置页开关
+@Published isProcessing: Bool             // 处理中页开关
+@Published toastMessage / toastStyle      // Toast
+```
+
+8.3 项目数据结构
+
+```
+Project {
+    id: UUID
+    name: String
+    videoInfo: VideoInfo           // 源视频元数据（只读）
+    segments: [VideoSegment]       // 时间线片段（至少1个）
+    enhancement: EnhancementConfig // 增强配置
+    exportSettings: ExportSettings // 导出设置
+    status: ProjectStatus          // 草稿/处理中/完成/失败
+    outputURL: URL?               // 处理完成后输出文件
+    createdAt / updatedAt: Date
+}
+
+EnhancementConfig {
+    mode: EnhancementMode          // .none / .frameInterpolation / .superResolution
+    frameMultiplier: FrameMultiplier  // .x2 / .x4
+    srModel: SuperResolutionModel    // .piperSR / .esrgan
+    clarity: ClarityConfig         // 降噪/锐化/对比度/色彩
+    audio: AudioConfig             // 音频修复开关
+}
+```
+
+8.4 编辑操作流
+
+所有片段编辑操作通过 AppState 方法执行，确保 undoStack 和持久化同步：
+
+```
+splitSegment(at:)     → pushUndo → 更新 segments → saveProjects
+duplicateSegment(_:)  → pushUndo → 更新 segments → saveProjects
+deleteSegment(_:)     → pushUndo → 更新 segments → saveProjects
+undoSegmentEdit()     → popUndo → 恢复 segments → saveProjects
+```
+
+8.5 增强配置流
+
+```
+setEnhancementMode(_:)     → 更新 enhancement.mode → saveProjects
+setFrameMultiplier(_:)     → 更新 enhancement.frameMultiplier
+setSuperResolutionModel(_:) → 更新 enhancement.srModel
+updateClarity(_:)          → 更新 enhancement.clarity
+toggleAudioRepair(_:)      → 更新 enhancement.audio.repairEnabled
+updateExportSettings(_:)   → 更新 exportSettings
+```
+
+═══════════════════════════════════════════════════════
+9. 已有功能接入状态
+═══════════════════════════════════════════════════════
+
+功能 UI状态 管线状态 备注
+视频预览 ✅ 已实现 ✅ AVPlayer 自定义控制条
+播放头拖拽 ✅ 已实现 ✅ seek 实时预览
+片段分切 ✅ 已实现 ⚠️ 仅数据模型，管线未按片段合成
+片段复制 ✅ 已实现 ⚠️ 同上
+片段删除 ✅ 已实现 ⚠️ 同上
+撤销栈 ✅ 已实现 ✅ 20步内存撤销
+补帧选择 ✅ 已实现 ✅ RIFE Lite 2x/4x
+快速模式 ✅ 已实现 ✅ fastMode 传入管线
+超分选择 ✅ 已实现 ❌ 模型未接入，UI占位
+清晰度增强 ✅ 已实现 ❌ Metal Shader 未接入
+音频修复 ✅ 已实现 ✅ 始终透传，Toggle占位
+输出分辨率 ✅ 已实现 ✅ vImage缩放 720p/1080p
+HEVC编码 ❌ 占位 ❌ 管线硬编码H.264
+AAC重编码 ❌ 占位 ❌ 仅透传
+码率模式 ✅ 已实现 ⚠️ 预计输出应用系数，管线按分辨率分档
+处理中最小化 ✅ 已实现 ✅ 回首页横幅恢复
+后台通知 ✅ 已实现 ✅ UIBackgroundTask + 本地通知
+速度自适应 ✅ 已实现 ✅ measuredSpeedFactor滑动平均
+
+═══════════════════════════════════════════════════════
+10. 异常与边界
+═══════════════════════════════════════════════════════
+
+· 项目丢失（currentProject == nil）：显示 EmptyStateView「项目不存在，请返回首页重新选择」
+· 视频播放失败：AVPlayer 播放失败时静默暂停，不崩溃
+· 缩略图生成失败：显示 film 占位图标，不影响编辑
+· 分切位置过近（< 0.05s）：分切按钮禁用，不执行
+· 删除最后一个片段：删除按钮禁用，Toast「至少保留 1 个片段」
+· 撤销栈为空：撤销按钮禁用
+· 处理中返回：返回按钮仍可点击，处理在后台继续（isProcessing 状态保留）
+· 内存警告：不自动降低参数，仅依赖系统 didReceiveMemoryWarning
+
+═══════════════════════════════════════════════════════
+11. 无障碍与适配
+═══════════════════════════════════════════════════════
+
+VoiceOver：
+· 返回按钮：accessibilityLabel("返回首页")
+· 播放按钮：accessibilityLabel(isPlaying ? "暂停" : "播放")
+· 进度条：accessibilityValue("当前时间 \(TimeFormatter.format(currentTime))")
+· 片段卡片：accessibilityLabel("片段\(index+1)，时长\(duration)，\(isSelected ? "已选中" : "未选中")")
+· 编辑按钮：每个按钮独立 accessibilityLabel
+· 增强单选卡片：accessibilityLabel("\(title)\(isSelected ? "，已选中" : "")") + accessibilityAddTraits(.isSelected)
+· Slider：系统原生支持
+
+动态字体：
+· 使用语义化字体（DesignTokens.Fonts）
+· 大字体下工具栏按钮文字可能截断，保持图标可见
+· 按钮最小高度 44pt，不随字体缩小
+
+深色/浅色：
+· 全部颜色使用 DesignTokens 动态颜色
+· 视频预览区强制纯黑
+· CardView 浅色模式带极浅阴影，深色模式无阴影
+
+屏幕尺寸：
+· 视频预览 16:9 自适应宽度
+· 片段卡片固定 100×70，不随屏幕缩放
+· 横向滚动确保小屏可浏览全部片段
+
+═══════════════════════════════════════════════════════
+12. 验收清单
+═══════════════════════════════════════════════════════
+
+□ 视频预览播放/暂停正常，时间码与播放头同步
+□ 拖动播放头实时 seek，画面跟随
+□ 片段卡片横向滚动，点击选中高亮
+□ 分切在播放头位置生成两段，缩略图正确
+□ 复制在选中片段后插入副本
+□ 删除移除选中片段，最后一个片段不可删
+□ 撤销恢复上一次编辑，连续撤销到初始状态
+□ 补帧/超分互斥，切换自动取消对方
+□ 补帧选中显示倍数和快速模式，超分选中显示模型选择
+□ 快速模式 Toggle 开关状态持久化
+□ 清晰度折叠区展开/收起动画流畅，Slider数值实时显示
+□ 导出设置入口摘要正确反映当前设置
+□ 底部按钮点击进入处理中页，返回不丢失编辑
+□ 项目关闭后重新打开，所有编辑状态恢复
+□ 深色/浅色模式切换无颜色错乱
+□ VoiceOver 可完整走通编辑流程
+□ 按钮最小点击区域 ≥ 44pt
