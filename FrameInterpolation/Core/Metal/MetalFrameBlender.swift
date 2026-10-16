@@ -5,9 +5,9 @@ import OSLog
 /// Metal 帧混合器：使用 GPU 做简单 alpha 混合，用于快速模式
 /// IOSurface 零拷贝 + PixelBufferPool 复用 + GPU 状态检查，避免黑帧
 final class MetalFrameBlender {
-    static let shared = MetalFrameBlender()
+    static let shared: MetalFrameBlender? = MetalFrameBlender()
 
-    private let helper = MetalComputeHelper.shared
+    private let helper: MetalComputeHelper
     private let pipeline: MTLComputePipelineState
     private let logger = Logger(subsystem: "com.lambret.bz", category: "MetalFrameBlender")
 
@@ -17,11 +17,13 @@ final class MetalFrameBlender {
     private var configuredHeight = 0
 
     private init?() {
-        guard let library = helper.device.makeDefaultLibrary(),
+        guard let metalHelper = MetalComputeHelper.shared,
+              let library = metalHelper.device.makeDefaultLibrary(),
               let function = library.makeFunction(name: "simple_blend"),
-              let pipeline = try? helper.device.makeComputePipelineState(function: function) else {
+              let pipeline = try? metalHelper.device.makeComputePipelineState(function: function) else {
             return nil
         }
+        self.helper = metalHelper
         self.pipeline = pipeline
     }
 

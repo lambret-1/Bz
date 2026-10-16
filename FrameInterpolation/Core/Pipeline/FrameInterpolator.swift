@@ -11,7 +11,7 @@ final class FrameInterpolator {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "FrameInterpolator")
 
     // MARK: - Metal 资源
-    private let helper = MetalComputeHelper.shared
+    private let helper: MetalComputeHelper
     private let commandQueue: MTLCommandQueue
     private let preprocessPipeline: MTLComputePipelineState
     private let sigmoidPipeline: MTLComputePipelineState
@@ -58,6 +58,13 @@ final class FrameInterpolator {
 
     // MARK: - 初始化
     init?() {
+        // 0. 检查 Metal 可用性
+        guard let metalHelper = MetalComputeHelper.shared else {
+            logger.error("Metal 初始化失败，无法创建帧插值器")
+            return nil
+        }
+        self.helper = metalHelper
+
         // 1. 加载 Core ML 模型
         guard let modelURL = Bundle.main.url(forResource: "RIFE_Lite", withExtension: "mlmodelc"),
               let model = try? MLModel(contentsOf: modelURL, configuration: {
