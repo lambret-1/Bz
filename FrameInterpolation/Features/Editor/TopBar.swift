@@ -11,7 +11,7 @@ struct TopBar: View {
     private var taskLabel: String {
         guard let project = appState.currentProject else { return "未导入" }
 
-        let resolution = "\(project.videoInfo.width)P"
+        let resolution = "\(project.videoInfo.height)P"
 
         switch project.enhancement.mode {
         case .frameInterpolation:

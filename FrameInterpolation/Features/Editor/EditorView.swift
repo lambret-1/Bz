@@ -19,19 +19,22 @@ struct EditorView: View {
                     onClose: { showCloseAlert = true },
                     onExport: { prepareExport() }
                 )
-                .overlay(alignment: .bottom) {
-                    if draftIndicator.showSaved {
-                        DraftSavedToast()
-                            .padding(.bottom, -20)
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
-                }
 
                 PreviewArea()
                 PlaybackControlBar()
                 TimelineView()
-                    .frame(maxHeight: .infinity)
                 BottomToolbar()
+            }
+
+            // 草稿保存 Toast（顶层居中显示）
+            if draftIndicator.showSaved {
+                VStack {
+                    Spacer().frame(height: 70)
+                    DraftSavedToast()
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    Spacer()
+                }
+                .animation(.easeInOut(duration: 0.2), value: draftIndicator.showSaved)
             }
 
             // 导出处理 HUD

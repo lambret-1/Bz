@@ -3,10 +3,10 @@ import AVFoundation
 
 /// 缩放级别
 enum ZoomLevel: CGFloat, CaseIterable {
-    case l0 = 0.5    // 宏观
-    case l1 = 2.0    // 中观
-    case l2 = 10.0   // 微观
-    case l3 = 20.0   // 逐帧
+    case l0 = 2.0    // 宏观（每帧2pt）
+    case l1 = 8.0    // 中观（每帧8pt，缩略图可辨认）
+    case l2 = 20.0   // 微观（每帧20pt）
+    case l3 = 40.0   // 逐帧（每帧40pt）
 }
 
 /// 时间线视图：刻度尺 + 片段卡片 + 播放头 + 缩放 + 逐帧 + 音频轨 + 转场
@@ -213,7 +213,7 @@ struct TimelineView: View {
 
             // 添加音频按钮
             Button {
-                // 音频选择器（后续实现）
+                appState.showToast("音频轨道功能即将上线", style: .warning)
             } label: {
                 HStack {
                     Image(systemName: "plus")
