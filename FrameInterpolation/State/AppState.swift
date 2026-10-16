@@ -123,18 +123,58 @@ final class AppState: ObservableObject {
     }
 
     /// 追加最近记录（处理成功后调用）
-    private func appendRecentRecord(outputURL: URL, outputFPS: Double) {
+    private func appendRecentRecord(
+        outputURL: URL,
+        outputFPS: Double,
+        processingMode: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        duration: TimeInterval
+    ) {
         let thumbnail = generateThumbnail(from: outputURL)
+        let fileSizeMB = (try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+            .map { Double($0) / (1024 * 1024) }
         let record = RecentRecord(
             fileName: outputURL.lastPathComponent,
             outputFPS: outputFPS,
-            thumbnailData: thumbnail
+            thumbnailData: thumbnail,
+            processingMode: processingMode,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight,
+            fileSizeMB: fileSizeMB,
+            duration: duration,
+            outputPath: outputURL.path
         )
         recentRecords.insert(record, at: 0)
         // 最多保留 20 条
         if recentRecords.count > 20 {
             recentRecords = Array(recentRecords.prefix(20))
         }
+        saveRecentRecords()
+    }
+
+    /// 重播最近记录（输出文件仍存在时直接展示结果页，否则提示重新导入）
+    func replayRecentRecord(_ record: RecentRecord) {
+        if let path = record.outputPath,
+           FileManager.default.fileExists(atPath: path) {
+            outputURL = URL(fileURLWithPath: path)
+            processingMode = record.processingMode ?? "已处理视频"
+            logger.info("重播最近记录: \(record.fileName, privacy: .public)")
+        } else {
+            showToast("原文件已被清理，请重新导入视频", style: .warning)
+            logger.info("最近记录文件已清理: \(record.fileName, privacy: .public)")
+        }
+    }
+
+    /// 删除指定最近记录
+    func deleteRecentRecord(_ record: RecentRecord) {
+        recentRecords.removeAll { $0.id == record.id }
+        saveRecentRecords()
+    }
+
+    /// 清空所有最近记录
+    func clearAllRecentRecords() {
+        recentRecords.removeAll()
         saveRecentRecords()
     }
 
@@ -251,7 +291,23 @@ final class AppState: ObservableObject {
                     case .superResolution:
                         outputFPS = self.selectedVideo?.originalFPS ?? 30
                     }
-                    self.appendRecentRecord(outputURL: url, outputFPS: outputFPS)
+
+                    // 读取输出视频元数据
+                    let outputAsset = AVURLAsset(url: url)
+                    let outputTrack = outputAsset.tracks(withMediaType: .video).first
+                    let outputSize = outputTrack?.naturalSize.applying(outputTrack?.preferredTransform ?? .identity) ?? .zero
+                    let outputWidth = Int(abs(outputSize.width))
+                    let outputHeight = Int(abs(outputSize.height))
+                    let outputDuration = CMTimeGetSeconds(outputAsset.duration)
+
+                    self.appendRecentRecord(
+                        outputURL: url,
+                        outputFPS: outputFPS,
+                        processingMode: self.processingMode,
+                        outputWidth: outputWidth,
+                        outputHeight: outputHeight,
+                        duration: outputDuration
+                    )
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
                     // 记录本机实测处理速度系数（视频时长/实际耗时）

@@ -43,6 +43,20 @@ struct HomeView: View {
                     Text("最近记录")
                         .font(.headline)
                     Spacer()
+                    if !appState.recentRecords.isEmpty {
+                        NavigationLink {
+                            RecentVideosView()
+                                .environmentObject(appState)
+                        } label: {
+                            HStack(spacing: 2) {
+                                Text("全部")
+                                    .font(.subheadline)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                            }
+                            .foregroundColor(DesignTokens.Colors.accent)
+                        }
+                    }
                 }
 
                 if appState.recentRecords.isEmpty {
@@ -55,8 +69,11 @@ struct HomeView: View {
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: DesignTokens.Spacing.m) {
-                            ForEach(appState.recentRecords) { record in
-                                RecentRecordCard(record: record)
+                            ForEach(appState.recentRecords.prefix(10)) { record in
+                                RecentRecordCard(record: record) {
+                                    // 点击卡片：如果输出文件仍存在则直接展示结果，否则提示重新导入
+                                    appState.replayRecentRecord(record)
+                                }
                             }
                         }
                     }
@@ -133,6 +150,7 @@ struct HomeView: View {
 // MARK: - 最近记录卡片
 struct RecentRecordCard: View {
     let record: RecentRecord
+    var onTap: (() -> Void)? = nil
 
     private var thumbnailImage: UIImage? {
         guard let data = record.thumbnailData else { return nil }
@@ -140,37 +158,100 @@ struct RecentRecordCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
-            ZStack {
-                RoundedRectangle(cornerRadius: DesignTokens.Radius.s)
-                    .fill(DesignTokens.Colors.bgTertiary)
-                    .frame(width: 160, height: 90)
+        Button(action: { onTap?() }) {
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
+                // 缩略图区域
+                ZStack(alignment: .bottomLeading) {
+                    RoundedRectangle(cornerRadius: DesignTokens.Radius.s)
+                        .fill(DesignTokens.Colors.bgTertiary)
+                        .frame(width: 180, height: 101)
 
-                if let image = thumbnailImage {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 160, height: 90)
-                        .clipped()
-                        .cornerRadius(DesignTokens.Radius.s)
-                } else {
-                    Image(systemName: "video.fill")
-                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                    if let image = thumbnailImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 180, height: 101)
+                            .clipped()
+                            .cornerRadius(DesignTokens.Radius.s)
+                    } else {
+                        Image(systemName: "video.fill")
+                            .font(.system(size: 32))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+
+                    // 时长标签
+                    if let duration = record.durationText {
+                        Text(duration)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.black.opacity(0.6))
+                            .cornerRadius(4)
+                            .padding(6)
+                    }
+
+                    // 处理模式标签（右上角）
+                    if let mode = record.processingMode {
+                        Text(mode)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(DesignTokens.Colors.accent.opacity(0.9))
+                            .cornerRadius(4)
+                            .padding(6)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    }
                 }
-            }
-            .frame(width: 160, height: 90)
+                .frame(width: 180, height: 101)
 
-            Text(record.fileName)
-                .font(.caption)
-                .lineLimit(1)
-            Text("\(Int(record.outputFPS))fps")
-                .font(.caption2)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(DesignTokens.Colors.accent)
-                .foregroundColor(.white)
-                .cornerRadius(4)
+                // 文件名
+                Text(record.fileName)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DesignTokens.Colors.textPrimary)
+                    .lineLimit(1)
+                    .frame(width: 180, alignment: .leading)
+
+                // 元信息行
+                HStack(spacing: 6) {
+                    if let resolution = record.resolutionText {
+                        Text(resolution)
+                            .font(.system(size: 10))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+                    Text("·")
+                        .font(.system(size: 10))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                    Text("\(Int(record.outputFPS))fps")
+                        .font(.system(size: 10))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                    if let size = record.fileSizeText {
+                        Text("·")
+                            .font(.system(size: 10))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                        Text(size)
+                            .font(.system(size: 10))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+                }
+                .frame(width: 180, alignment: .leading)
+
+                // 时间
+                Text(record.formattedDate)
+                    .font(.system(size: 10))
+                    .foregroundColor(DesignTokens.Colors.textSecondary.opacity(0.7))
+                    .frame(width: 180, alignment: .leading)
+            }
+            .frame(width: 180)
         }
-        .frame(width: 160)
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button(role: .destructive) {
+                // 删除操作由父视图处理
+            } label: {
+                Label("删除", systemImage: "trash")
+            }
+        }
     }
 }

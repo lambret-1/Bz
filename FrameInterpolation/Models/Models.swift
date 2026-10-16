@@ -38,13 +38,85 @@ struct RecentRecord: Identifiable, Equatable, Codable {
     let outputFPS: Double
     let createdAt: Date
     let thumbnailData: Data?
+    /// 处理模式描述（如 "AI补帧（2x）" 或 "AI超分（Fast-SRGAN 4x）"）
+    let processingMode: String?
+    /// 输出宽度（像素）
+    let outputWidth: Int?
+    /// 输出高度（像素）
+    let outputHeight: Int?
+    /// 输出文件大小（MB）
+    let fileSizeMB: Double?
+    /// 视频时长（秒）
+    let duration: TimeInterval?
+    /// 输出文件路径（沙盒临时目录，可能已被清理）
+    let outputPath: String?
 
-    init(id: UUID = UUID(), fileName: String, outputFPS: Double, createdAt: Date = Date(), thumbnailData: Data? = nil) {
+    init(
+        id: UUID = UUID(),
+        fileName: String,
+        outputFPS: Double,
+        createdAt: Date = Date(),
+        thumbnailData: Data? = nil,
+        processingMode: String? = nil,
+        outputWidth: Int? = nil,
+        outputHeight: Int? = nil,
+        fileSizeMB: Double? = nil,
+        duration: TimeInterval? = nil,
+        outputPath: String? = nil
+    ) {
         self.id = id
         self.fileName = fileName
         self.outputFPS = outputFPS
         self.createdAt = createdAt
         self.thumbnailData = thumbnailData
+        self.processingMode = processingMode
+        self.outputWidth = outputWidth
+        self.outputHeight = outputHeight
+        self.fileSizeMB = fileSizeMB
+        self.duration = duration
+        self.outputPath = outputPath
+    }
+
+    /// 格式化的创建时间（如 "今天 14:30"、"昨天 09:15"、"10月15日"）
+    var formattedDate: String {
+        let calendar = Calendar.current
+        let now = Date()
+        if calendar.isDateInToday(createdAt) {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm"
+            return "今天 \(formatter.string(from: createdAt))"
+        } else if calendar.isDateInYesterday(createdAt) {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm"
+            return "昨天 \(formatter.string(from: createdAt))"
+        } else {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "M月d日"
+            return formatter.string(from: createdAt)
+        }
+    }
+
+    /// 格式化的分辨率（如 "1920×1080"）
+    var resolutionText: String? {
+        guard let w = outputWidth, let h = outputHeight, w > 0, h > 0 else { return nil }
+        return "\(w)×\(h)"
+    }
+
+    /// 格式化的时长（如 "1:30"）
+    var durationText: String? {
+        guard let d = duration, d > 0 else { return nil }
+        let minutes = Int(d) / 60
+        let seconds = Int(d) % 60
+        return String(format: "%d:%02d", minutes, seconds)
+    }
+
+    /// 格式化的文件大小（如 "12.5 MB"）
+    var fileSizeText: String? {
+        guard let size = fileSizeMB, size > 0 else { return nil }
+        if size < 1 {
+            return String(format: "%.0f KB", size * 1024)
+        }
+        return String(format: "%.1f MB", size)
     }
 }
 
