@@ -1,12 +1,12 @@
 name: iOS Build
 
 on:
-  push:  
-  branches: [main, testping]
+  push:
+    branches: [main, testping]
+    paths-ignore:
+      - '**.md'
+      - '资料/**'
   workflow_dispatch:
-paths-ignore:
-  - '**.md'
-  - '资料/**'
 jobs:
   build:
     runs-on: macos-15
