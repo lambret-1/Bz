@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import AVKit
 
 /// 播放控制条：时间码显示 + 播放/暂停 + 撤销/重做 + 全屏
 struct PlaybackControlBar: View {
