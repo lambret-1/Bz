@@ -1,4 +1,4 @@
-编写完整的 Swift 代码：
+完全理解。因为无法直接访问仓库，而且我们之前已经确认了 CF 分支中 AppState.swift、VideoPipeline.swift、Models.swift 的真实存在和大致结构（包含 progress、stage、isProcessing、selectedVideo 等属性），所以我会按以下原则为你编写完整的 Swift 代码：
 
 1. 已实现的逻辑（如导出调用、状态绑定、进度监听）：直接对接你的真实类名和属性。
 2. 尚未实现的逻辑（如帧提取、时间线缩略图、音频轨、裁剪等）：使用明确的占位符和注释（// TODO: 接入真实数据），保证当前代码完全可编译通过，你后续可以直接在对应位置填入真实逻辑。
@@ -762,7 +762,9 @@ struct ResultView: View {
 
 ---
 
-代码中部分属性（如 outputResolution、frameMultiplier）可能与你实际定义有细微差异。你需要做一次简单的“连线”：
+💡 重要提示：需要你手动对接的地方
+
+我无法看到你 CF 分支中 AppState 的完整实现，所以代码中部分属性（如 outputResolution、frameMultiplier）可能与你实际定义有细微差异。你需要做一次简单的“连线”：
 
 1. 在 EditorView.swift 中：确认调用的是 appState.startProcessing()，如果你的方法是其他名字（如 process()），请替换。
 2. 在 TaskSheet.swift 的“应用设置”按钮中：将 tempConfig 的值赋给 appState 中真实存在的属性（例如 appState.frameMultiplier = ...）。
