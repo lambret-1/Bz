@@ -263,8 +263,8 @@ struct TimelineView: View {
         guard let player = PlayerManager.shared.player else { return }
         // 降低刷新频率到 20fps（0.05s），减少主线程压力
         let interval = CMTime(seconds: 0.05, preferredTimescale: 600)
-        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
-            guard let self = self, self.viewAlive else { return }
+        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+            guard self.viewAlive else { return }
             guard !self.isScrubbing else { return }  // 拖动时不覆盖帧号
             let seconds = CMTimeGetSeconds(time)
             let frame = Int(seconds * self.fps)
@@ -306,8 +306,8 @@ struct TimelineView: View {
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
 
-        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { [weak self] _, cgImage, _, _, _ in
-            guard let self = self, self.viewAlive else { return }  // 检查视图存活
+        generator.generateCGImagesAsynchronously(forTimes: [NSValue(time: time)]) { _, cgImage, _, _, _ in
+            guard self.viewAlive else { return }  // 检查视图存活
             if let cgImage {
                 let image = UIImage(cgImage: cgImage)
                 DispatchQueue.main.async {
