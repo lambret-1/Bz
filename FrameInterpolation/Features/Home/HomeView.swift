@@ -22,6 +22,7 @@ struct HomeView: View {
             ScrollView {
                 if appState.projects.isEmpty {
                     emptyState
+                        .frame(maxWidth: .infinity)
                         .padding(.top, DesignTokens.Spacing.xl * 2)
                 } else {
                     projectGrid

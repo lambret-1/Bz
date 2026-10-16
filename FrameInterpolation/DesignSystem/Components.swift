@@ -201,9 +201,9 @@ struct EmptyStateView: View {
                 .multilineTextAlignment(.center)
             if let actionTitle = actionTitle, let action = action {
                 PrimaryButton(title: actionTitle, action: action)
-                    .frame(maxWidth: 240)
             }
         }
+        .frame(maxWidth: .infinity)
         .padding(DesignTokens.Spacing.xl)
     }
 }
