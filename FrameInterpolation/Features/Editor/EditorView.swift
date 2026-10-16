@@ -12,7 +12,8 @@ struct EditorView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            // 整体背景用 TopBar 白色，确保状态栏区域与 TopBar 衔接
+            Color.topBarBg.ignoresSafeArea()
 
             VStack(spacing: 0) {
                 TopBar(

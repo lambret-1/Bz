@@ -106,6 +106,10 @@ struct TimelineView: View {
             viewAlive = false
             removePlayerObserver()
         }
+        // 监听项目变化（异步导入完成后刷新片段轨道）
+        .onChange(of: appState.currentProject?.id) { _ in
+            // 触发视图刷新，重新计算 segments
+        }
     }
 
     // MARK: - 刻度尺
@@ -127,14 +131,33 @@ struct TimelineView: View {
     // MARK: - 片段轨道
     private var segmentTrackView: some View {
         ZStack(alignment: .top) {
-            HStack(spacing: 0) {
-                ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
-                    segmentCard(segment, index: index)
+            if segments.isEmpty {
+                // 空状态占位
+                HStack {
+                    Spacer()
+                    VStack(spacing: 4) {
+                        Image(systemName: "film")
+                            .font(.system(size: 24))
+                            .foregroundColor(.gray)
+                        Text("等待视频导入…")
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                    }
+                    Spacer()
+                }
+                .frame(height: 100)
+            } else {
+                HStack(spacing: 0) {
+                    ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
+                        segmentCard(segment, index: index)
+                    }
                 }
             }
 
-            // 播放头固定居中（帧吸附），ZStack 顶部对齐
-            playheadView
+            // 播放头固定居中（帧吸附），ZStack 顶部对齐，白色
+            if !segments.isEmpty {
+                playheadView
+            }
         }
         .frame(height: 100)
     }
@@ -164,16 +187,16 @@ struct TimelineView: View {
         .onAppear { loadSegmentThumbnails(segment) }
     }
 
-    // MARK: - 播放头（帧吸附）
+    // MARK: - 播放头（帧吸附，白色）
     private var playheadView: some View {
         VStack(spacing: 0) {
             // 顶部三角
             Triangle()
-                .fill(Color.accentPink)
+                .fill(Color.white)
                 .frame(width: 12, height: 8)
             // 竖线（填充剩余高度）
             Rectangle()
-                .fill(Color.accentPink)
+                .fill(Color.white)
                 .frame(width: 2)
                 .frame(maxHeight: .infinity)
         }
@@ -231,8 +254,13 @@ struct TimelineView: View {
     private var bottomControls: some View {
         HStack(spacing: 12) {
             // 转场按钮
-            TransitionButton(transition: $transition, duration: $transitionDuration)
-                .padding(.leading, 16)
+            HStack(spacing: 6) {
+                TransitionButton(transition: $transition, duration: $transitionDuration)
+                Text("转场")
+                    .font(.system(size: 12))
+                    .foregroundColor(.gray)
+            }
+            .padding(.leading, 16)
 
             Spacer()
 
