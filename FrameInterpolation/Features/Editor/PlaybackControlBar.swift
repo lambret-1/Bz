@@ -58,13 +58,13 @@ struct PlaybackControlBar: View {
                 .accessibilityLabel("撤销")
 
                 Button {
-                    // 重做（暂未实现）
+                    appState.redoSegmentEdit()
                 } label: {
                     Image(systemName: "arrow.uturn.forward")
                         .font(.system(size: 20))
-                        .foregroundColor(.gray)
+                        .foregroundColor(appState.canRedo ? .topBarText : .gray)
                 }
-                .disabled(true)
+                .disabled(!appState.canRedo)
                 .accessibilityLabel("重做")
 
                 Button {

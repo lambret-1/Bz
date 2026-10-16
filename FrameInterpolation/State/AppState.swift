@@ -38,8 +38,12 @@ final class AppState: ObservableObject {
     @Published var projects: [Project] = []
     /// 当前编辑的项目
     @Published var currentProject: Project?
+    /// 当前选中的片段ID
+    @Published var selectedSegmentID: UUID?
     /// 片段编辑撤销栈（保存操作前的 segments 快照）
     private var undoStack: [[VideoSegment]] = []
+    /// 片段编辑重做栈
+    private var redoStack: [[VideoSegment]] = []
 
     // MARK: - 兼容旧版最近记录
     @Published var recentRecords: [RecentRecord] = []
@@ -297,6 +301,8 @@ final class AppState: ObservableObject {
     private func pushUndo() {
         guard let segments = currentProject?.segments else { return }
         undoStack.append(segments)
+        // 新操作清空重做栈
+        redoStack.removeAll()
         // 最多保留 20 步
         if undoStack.count > 20 {
             undoStack.removeFirst()
@@ -306,11 +312,27 @@ final class AppState: ObservableObject {
     /// 是否可撤销
     var canUndo: Bool { !undoStack.isEmpty }
 
+    /// 是否可重做
+    var canRedo: Bool { !redoStack.isEmpty }
+
     /// 撤销上一次片段编辑
     func undoSegmentEdit() {
         guard let previous = undoStack.popLast() else { return }
+        if let current = currentProject?.segments {
+            redoStack.append(current)
+        }
         updateCurrentProject { $0.segments = previous }
         showToast("已撤销", style: .warning)
+    }
+
+    /// 重做上一次撤销的编辑
+    func redoSegmentEdit() {
+        guard let next = redoStack.popLast() else { return }
+        if let current = currentProject?.segments {
+            undoStack.append(current)
+        }
+        updateCurrentProject { $0.segments = next }
+        showToast("已重做", style: .info)
     }
 
     /// 在播放头位置分切当前片段
@@ -797,6 +819,52 @@ final class AppState: ObservableObject {
             try? FileManager.default.removeItem(atPath: path)
         }
         showToast("缓存已清除")
+    }
+
+    // MARK: - 草稿管理
+
+    /// 是否存在未完成的草稿
+    var hasDraft: Bool {
+        DraftStore.shared.hasDraft()
+    }
+
+    /// 恢复草稿（从最近记录中匹配视频）
+    func restoreDraftIfPossible() -> Bool {
+        guard let segments = DraftStore.shared.loadSegments(),
+              !segments.isEmpty else {
+            return false
+        }
+
+        // 从最近记录中找到第一个可用的视频
+        for record in recentRecords {
+            let tempURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(record.fileName)
+            if FileManager.default.fileExists(atPath: tempURL.path) {
+                // 找到匹配的视频，创建项目
+                let videoInfo = VideoInfo(
+                    url: tempURL,
+                    duration: 0,
+                    width: 0,
+                    height: 0,
+                    originalFPS: 30,
+                    fileSize: 0,
+                    bitRateMbps: 0
+                )
+                let project = Project(
+                    videoInfo: videoInfo,
+                    segments: segments,
+                    enhancement: EnhancementConfig()
+                )
+                currentProject = project
+                selectedVideo = videoInfo
+                DraftStore.shared.clearDraft()
+                return true
+            }
+        }
+
+        // 没有找到匹配的视频，清除无效草稿
+        DraftStore.shared.clearDraft()
+        return false
     }
 
     // MARK: - Toast

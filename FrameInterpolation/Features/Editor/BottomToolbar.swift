@@ -43,6 +43,8 @@ struct BottomToolbar: View {
                     }
                     .frame(maxWidth: .infinity)
                 }
+                .accessibilityLabel(title)
+                .accessibilityHint(accessibilityHint(for: title))
             }
         }
         .padding(.vertical, 8)
@@ -55,16 +57,46 @@ struct BottomToolbar: View {
         case "分割":
             let currentTime = PlayerManager.shared.currentTime
             appState.splitSegment(at: currentTime)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
         case "复制":
-            // 复制选中片段（后续实现选中逻辑）
-            appState.showToast("请先选中片段", style: .warning)
+            if let segment = selectedSegment {
+                appState.duplicateSegment(segment)
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } else {
+                appState.showToast("请先选中片段", style: .warning)
+            }
         case "删除":
-            // 删除选中片段（后续实现选中逻辑）
-            appState.showToast("请先选中片段", style: .warning)
+            if let segment = selectedSegment {
+                appState.deleteSegment(segment)
+                appState.selectedSegmentID = nil
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } else {
+                appState.showToast("请先选中片段", style: .warning)
+            }
         case "粘贴":
             appState.showToast("粘贴功能开发中", style: .warning)
+        case "变速":
+            appState.showToast("变速功能开发中", style: .warning)
+        case "音量":
+            appState.showToast("音量调节开发中", style: .warning)
+        case "收起":
+            appState.showToast("收起时间线", style: .info)
         default:
             break
+        }
+    }
+
+    private var selectedSegment: VideoSegment? {
+        guard let id = appState.selectedSegmentID else { return nil }
+        return appState.currentProject?.segments.first(where: { $0.id == id })
+    }
+
+    private func accessibilityHint(for title: String) -> String {
+        switch title {
+        case "分割": return "在当前播放位置分割片段"
+        case "复制": return "复制选中的片段"
+        case "删除": return "删除选中的片段"
+        default: return ""
         }
     }
 }
