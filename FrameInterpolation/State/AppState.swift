@@ -420,7 +420,7 @@ final class AppState: ObservableObject {
 
     // MARK: - 增强配置
 
-    /// 设置增强模式（互斥：选择补帧自动取消超分，反之亦然）
+    /// 设置增强模式（按钮点击用：同模式再次点击取消，toggle语义）
     func setEnhancementMode(_ mode: EnhancementMode) {
         guard let project = currentProject else { return }
         if project.enhancement.mode == mode {
@@ -431,6 +431,20 @@ final class AppState: ObservableObject {
             if mode != .none {
                 triggerHaptic()
             }
+        }
+    }
+
+    /// 应用增强模式（配置页用：直接赋值，不toggle；切到不增强时重置倍数）
+    func applyEnhancementMode(_ mode: EnhancementMode) {
+        updateCurrentProject { project in
+            project.enhancement.mode = mode
+            if mode == .none {
+                // 切回不增强时重置补帧倍数，避免残留
+                project.enhancement.frameMultiplier = .x2
+            }
+        }
+        if mode != .none {
+            triggerHaptic()
         }
     }
 

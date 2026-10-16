@@ -14,12 +14,21 @@ struct TaskSheet: View {
     @State private var tempMode: EnhancementMode = .none
     @State private var tempMultiplier: FrameMultiplier = .x2
     @State private var tempSRModel: SuperResolutionModel = .piperSR
+    @State private var tempFastMode: Bool = false
 
     // 轻量增强设置
     @State private var tempSharpen: Bool = false
     @State private var tempSharpenStrength: Double = 0.4
     @State private var tempDenoise: Bool = false
     @State private var tempDenoiseStrength: Double = 0.3
+
+    /// 输出帧率预览（补帧模式下显示）
+    private var outputFPSPreview: String {
+        guard let project = appState.currentProject else { return "" }
+        let baseFPS = project.videoInfo.originalFPS
+        let multiplier = tempMultiplier.rawValue
+        return "\(Int(baseFPS))fps × \(multiplier) = \(Int(baseFPS * Double(multiplier)))fps"
+    }
 
     var body: some View {
         NavigationStack {
@@ -69,11 +78,32 @@ struct TaskSheet: View {
                         .pickerStyle(.segmented)
 
                         if tempMode == .frameInterpolation {
+                            // 补帧倍数
                             Picker("补帧倍数", selection: $tempMultiplier) {
                                 Text("2x").tag(FrameMultiplier.x2)
                                 Text("4x").tag(FrameMultiplier.x4)
                             }
                             .pickerStyle(.segmented)
+
+                            // 输出帧率预览
+                            HStack {
+                                Image(systemName: "gauge.with.dots.needle.bottom.50percent")
+                                    .foregroundColor(.accentPink)
+                                Text("输出帧率：\(outputFPSPreview)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            // 快速模式开关
+                            Toggle(isOn: $tempFastMode) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("快速模式")
+                                        .font(.subheadline)
+                                    Text("低运动帧用 GPU 混合，速度提升约 40%")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
                         }
 
                         if tempMode == .superResolution {
@@ -112,6 +142,7 @@ struct TaskSheet: View {
                         tempMode = .none
                         tempMultiplier = .x2
                         tempSRModel = .piperSR
+                        tempFastMode = false
                         tempSharpen = false
                         tempDenoise = false
                     }
@@ -149,6 +180,7 @@ struct TaskSheet: View {
         tempMode = project.enhancement.mode
         tempMultiplier = project.enhancement.frameMultiplier
         tempSRModel = project.enhancement.srModel
+        tempFastMode = appState.fastMode
         tempSharpen = project.enhancement.clarity.sharpenEnabled
         tempSharpenStrength = project.enhancement.clarity.sharpenIntensity
         tempDenoise = project.enhancement.clarity.denoiseEnabled
@@ -165,14 +197,24 @@ struct TaskSheet: View {
             project.exportSettings.bitrateMode = tempBitrate
         }
 
-        // AI增强设置
-        appState.setEnhancementMode(tempMode)
+        // AI增强设置：使用直接赋值方法，避免toggle误关
+        appState.applyEnhancementMode(tempMode)
+
+        // 补帧模式下同步倍数和快速模式
         if tempMode == .frameInterpolation {
             appState.setFrameMultiplier(tempMultiplier)
+            appState.fastMode = tempFastMode
+        } else {
+            // 非补帧模式关闭快速模式
+            appState.fastMode = false
         }
+
+        // 超分模式下同步模型
         if tempMode == .superResolution {
             appState.setSuperResolutionModel(tempSRModel)
         }
+
+        // 轻量增强
         appState.updateClarity { config in
             config.sharpenEnabled = tempSharpen
             config.sharpenIntensity = tempSharpenStrength
