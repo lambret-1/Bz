@@ -22,12 +22,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 配置 Git（用于版本号自动递增提交）
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: 显示 Xcode 版本
         run: xcodebuild -version
@@ -50,40 +44,34 @@ jobs:
         run: |
           # 读取当前版本号
           CURRENT_VERSION=$(grep 'CFBundleShortVersionString' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          echo "当前版本: $CURRENT_VERSION"
+          echo "基准版本: $CURRENT_VERSION"
 
           # 解析 X.Y.Z
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
 
-          # 补丁位递增，0-9 自动进位
-          PATCH=$((PATCH + 1))
-          if [ "$PATCH" -gt 9 ]; then
-            PATCH=0
-            MINOR=$((MINOR + 1))
-            if [ "$MINOR" -gt 9 ]; then
-              MINOR=0
-              MAJOR=$((MAJOR + 1))
-            fi
-          fi
+          # 基于构建次数持续递增（github.run_number 从1开始，每次构建+1）
+          TOTAL_PATCH=$((PATCH + ${GITHUB_RUN_NUMBER} - 1))
 
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "新版本: $NEW_VERSION"
+          # 补丁位 0-9 自动进位
+          NEW_PATCH=$((TOTAL_PATCH % 10))
+          CARRY=$((TOTAL_PATCH / 10))
+          TOTAL_MINOR=$((MINOR + CARRY))
+          NEW_MINOR=$((TOTAL_MINOR % 10))
+          NEW_MAJOR=$((MAJOR + TOTAL_MINOR / 10))
 
-          # 更新 project.yml 中的版本号
+          NEW_VERSION="${NEW_MAJOR}.${NEW_MINOR}.${NEW_PATCH}"
+          echo "构建版本: $NEW_VERSION (构建次数: ${GITHUB_RUN_NUMBER})"
+
+          # 动态更新 project.yml 中的版本号（不提交，仅用于本次构建）
           sed -i '' "s/CFBundleShortVersionString: \"${CURRENT_VERSION}\"/CFBundleShortVersionString: \"${NEW_VERSION}\"/" project.yml
 
           # 同步更新 CFBundleVersion 为构建时间戳（中国时间）
-          BUILD_NUMBER=$(date +%Y%m%d%H%M)
+          BUILD_NUMBER=$(TZ=Asia/Shanghai date +%Y%m%d%H%M)
           sed -i '' "s/CFBundleVersion: \"[0-9]*\"/CFBundleVersion: \"${BUILD_NUMBER}\"/" project.yml
 
           echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
           echo "build_number=$BUILD_NUMBER" >> $GITHUB_OUTPUT
           echo "版本号已更新为: $NEW_VERSION (构建号: $BUILD_NUMBER)"
-
-          # 提交版本号更新（跳过 CI 避免无限循环）
-          git add project.yml
-          git commit -m "chore: 自动递增版本号至 v${NEW_VERSION} [skip ci]"
-          git push origin HEAD:${GITHUB_REF_NAME}
 
       - name: 生成 Xcode 工程
         run: xcodegen generate
