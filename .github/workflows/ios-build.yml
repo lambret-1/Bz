@@ -2,7 +2,7 @@ name: iOS Build
 
 on:
   push:
-    branches: [main, testping, feature/speed-optimization]
+    branches: [main, testping, test]
     paths-ignore:
       - '**.md'
       - '资料/**'
@@ -110,7 +110,7 @@ jobs:
 
       - name: 导出未签名 IPA
         run: |
-          BRANCH=${GITHUB_REF_NAME//\//-}
+          BRANCH=${GITHUB_REF_NAME}
           VERSION=${{ steps.version.outputs.version }}
           BUILD_TIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S')
           IPA_NAME="AI补帧_${BRANCH}_v${VERSION}.ipa"
