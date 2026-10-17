@@ -5,6 +5,7 @@ import SwiftUI
 struct HomeView: View {
     @EnvironmentObject var appState: AppState
     @State private var showPicker = false
+    @State private var showAppSettings = false
 
     var body: some View {
         ScrollView {
@@ -14,6 +15,13 @@ struct HomeView: View {
                     Text("视频增强")
                         .font(.largeTitle.bold())
                     Spacer()
+                    Button {
+                        showAppSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .font(.title2)
+                            .foregroundColor(DesignTokens.Colors.textPrimary)
+                    }
                 }
 
                 // 导入卡片
@@ -97,6 +105,11 @@ struct HomeView: View {
         // 参数设置页（独立全屏导航，不共用首页导航栈）
         .fullScreenCover(isPresented: $appState.showSettings) {
             SettingsView()
+                .environmentObject(appState)
+        }
+        // 应用设置页（独立全屏导航）
+        .fullScreenCover(isPresented: $showAppSettings) {
+            AppSettingsView()
                 .environmentObject(appState)
         }
         // Toast 覆盖层
