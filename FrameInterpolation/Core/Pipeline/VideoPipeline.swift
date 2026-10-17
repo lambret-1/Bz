@@ -253,14 +253,20 @@ final class VideoPipeline {
         // MARK: 配置音频 Reader（直写模式，不再二次编码）
         var audioReaderOutput: AVAssetReaderTrackOutput?
         if let audioTrack = loadedAudioTrack {
-            // 音频必须 alwaysCopiesSampleData=true，否则 sample buffer 数据可能被 reader 复用覆盖
-            // 音频数据量小，拷贝开销可忽略
-            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+            // 音频 Reader 输出 PCM 格式（解码），Writer 用 AAC 编码
+            // 透传模式(outputSettings:nil)在部分视频上不稳定，PCM→AAC 更可靠
+            let audioOutputSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false
+            ]
+            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
             output.alwaysCopiesSampleData = true
             if reader.canAdd(output) {
                 reader.add(output)
                 audioReaderOutput = output
-                print("[Bz音频诊断] 音频直写模式：已配置音频 Reader")
+                print("[Bz音频诊断] 音频模式：PCM解码→AAC编码，已配置音频 Reader")
             } else {
                 print("[Bz音频诊断] 音频 Reader 添加失败，reader状态: \(reader.status.rawValue)")
             }
@@ -333,12 +339,30 @@ final class VideoPipeline {
         // MARK: 配置音频 Writer Input（透传原格式，不重编码）
         var audioWriterInput: AVAssetWriterInput?
         if audioReaderOutput != nil {
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            // 从音频轨道获取声道数和采样率，用于 AAC 编码配置
+            let audioChannels = loadedAudioTrack?.formatDescriptions.first.flatMap { desc -> Int? in
+                guard let audioDesc = desc as? CMAudioFormatDescription else { return nil }
+                let basicDesc = CMAudioFormatDescriptionGetStreamBasicDescription(audioDesc)
+                return Int(basicDesc?.pointee.mChannelsPerFrame ?? 2)
+            } ?? 2
+            let audioSampleRate = loadedAudioTrack?.formatDescriptions.first.flatMap { desc -> Double? in
+                guard let audioDesc = desc as? CMAudioFormatDescription else { return nil }
+                let basicDesc = CMAudioFormatDescriptionGetStreamBasicDescription(audioDesc)
+                return basicDesc?.pointee.mSampleRate
+            } ?? 44100
+
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: audioChannels,
+                AVSampleRateKey: audioSampleRate,
+                AVEncoderBitRateKey: 128000
+            ]
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
             input.expectsMediaDataInRealTime = false
             if writer.canAdd(input) {
                 writer.add(input)
                 audioWriterInput = input
-                print("[Bz音频诊断] 音频直写模式：已配置音频 Writer Input")
+                print("[Bz音频诊断] 音频模式：已配置 AAC 编码 Writer Input，声道:\(audioChannels)，采样率:\(audioSampleRate)")
             } else {
                 print("[Bz音频诊断] 音频 Writer Input 添加失败，writer状态: \(writer.status.rawValue)")
             }
@@ -350,7 +374,7 @@ final class VideoPipeline {
         }
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
-        Self.音频诊断结果 = audioWriterInput != nil ? "音视频直写中" : "无声视频处理中"
+        Self.音频诊断结果 = audioWriterInput != nil ? "音视频编码中" : "无声视频处理中"
 
         // MARK: 启动音频直写（独立队列，与视频处理并行）
         let audioEncodeGroup = DispatchGroup()
@@ -452,7 +476,7 @@ final class VideoPipeline {
             throw error
         }
 
-        Self.音频诊断结果 = audioWriterInput != nil ? "音视频直写完成" : "无声视频处理完成"
+        Self.音频诊断结果 = audioWriterInput != nil ? "音视频编码完成" : "无声视频处理完成"
         print("[Bz音频诊断] 全部完成，输出: \(outputURL.lastPathComponent)")
 
         // 释放内存池
