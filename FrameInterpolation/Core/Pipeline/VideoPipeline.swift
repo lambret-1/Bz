@@ -270,8 +270,10 @@ final class VideoPipeline {
         // MARK: 配置音频 Reader（直写模式，不再二次编码）
         var audioReaderOutput: AVAssetReaderTrackOutput?
         if let audioTrack = loadedAudioTrack {
+            // 音频必须 alwaysCopiesSampleData=true，否则 sample buffer 数据可能被 reader 复用覆盖
+            // 音频数据量小，拷贝开销可忽略
             let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
-            output.alwaysCopiesSampleData = false
+            output.alwaysCopiesSampleData = true
             if reader.canAdd(output) {
                 reader.add(output)
                 audioReaderOutput = output
