@@ -682,11 +682,18 @@ final class VideoPipeline {
             var localFrameIndex = 0
             var localProgress = 0.0
 
+            // 确保解码队列退出时关闭缓冲队列，唤醒编码端
+            defer {
+                frameBuffer.close()
+                localOutputFrameCount = localFrameIndex
+                decodeGroup.leave()
+            }
+
             while reader.status == .reading {
                 if self.isCancelled {
                     reader.cancelReading()
                     setError(PipelineError.cancelled)
-                    break
+                    return
                 }
 
                 guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
@@ -752,19 +759,22 @@ final class VideoPipeline {
                     localFrameIndex += 1
                 }
             }
-
-            // 解码完成，关闭缓冲队列（唤醒编码端）
-            frameBuffer.close()
-            localOutputFrameCount = localFrameIndex
-            decodeGroup.leave()
         }
 
         // MARK: 编码队列（requestMediaDataWhenReady 驱动）
         let encodeGroup = DispatchGroup()
         encodeGroup.enter()
+        var encodeFinished = false
+        let finishEncode = {
+            if !encodeFinished {
+                encodeFinished = true
+                videoWriterInput.markAsFinished()
+                encodeGroup.leave()
+            }
+        }
         videoWriterInput.requestMediaDataWhenReady(on: encodeQueue) { [weak self] in
             guard let self = self else {
-                encodeGroup.leave()
+                finishEncode()
                 return
             }
 
@@ -772,15 +782,13 @@ final class VideoPipeline {
                 // 从缓冲队列取帧（可能阻塞等待）
                 guard let frame = frameBuffer.dequeue() else {
                     // 队列已关闭且为空，编码完成
-                    videoWriterInput.markAsFinished()
-                    encodeGroup.leave()
+                    finishEncode()
                     return
                 }
 
                 if self.isCancelled {
                     setError(PipelineError.cancelled)
-                    videoWriterInput.markAsFinished()
-                    encodeGroup.leave()
+                    finishEncode()
                     return
                 }
 
@@ -790,8 +798,7 @@ final class VideoPipeline {
                     if writer.status == .failed {
                         setError(writer.error ?? PipelineError.writerFailed)
                     }
-                    videoWriterInput.markAsFinished()
-                    encodeGroup.leave()
+                    finishEncode()
                     return
                 }
             }
@@ -893,6 +900,13 @@ final class VideoPipeline {
             var localFrameIndex = 0
             var localProgress = 0.0
 
+            // 确保解码队列退出时关闭缓冲队列，唤醒编码端
+            defer {
+                frameBuffer.close()
+                localOutputFrameCount = localFrameIndex
+                decodeGroup.leave()
+            }
+
             // 局部函数：处理并入队一帧
             func enqueueFrame(_ frame: CVPixelBuffer, source: CVPixelBuffer) -> Bool {
                 if self.isCancelled { return false }
@@ -910,7 +924,7 @@ final class VideoPipeline {
                 if self.isCancelled {
                     reader.cancelReading()
                     setError(PipelineError.cancelled)
-                    break
+                    return
                 }
 
                 guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
@@ -974,32 +988,34 @@ final class VideoPipeline {
                     previousPixelBuffer = currentFrame
                 }
             }
-
-            frameBuffer.close()
-            localOutputFrameCount = localFrameIndex
-            decodeGroup.leave()
         }
 
         // MARK: 编码队列
         let encodeGroup = DispatchGroup()
         encodeGroup.enter()
+        var encodeFinished = false
+        let finishEncode = {
+            if !encodeFinished {
+                encodeFinished = true
+                videoWriterInput.markAsFinished()
+                encodeGroup.leave()
+            }
+        }
         videoWriterInput.requestMediaDataWhenReady(on: encodeQueue) { [weak self] in
             guard let self = self else {
-                encodeGroup.leave()
+                finishEncode()
                 return
             }
 
             while videoWriterInput.isReadyForMoreMediaData {
                 guard let frame = frameBuffer.dequeue() else {
-                    videoWriterInput.markAsFinished()
-                    encodeGroup.leave()
+                    finishEncode()
                     return
                 }
 
                 if self.isCancelled {
                     setError(PipelineError.cancelled)
-                    videoWriterInput.markAsFinished()
-                    encodeGroup.leave()
+                    finishEncode()
                     return
                 }
 
@@ -1008,8 +1024,7 @@ final class VideoPipeline {
                     if writer.status == .failed {
                         setError(writer.error ?? PipelineError.writerFailed)
                     }
-                    videoWriterInput.markAsFinished()
-                    encodeGroup.leave()
+                    finishEncode()
                     return
                 }
             }
