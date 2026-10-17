@@ -65,6 +65,18 @@ final class AppState: ObservableObject {
     /// 是否使用AI插值（模型加载成功）
     var isUsingAI: Bool { pipeline.isUsingAIInterpolation }
 
+    // MARK: - 处理统计（结果页展示）
+    /// 总耗时（秒）
+    @Published var totalElapsedSeconds: Double = 0
+    /// CPU 平均使用率（%）
+    @Published var cpuAverage: Double = 0
+    /// CPU 峰值使用率（%）
+    @Published var cpuPeak: Double = 0
+    /// 内存平均占用（MB）
+    @Published var memoryAverageMB: Double = 0
+    /// 内存峰值占用（MB）
+    @Published var memoryPeakMB: Double = 0
+
     // MARK: - Toast
     @Published var toastMessage: String?
     @Published var toastStyle: ToastStyle = .success
@@ -232,6 +244,7 @@ final class AppState: ObservableObject {
         processingStartTime = Date()
 
         // 启动性能监控（处理中页面显示 CPU/内存）
+        performanceMonitor.resetStatistics()
         performanceMonitor.start()
 
         // 统一申请后台任务，处理全程持有（包括最小化到首页）
@@ -286,6 +299,15 @@ final class AppState: ObservableObject {
                     self.progress = 1.0
                     self.estimatedRemaining = 0
                     self.outputURL = url
+
+                    // 记录处理统计（总耗时、CPU/内存平均与峰值）
+                    if let start = self.processingStartTime {
+                        self.totalElapsedSeconds = Date().timeIntervalSince(start)
+                    }
+                    self.cpuAverage = self.performanceMonitor.cpuAverage
+                    self.cpuPeak = self.performanceMonitor.cpuPeak
+                    self.memoryAverageMB = self.performanceMonitor.memoryAverage
+                    self.memoryPeakMB = self.performanceMonitor.memoryPeak
 
                     // 根据实际模式设置处理描述
                     switch mode {

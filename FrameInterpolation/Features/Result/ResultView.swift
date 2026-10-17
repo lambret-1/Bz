@@ -42,6 +42,27 @@ struct ResultView: View {
                                 infoRow("处理状态", "处理完成", highlight: true)
                                 Divider()
                                 infoRow("当前模式", appState.processingMode.isEmpty ? "未知" : appState.processingMode)
+                                Divider()
+                                // 处理统计
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("处理统计")
+                                        .font(.subheadline)
+                                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                                    HStack {
+                                        statItem("总耗时", formatDuration(appState.totalElapsedSeconds))
+                                        Spacer()
+                                        statItem("CPU平均", String(format: "%.0f%%", appState.cpuAverage))
+                                        Spacer()
+                                        statItem("CPU峰值", String(format: "%.0f%%", appState.cpuPeak))
+                                    }
+                                    HStack {
+                                        statItem("内存平均", String(format: "%.0f MB", appState.memoryAverageMB))
+                                        Spacer()
+                                        statItem("内存峰值", String(format: "%.0f MB", appState.memoryPeakMB))
+                                        Spacer()
+                                        statItem("帧率", "\(appState.processedFrames)帧")
+                                    }
+                                }
                                 if !appState.debugInfo.isEmpty {
                                     Divider()
                                     VStack(alignment: .leading, spacing: 4) {
@@ -123,6 +144,30 @@ struct ResultView: View {
                 .font(.subheadline.weight(.medium))
                 .foregroundColor(highlight ? DesignTokens.Colors.accent : DesignTokens.Colors.textPrimary)
                 .lineLimit(1)
+        }
+    }
+
+    // MARK: - 统计项
+    private func statItem(_ title: String, _ value: String) -> some View {
+        VStack(spacing: 2) {
+            Text(value)
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(DesignTokens.Colors.textPrimary)
+            Text(title)
+                .font(.caption2)
+                .foregroundColor(DesignTokens.Colors.textSecondary)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - 格式化时长
+    private func formatDuration(_ seconds: Double) -> String {
+        if seconds < 60 {
+            return String(format: "%.1f秒", seconds)
+        } else {
+            let mins = Int(seconds) / 60
+            let secs = Int(seconds) % 60
+            return "\(mins)分\(secs)秒"
         }
     }
 
