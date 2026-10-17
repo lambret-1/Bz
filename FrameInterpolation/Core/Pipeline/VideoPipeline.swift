@@ -164,14 +164,25 @@ final class VideoPipeline {
         var loadedAudioTrack: AVAssetTrack?
         asset.loadTracks(withMediaType: .video) { videoTracks, error in
             loadedVideoTrack = videoTracks?.first
-            asset.loadTracks(withMediaType: .audio) { audioTracks, _ in
+            asset.loadTracks(withMediaType: .audio) { audioTracks, audioError in
                 loadedAudioTrack = audioTracks?.first
+                // 备选：异步加载失败时尝试同步获取（部分视频异步加载音频轨道返回空）
+                if loadedAudioTrack == nil {
+                    loadedAudioTrack = asset.tracks(withMediaType: .audio).first
+                }
                 tracksSemaphore.signal()
             }
         }
         tracksSemaphore.wait()
+        // 备选：异步加载视频轨道也可能失败
+        if loadedVideoTrack == nil {
+            loadedVideoTrack = asset.tracks(withMediaType: .video).first
+        }
 
         print("[Bz音频诊断] 视频轨道: \(loadedVideoTrack != nil ? "有" : "无"), 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
+        if let audioTrack = loadedAudioTrack {
+            print("[Bz音频诊断] 音频格式: \(audioTrack.formatDescriptions), 估计码率: \(audioTrack.estimatedDataRate)bps")
+        }
 
         // 获取视频轨道
         guard let videoTrack = loadedVideoTrack else {
@@ -265,6 +276,8 @@ final class VideoPipeline {
                 reader.add(output)
                 audioReaderOutput = output
                 print("[Bz音频诊断] 音频直写模式：已配置音频 Reader")
+            } else {
+                print("[Bz音频诊断] 音频 Reader 添加失败，reader状态: \(reader.status.rawValue)")
             }
         }
 
@@ -341,6 +354,8 @@ final class VideoPipeline {
                 writer.add(input)
                 audioWriterInput = input
                 print("[Bz音频诊断] 音频直写模式：已配置音频 Writer Input")
+            } else {
+                print("[Bz音频诊断] 音频 Writer Input 添加失败，writer状态: \(writer.status.rawValue)")
             }
         }
 
@@ -366,7 +381,10 @@ final class VideoPipeline {
                     }
                     // PTS 直接透传，音视频同源保持同步
                     if !audioInput.append(sample) {
-                        print("[Bz音频诊断] 音频 append 失败: \(writer.error?.localizedDescription ?? "未知")")
+                        print("[Bz音频诊断] 音频 append 失败: \(writer.error?.localizedDescription ?? "未知")，停止音频写入")
+                        audioInput.markAsFinished()
+                        audioEncodeGroup.leave()
+                        return
                     }
                 }
             }
