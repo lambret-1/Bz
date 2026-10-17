@@ -506,7 +506,7 @@ final class VideoPipeline {
                 lastProgressReport = progressValue
                 let stage: ProcessingStage = interpolator != nil ? .inferring : .decoding
                 // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI，避免高频主线程回调
-                updateProgress(progressValue, stage)
+                updateProgress(progressValue, stage: stage)
             }
 
             autoreleasepool {
@@ -613,7 +613,7 @@ final class VideoPipeline {
                 lastProgressReport = progressValue
                 let stage: ProcessingStage = usingAI ? .superResolving : .decoding
                 // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
-                updateProgress(progressValue, stage)
+                updateProgress(progressValue, stage: stage)
             }
 
             autoreleasepool {
@@ -750,7 +750,7 @@ final class VideoPipeline {
                     localProgress = progressValue
                     let stage: ProcessingStage = usingAI ? .superResolving : .decoding
                     // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
-                    updateProgress(progressValue, stage)
+                    updateProgress(progressValue, stage: stage)
                 }
 
                 autoreleasepool {
@@ -981,7 +981,7 @@ final class VideoPipeline {
                     localProgress = progressValue
                     let stage: ProcessingStage = self.interpolator != nil ? .inferring : .decoding
                     // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
-                    updateProgress(progressValue, stage)
+                    updateProgress(progressValue, stage: stage)
                 }
 
                 autoreleasepool {
