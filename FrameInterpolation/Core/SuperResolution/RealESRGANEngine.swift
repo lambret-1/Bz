@@ -3,12 +3,11 @@ import CoreVideo
 import Accelerate
 import OSLog
 
-// MARK: - Real-ESRGAN x4v3 轻量版超分引擎（ImageType零拷贝版）
+// MARK: - Real-ESRGAN x4v3 轻量版超分引擎（ImageType零拷贝+资源复用版）
 
 /// Real-ESRGAN General-x4v3 轻量版 4x 超分引擎
-/// ImageType 输入输出：直接喂 CVPixelBuffer，零拷贝，消除 MLMultiArray 转换开销
-/// 128×128 瓦片拼接（带羽化融合），适合极低清素材（480p 及以下）
-/// 模型文件缺失时 init 返回 nil，VideoPipeline 自动降级为 vImage 缩放
+/// ImageType 输入输出：直接喂 CVPixelBuffer，零拷贝
+/// 优化：原帧单次锁定、瓦片缓冲区复用、瓦片级autoreleasepool，解决推理时间随帧数退化
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
@@ -21,21 +20,19 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     // MARK: - 瓦片配置
 
-    /// 瓦片步长（输入空间），重叠 = tileSize - tileStride
     private let tileStride = 96
-    /// 边缘羽化宽度（输出空间），用于瓦片拼接时平滑过渡
     private let featherWidth = 32
 
     // MARK: - 私有属性
 
     private let model: MLModel
-    /// 取消标志
     private var isCancelledFlag = false
+    /// 复用的瓦片输入缓冲区（避免每瓦片创建CVPixelBuffer）
+    private var reusableTileBuffer: CVPixelBuffer?
 
     // MARK: - 初始化
 
     init?() {
-        // 1. 加载 Core ML 模型
         guard let modelURL = Bundle.main.url(
             forResource: SuperResolutionEngineType.realESRGAN.modelFileName,
             withExtension: "mlmodelc"
@@ -50,12 +47,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
         self.model = model
 
-        logger.info("RealESRGAN x4v3 ImageType引擎初始化成功，瓦片: \(self.inputWidth)x\(self.inputHeight)，步长: \(self.tileStride)")
+        // 预分配瓦片缓冲区
+        reusableTileBuffer = createTileBuffer(width: inputWidth, height: inputHeight)
+
+        logger.info("RealESRGAN x4v3 ImageType引擎初始化成功（资源复用版）")
     }
 
     // MARK: - 公开方法
 
-    /// 对单帧执行 4x 超分（128×128 瓦片拼接，ImageType零拷贝）
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         isCancelledFlag = false
         let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
@@ -66,18 +65,27 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let outputHeight = srcHeight * scaleFactor
         let pixelCount = outputWidth * outputHeight
 
-        // 1. Float 累加器（3通道 + 权重）
+        // Float 累加器
         var accumR = [Float](repeating: 0, count: pixelCount)
         var accumG = [Float](repeating: 0, count: pixelCount)
         var accumB = [Float](repeating: 0, count: pixelCount)
         var accumW = [Float](repeating: 0, count: pixelCount)
 
-        // 2. 计算瓦片网格
         let cols = max((srcWidth - inputWidth + tileStride - 1) / tileStride + 1, 1)
         let rows = max((srcHeight - inputHeight + tileStride - 1) / tileStride + 1, 1)
         let outputTileSize = inputWidth * scaleFactor
 
-        // 3. 逐瓦片推理并累加（ImageType零拷贝）
+        // 单次锁定原帧，所有瓦片直接读取（避免18次锁定/解锁）
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let srcBase = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let src = srcBase.assumingMemoryBound(to: UInt8.self)
+
+        // 逐瓦片推理
         for row in 0..<rows {
             for col in 0..<cols {
                 if isCancelledFlag { return nil }
@@ -85,37 +93,34 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let srcX = min(col * tileStride, max(srcWidth - inputWidth, 0))
                 let srcY = min(row * tileStride, max(srcHeight - inputHeight, 0))
 
-                // 从原帧裁剪128x128瓦片
-                guard let tileBuffer = cropPixelBuffer(pixelBuffer, x: srcX, y: srcY, width: inputWidth, height: inputHeight) else {
-                    logger.error("瓦片裁剪失败 (\(col),\(row))")
-                    continue
-                }
+                autoreleasepool {
+                    // 填充复用的瓦片缓冲区
+                    guard let tileBuffer = reusableTileBuffer else { return }
+                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, x: srcX, y: srcY)
 
-                // ImageType零拷贝推理
-                guard let outputBuffer = predictTile(tileBuffer) else {
-                    logger.error("瓦片推理失败 (\(col),\(row))")
-                    continue
-                }
+                    // ImageType零拷贝推理
+                    guard let outputBuffer = predictTile(tileBuffer) else { return }
 
-                // 累加到 Float 缓冲区（带羽化权重）
-                let dstX = srcX * scaleFactor
-                let dstY = srcY * scaleFactor
-                accumulateOutputBuffer(
-                    outputBuffer,
-                    accumR: &accumR,
-                    accumG: &accumG,
-                    accumB: &accumB,
-                    accumW: &accumW,
-                    dstX: dstX,
-                    dstY: dstY,
-                    tileSize: outputTileSize,
-                    outputWidth: outputWidth,
-                    outputHeight: outputHeight
-                )
+                    // 累加
+                    let dstX = srcX * scaleFactor
+                    let dstY = srcY * scaleFactor
+                    accumulateOutputBuffer(
+                        outputBuffer,
+                        accumR: &accumR,
+                        accumG: &accumG,
+                        accumB: &accumB,
+                        accumW: &accumW,
+                        dstX: dstX,
+                        dstY: dstY,
+                        tileSize: outputTileSize,
+                        outputWidth: outputWidth,
+                        outputHeight: outputHeight
+                    )
+                }
             }
         }
 
-        // 4. 归一化并创建输出 CVPixelBuffer
+        // 归一化并创建输出
         guard let outputBuffer = createOutputBuffer(
             width: outputWidth,
             height: outputHeight,
@@ -124,61 +129,46 @@ final class RealESRGANEngine: SuperResolutionEngine {
             accumB: &accumB,
             accumW: &accumW
         ) else {
-            logger.error("创建输出缓冲区失败")
             return nil
         }
 
-        // 5. 复制颜色空间附件
         copyColorSpaceAttachments(from: pixelBuffer, to: outputBuffer)
-
         return outputBuffer
     }
 
-    /// 取消处理
     func cancel() { isCancelledFlag = true }
 
-    // MARK: - 瓦片裁剪（从原帧裁剪指定区域为新的CVPixelBuffer）
+    // MARK: - 瓦片缓冲区创建与填充
 
-    private func cropPixelBuffer(_ source: CVPixelBuffer, x: Int, y: Int, width: Int, height: Int) -> CVPixelBuffer? {
-        var croppedBuffer: CVPixelBuffer?
+    private func createTileBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
         let attrs = [
-            kCVPixelBufferPixelFormatTypeKey: CVPixelBufferGetPixelFormatType(source),
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey: width,
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, CVPixelBufferGetPixelFormatType(source), attrs, &croppedBuffer) == kCVReturnSuccess,
-              let cropped = croppedBuffer else {
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess else {
             return nil
         }
+        return buffer
+    }
 
-        guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess,
-              CVPixelBufferLockBaseAddress(cropped, []) == kCVReturnSuccess else {
-            return nil
-        }
-        defer {
-            CVPixelBufferUnlockBaseAddress(source, .readOnly)
-            CVPixelBufferUnlockBaseAddress(cropped, [])
-        }
+    /// 直接从原帧内存填充瓦片缓冲区（原帧已锁定）
+    private func fillTileBuffer(_ tile: CVPixelBuffer, from src: UnsafePointer<UInt8>, srcBytesPerRow: Int, x: Int, y: Int) {
+        CVPixelBufferLockBaseAddress(tile, [])
+        defer { CVPixelBufferUnlockBaseAddress(tile, []) }
 
-        guard let srcAddr = CVPixelBufferGetBaseAddress(source),
-              let dstAddr = CVPixelBufferGetBaseAddress(cropped) else {
-            return nil
-        }
+        guard let dstBase = CVPixelBufferGetBaseAddress(tile) else { return }
+        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(tile)
+        let dst = dstBase.assumingMemoryBound(to: UInt8.self)
+        let srcStart = src.advanced(by: y * srcBytesPerRow + x * 4)
 
-        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
-        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(cropped)
-        let srcStart = srcAddr.advanced(by: y * srcBytesPerRow + x * 4)
-
-        // 逐行拷贝（处理stride差异）
-        for row in 0..<height {
-            memcpy(dstAddr.advanced(by: row * dstBytesPerRow),
+        for row in 0..<inputHeight {
+            memcpy(dst.advanced(by: row * dstBytesPerRow),
                    srcStart.advanced(by: row * srcBytesPerRow),
-                   min(width * 4, dstBytesPerRow))
+                   min(inputWidth * 4, dstBytesPerRow))
         }
-
-        return cropped
     }
 
     // MARK: - 单瓦片推理（ImageType零拷贝）
@@ -193,7 +183,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return outputBuffer
     }
 
-    // MARK: - 瓦片累加（从输出CVPixelBuffer读取BGRA，带羽化权重）
+    // MARK: - 瓦片累加
 
     private func accumulateOutputBuffer(
         _ outputBuffer: CVPixelBuffer,
@@ -228,7 +218,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let srcOffset = ty * srcBytesPerRow + tx * 4
                 let outIdx = outY * outputWidth + outX
 
-                // BGRA → RGB，模型输出已是[0,255]，需除以255归一化到[0,1]再累加
+                // 模型输出已是[0,255]，除以255归一化到[0,1]
                 accumR[outIdx] += Float(src[srcOffset + 2]) / 255.0 * weight
                 accumG[outIdx] += Float(src[srcOffset + 1]) / 255.0 * weight
                 accumB[outIdx] += Float(src[srcOffset + 0]) / 255.0 * weight
@@ -237,7 +227,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
     }
 
-    /// 计算边缘羽化权重（0~1），中心区域为1，边缘线性衰减
     private func featherWeight(position: Int, size: Int) -> Float {
         let fw = featherWidth
         if position < fw {
@@ -249,7 +238,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
     }
 
-    // MARK: - 创建输出缓冲区（归一化 Float 累加器 → BGRA）
+    // MARK: - 创建输出缓冲区
 
     private func createOutputBuffer(
         width: Int,
@@ -286,7 +275,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let pixelOffset = rowOffset + x * 4
 
                 if w > 0 {
-                    // GAN 输出需 Clamp，累加归一化后钳制到 [0,255]
                     let b = accumB[idx] / w
                     let g = accumG[idx] / w
                     let r = accumR[idx] / w
