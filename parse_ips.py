@@ -134,16 +134,20 @@ def parse_ips_file(content):
             print(f"错误: base64 解码失败: {e}")
             return None
     else:
-        # 多行格式
+        # 多行格式：第一行是 header JSON，剩余行拼接成 body JSON
         lines = stripped.splitlines()
         if len(lines) < 2:
             print("错误: .ips 文件行数不足")
             return None
         try:
             header = json.loads(lines[0])
-            crash_data = json.loads(lines[1])
+            # body 可能跨多行（格式化的 JSON），需要拼接剩余所有行
+            body_text = '\n'.join(lines[1:])
+            crash_data = json.loads(body_text)
         except json.JSONDecodeError as e:
             print(f"错误: JSON 解析失败: {e}")
+            print(f"第一行前100字符: {lines[0][:100]}")
+            print(f"剩余行前100字符: {body_text[:100] if 'body_text' in dir() else 'N/A'}")
             return None
 
     # 提取版本信息
