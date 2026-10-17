@@ -14,14 +14,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
     // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .realESRGAN
-    let inputWidth: Int = 256
-    let inputHeight: Int = 256
+    let inputWidth: Int = 512
+    let inputHeight: Int = 512
     let scaleFactor: Int = 4
 
     // MARK: - 瓦片配置
 
-    private let tileStride = 192
-    private let featherWidth = 64
+    private let tileStride = 384
+    private let featherWidth = 128
 
     // MARK: - 私有属性
 
@@ -49,7 +49,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
         reusableTileBuffer = createTileBuffer(width: inputWidth, height: inputHeight)
 
-        logger.info("RealESRGAN x4v3 256x256引擎初始化成功（computeUnits: all）")
+        logger.info("RealESRGAN x4v3 512x512引擎初始化成功（computeUnits: all）")
     }
 
     // MARK: - 公开方法
