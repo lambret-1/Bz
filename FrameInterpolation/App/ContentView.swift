@@ -19,5 +19,9 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
             appState.applicationDidEnterBackground()
         }
+        // 监听应用回到前台
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            appState.applicationWillEnterForeground()
+        }
     }
 }

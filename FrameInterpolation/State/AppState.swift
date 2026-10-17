@@ -451,21 +451,25 @@ final class AppState: ObservableObject {
         // 任务完成后（outputURL != nil）不再发后台通知
         guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
         sendBackgroundNotification(
-            title: "补帧处理中",
-            body: "你刚切到后台，处理将继续约30秒，点我回到App继续",
+            title: "视频处理中",
+            body: "为避免处理中断，建议保持App在前台，后台可能被系统暂停",
             identifier: "bz_bg_warning"
         )
     }
 
-    /// 后台时间即将耗尽时调用
+    /// 后台时间即将耗尽时调用（只记录日志，不发通知避免频繁打扰）
     func backgroundTimeExpiring() {
-        // 任务完成后不再发通知
         guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
-        sendBackgroundNotification(
-            title: "补帧即将暂停",
-            body: "系统马上要挂起任务，点我回来继续处理",
-            identifier: "bz_bg_expiring"
-        )
+        logger.warning("后台任务时间即将耗尽，处理可能被系统中断")
+    }
+
+    /// 应用回到前台时调用，检查处理状态
+    func applicationWillEnterForeground() {
+        // 如果处理失败（后台被系统杀死），提示用户
+        if stage == .failed {
+            showToast("后台处理被系统中断，请重新开始", style: .warning)
+            logger.warning("应用回到前台，检测到处理失败（可能后台被系统中断）")
+        }
     }
 
     private func sendBackgroundNotification(title: String, body: String, identifier: String) {
