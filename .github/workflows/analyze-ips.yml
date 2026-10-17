@@ -44,8 +44,20 @@ jobs:
         id: parse
         run: |
           CRASH_FILE="${{ steps.find_file.outputs.crash_file }}"
-          python3 parse_ips.py "$CRASH_FILE" > parse_output.txt
+          echo "=== Python 版本 ==="
+          python3 --version
+          echo "=== 文件信息 ==="
+          ls -la "$CRASH_FILE"
+          file "$CRASH_FILE"
+          echo "=== 文件前200字符 ==="
+          head -c 200 "$CRASH_FILE"
+          echo ""
+          echo "=== 执行解析脚本 ==="
+          python3 parse_ips.py "$CRASH_FILE" 2>&1 | tee parse_output.txt
+          echo "=== parse_output.txt 内容 ==="
           cat parse_output.txt
+          echo "=== 文件大小 ==="
+          wc -c parse_output.txt
 
           # 提取关键信息：同时设置当前 shell 变量和写入 GITHUB_ENV
           while IFS='=' read -r key value; do

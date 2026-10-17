@@ -7,6 +7,12 @@ on:
       - '**.md'
       - '资料/**'
       - '**.ips'
+      - '**.txt'
+      - 'crash_logs/**'
+      - 'parse_ips.py'
+      - 'Scripts/**'
+      - '.github/workflows/analyze-ips.yml'
+      - '.github/workflows/convert-*.yml'
   workflow_dispatch:
 
 env:
