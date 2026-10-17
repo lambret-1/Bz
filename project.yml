@@ -25,8 +25,8 @@ targets:
       path: FrameInterpolation/Resources/Info.plist
       properties:
         CFBundleDisplayName: AI 补帧
-        CFBundleShortVersionString: "0.4.6"
-        CFBundleVersion: "202610171931"
+        CFBundleShortVersionString: "0.4.7"
+        CFBundleVersion: "202610171946"
         UILaunchScreen:
           UIColorName: BgPrimary
         UISupportedInterfaceOrientations:
