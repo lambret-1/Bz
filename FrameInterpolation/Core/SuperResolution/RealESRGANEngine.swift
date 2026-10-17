@@ -29,8 +29,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
     // MARK: - 私有属性
 
     private let model: MLModel
-    /// 输入图像约束（用于创建 MLFeatureValue）
-    private let inputConstraint: MLImageConstraint
     /// 取消标志
     private var isCancelledFlag = false
 
@@ -51,12 +49,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
             return nil
         }
         self.model = model
-
-        // 2. 获取输入图像约束
-        guard let constraint = model.modelDescription.inputDescriptionsByName["input"]?.imageConstraint else {
-            return nil
-        }
-        self.inputConstraint = constraint
 
         logger.info("RealESRGAN x4v3 ImageType引擎初始化成功，瓦片: \(self.inputWidth)x\(self.inputHeight)，步长: \(self.tileStride)")
     }
@@ -192,8 +184,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
     // MARK: - 单瓦片推理（ImageType零拷贝）
 
     private func predictTile(_ inputBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        guard let inputFeature = try? MLFeatureValue(pixelBuffer: inputBuffer, constraint: inputConstraint),
-              let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputFeature]),
+        let inputFeature = MLFeatureValue(pixelBuffer: inputBuffer)
+        guard let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputFeature]),
               let prediction = try? model.prediction(from: inputProvider),
               let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
             return nil
