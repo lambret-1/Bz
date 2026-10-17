@@ -6,6 +6,7 @@ on:
     paths-ignore:
       - '**.md'
       - '资料/**'
+      - '**.ips'
   workflow_dispatch:
 jobs:
   build:
