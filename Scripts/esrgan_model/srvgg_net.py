@@ -69,4 +69,5 @@ class SRVGGNetCompact(nn.Module):
         # 加上最近邻上采样的输入，使网络学习残差
         base = self.nearest_upsample(x)
         out += base
-        return out
+        # 输出乘以255，适配 ImageType(scale=1.0) 直接输出 UInt8 CVPixelBuffer
+        return out * 255.0

@@ -118,7 +118,7 @@ def convert_to_coreml(model: SRVGGNetCompact) -> ct.models.MLModel:
         )],
         outputs=[ct.ImageType(
             name="output",
-            scale=255.0
+            scale=1.0
         )],
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS16
