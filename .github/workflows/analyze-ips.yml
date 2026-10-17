@@ -195,5 +195,5 @@ jobs:
             parse_output.txt
             symbolicated.txt
             call_stack.txt
-          if_no_files_found: warn
+          if-no-files-found: warn
           retention-days: 30
