@@ -18,8 +18,10 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: 检出代码
+      - name: 检出代码（使用分支最新代码，避免上传文件commit基于旧代码）
         uses: actions/checkout@v4
+        with:
+          ref: testping
 
       - name: 查找崩溃日志文件
         id: find_file
