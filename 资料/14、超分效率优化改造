@@ -101,6 +101,11 @@ func startAudioEncoding() {
 · 补帧模式帧率变化时，视频 PTS 重新计算后，音频 PTS 需用 CMSampleBufferSetOutputPresentationTimeStamp 整体平移对齐
 · 第一帧音视频起点必须一致（通常都是 kCMTimeZero 或原始时间戳），否则 writer.finishWriting() 会报错或音画不同步
 
+⚠️ 音频起始 PTS 非零（剪辑/拼接视频）：
+· 部分视频的音频轨起始 PTS 不是 0（经过快速剪辑或拼接），直接透传会导致 writer.finishWriting 报 Cannot Decode
+· 修正：写入前获取 asset.timeRange.start，音视频第一帧 PTS 统一用 CMTimeSubtract(pts, startTime) 平移到从 0 开始
+· 视频和音频必须用同一个 startTime 偏移，保持相对对齐
+
 ### 3.2 进度回调防抖（消除 B5）
 
 当前：每处理 0.5% 帧 DispatchQueue.main.async { progress = ... }
@@ -147,7 +152,10 @@ updateProgress(Double(frameIndex) / Double(totalFrames))
 final class PixelBufferPool {
     private let pool: CVPixelBufferPool
 
-    init(width: Int, height: Int, pixelFormat: OSType = kCVPixelFormatType_32BGRA, minBufferCount: Int = 4) {
+    // minBufferCount 必须足够大：三队列流水线中 inputPool 至少需要
+    // Reader处理中1 + 队列A积压4 + Inference处理中1 + 余量 = 至少6个
+    // 给 12 确保不枯竭，CVPixelBufferPool 内存吃紧时会自动回收
+    init(width: Int, height: Int, pixelFormat: OSType = kCVPixelFormatType_32BGRA, minBufferCount: Int = 12) {
         let poolAttributes: [String: Any] = [
             kCVPixelBufferPoolMinimumBufferCountKey as String: minBufferCount
         ]
@@ -203,9 +211,24 @@ func deepCopyWithPool(_ source: CVPixelBuffer) -> CVPixelBuffer? {
     }
     guard let srcAddr = CVPixelBufferGetBaseAddress(source),
           let dstAddr = CVPixelBufferGetBaseAddress(dest) else { return nil }
+
+    // ⚠️ Stride 越界陷阱：源和目标的 bytesPerRow 可能因内存对齐而不同
+    // 必须分别读取，不能用 source 的 stride 直接拷贝到 dest
     let height = CVPixelBufferGetHeight(source)
-    let bytesPerRow = CVPixelBufferGetBytesPerRow(source)
-    memcpy(dstAddr, srcAddr, height * bytesPerRow)
+    let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+    let dstBytesPerRow = CVPixelBufferGetBytesPerRow(dest)
+
+    if srcBytesPerRow == dstBytesPerRow {
+        // stride 相同，一键全拷（最快）
+        memcpy(dstAddr, srcAddr, height * srcBytesPerRow)
+    } else {
+        // stride 不同，必须逐行拷贝，每行取较小的宽度
+        for row in 0..<height {
+            memcpy(dstAddr + row * dstBytesPerRow,
+                   srcAddr + row * srcBytesPerRow,
+                   min(srcBytesPerRow, dstBytesPerRow))
+        }
+    }
     return dest
 }
 ```
@@ -217,23 +240,27 @@ func deepCopyWithPool(_ source: CVPixelBuffer) -> CVPixelBuffer? {
 ### 4.1 拆分 ReaderQueue 和 InferenceQueue（消除 B1）
 
 当前：decodeQueue 中 copyNextSampleBuffer → engine.upscale → enqueue 串行
-改造后：三队列流水线
+改造后：四队列流水线（InferenceQueue 只做推理，不混入 CPU 缩放）
 
 ```
-┌─────────────┐    ┌──────────────┐    ┌─────────────┐
-│ ReaderQueue │───▶│ InferenceQueue│───▶│ EncodeQueue │
-│ 读帧+深拷贝  │    │  AI超分+缩放  │    │  写入编码器  │
-│ (IO密集)    │    │ (ANE密集)    │    │ (编码密集)  │
-└─────────────┘    └──────────────┘    └─────────────┘
-       │                   │                   │
-       ▼                   ▼                   ▼
-   BoundedQueue A      BoundedQueue B     writer
-   (容量 4)           (容量 6)
+┌─────────────┐   ┌──────────────┐   ┌────────────────┐   ┌─────────────┐
+│ ReaderQueue │──▶│ InferenceQueue│──▶│PostProcessQueue│──▶│ EncodeQueue │
+│ 读帧+深拷贝  │   │  仅AI超分     │   │  vImage缩放     │   │  写入编码器  │
+│ (IO密集)    │   │ (ANE密集)    │   │  (CPU密集)     │   │ (编码密集)  │
+└─────────────┘   └──────────────┘   └────────────────┘   └─────────────┘
+      │                  │                   │                  │
+      ▼                  ▼                   ▼                  ▼
+  BoundedQueue A     BoundedQueue B      BoundedQueue C      writer
+  (容量 4)          (容量 6)            (容量 6)
 ```
+
+⚠️ ANE 饿死陷阱：InferenceQueue 绝对不能混入 scaleToOutput（vImage CPU 缩放）。
+否则 ANE 算完一帧后必须等 CPU 缩图完成才取下一帧，ANE 空转。缩放必须移到 PostProcessQueue。
 
 ```swift
 private let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
 private let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)
+private let postProcessQueue = DispatchQueue(label: "com.lambret.bz.sr.postprocess", qos: .userInitiated)
 
 // ReaderQueue：只负责读帧和深拷贝
 func runReader() {
@@ -245,7 +272,7 @@ func runReader() {
             guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
 
             // alwaysCopiesSampleData=false 时必须深拷贝，否则 buffer 会被 reader 复用
-            guard let copiedBuffer = self.deepCopyPixelBuffer(pixelBuffer) else { continue }
+            guard let copiedBuffer = self.deepCopyWithPool(pixelBuffer) else { continue }
 
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
             // 放入 Reader→Inference 队列
@@ -258,7 +285,7 @@ func runReader() {
     }
 }
 
-// InferenceQueue：只负责 AI 推理
+// InferenceQueue：只负责 AI 推理，绝不混入 CPU 缩放（防止 ANE 饿死）
 func runInference() {
     inferenceQueue.async { [weak self] in
         guard let self = self else { return }
@@ -266,17 +293,34 @@ func runInference() {
             guard let (pixelBuffer, pts, frameIndex) = self.readerToInferenceQueue.dequeue() else { break }
 
             autoreleasepool {
+                // 只做 AI 超分，4x 输出
                 let result = self.engine?.upscale(pixelBuffer) ?? self.scalePixelBuffer(pixelBuffer, scale: 4)
-                // 缩放到最终输出尺寸（合并缩放，见 5.1）
-                let final = self.scaleToOutput(result)
-                // 放入 Inference→Encode 队列
-                _ = self.inferenceToEncodeQueue.enqueue((final, pts, frameIndex))
+                // 放入 Inference→PostProcess 队列，缩放交给 PostProcessQueue
+                _ = self.inferenceToPostQueue.enqueue((result, pts, frameIndex))
             }
 
             // 只更新原子进度，不切主线程
             self.updateProgress(Double(frameIndex) / Double(self.totalFrames))
         }
-        self.inferenceToEncodeQueue.close()
+        self.inferenceToPostQueue.close()
+    }
+}
+
+// PostProcessQueue：只负责 vImage 缩放到最终输出尺寸
+func runPostProcess() {
+    postProcessQueue.async { [weak self] in
+        guard let self = self else { return }
+        while !self.isCancelled {
+            guard let (pixelBuffer, pts, frameIndex) = self.inferenceToPostQueue.dequeue() else { break }
+
+            autoreleasepool {
+                // 合并缩放：AI 4x 输出一次性缩放到最终 outputWidth/outputHeight
+                let final = self.scaleToOutput(pixelBuffer)
+                // 放入 PostProcess→Encode 队列
+                _ = self.postToEncodeQueue.enqueue((final, pts, frameIndex))
+            }
+        }
+        self.postToEncodeQueue.close()
     }
 }
 ```
@@ -297,22 +341,25 @@ func cancel() {
 }
 ```
 
-### 4.2 FrameBuffer 容量调整 + autoreleasepool
+### 4.2 队列容量调整 + autoreleasepool
 
-· FrameBuffer（Inference→Encode）容量从 6 调整为 10
-· Reader→Inference 队列容量 4
-· 每帧推理包裹 autoreleasepool，防止 CoreML 临时对象堆积
+四队列架构下的容量配置：
+· Reader→Inference 队列容量 4（输入帧，较小）
+· Inference→PostProcess 队列容量 6（AI 4x 输出帧，较大）
+· PostProcess→Encode 队列容量 10（最终输出帧，编码背压缓冲）
+· 每帧推理和后处理都包裹 autoreleasepool，防止 CoreML/vImage 临时对象堆积
 
 ```swift
-// 容量计算依据：1080p 4x 输出每帧 ~33MB，10帧 = 330MB，在安全线内
-let inferenceToEncodeQueue = BoundedQueue<ProcessedFrame>(capacity: 10)
+// 容量计算依据：1080p 4x 输出每帧 ~33MB
+// Post→Encode 10帧 = 330MB，Inference→Post 6帧 = 198MB，总计 ~530MB（含输入帧余量）
 let readerToInferenceQueue = BoundedQueue<RawFrame>(capacity: 4)
+let inferenceToPostQueue = BoundedQueue<AIOutputFrame>(capacity: 6)
+let postToEncodeQueue = BoundedQueue<ProcessedFrame>(capacity: 10)
 
-// InferenceQueue 中每帧包裹
+// 每个队列的每帧处理都包裹 autoreleasepool
 autoreleasepool {
     let upscaled = engine.upscale(pixelBuffer)
-    let final = scaleToOutput(upscaled)
-    _ = inferenceToEncodeQueue.enqueue((final, pts, frameIndex))
+    _ = inferenceToPostQueue.enqueue((upscaled, pts, frameIndex))
 }
 ```
 
@@ -396,7 +443,7 @@ mlmodel = ct.convert(
 | 一 | 音频直写 | 中（音视频同步） | 保留 muxAudio 旧代码，开关切换 | 输出视频有声音、音画同步 |
 | 一 | 进度防抖 | 低 | 恢复原回调 | 进度环流畅更新 |
 | 一 | CVPixelBufferPool | 低 | 恢复 CVPixelBufferCreate | 内存峰值下降、无崩溃 |
-| 二 | 拆队列 | 高（同步复杂） | 保留 runSuperResolutionAsync 旧实现 | 速度提升、无死锁、无顺序错乱 |
+| 二 | 拆四队列（Reader/Inference/PostProcess/Encode） | 高（同步复杂） | 保留 runSuperResolutionAsync 旧实现 | 速度提升、无死锁、无顺序错乱、ANE 不空转 |
 | 二 | 缓冲+autoreleasepool | 低 | 调回原参数 | 内存峰值 < 500MB |
 | 三 | 合并缩放 | 低 | 恢复两次缩放 | 输出尺寸正确 |
 | 三 | 256×256 模型 | 中（模型转换） | 保留 128×128 模型文件 | 推理结果正确、速度提升 |
