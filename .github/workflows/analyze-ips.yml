@@ -1,13 +1,14 @@
-name: Auto Symbolicate iOS .ips
+name: Auto Symbolicate Crash Log
 
 on:
   push:
     paths:
       - 'crash_logs/*.ips'
+      - 'crash_logs/*.txt'
   workflow_dispatch:
     inputs:
-      ips_file:
-        description: '崩溃日志文件名（位于 crash_logs/ 目录）'
+      crash_file:
+        description: '崩溃日志文件名（位于 crash_logs/ 目录，支持 .ips 和 .txt）'
         required: false
         default: ''
 
@@ -20,32 +21,36 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 查找 .ips 文件
-        id: find_ips
+      - name: 查找崩溃日志文件
+        id: find_file
         run: |
-          if [ -n "${{ github.event.inputs.ips_file }}" ]; then
-            IPS_FILE="crash_logs/${{ github.event.inputs.ips_file }}"
+          if [ -n "${{ github.event.inputs.crash_file }}" ]; then
+            CRASH_FILE="crash_logs/${{ github.event.inputs.crash_file }}"
           else
-            IPS_FILE=$(find crash_logs -name "*.ips" -type f | head -n 1)
+            # 优先查找 .ips，其次 .txt
+            CRASH_FILE=$(find crash_logs -name "*.ips" -type f | head -n 1)
+            if [ -z "$CRASH_FILE" ]; then
+              CRASH_FILE=$(find crash_logs -name "*.txt" -type f | head -n 1)
+            fi
           fi
-          if [ -z "$IPS_FILE" ] || [ ! -f "$IPS_FILE" ]; then
-            echo "错误: 未找到 .ips 文件"
+          if [ -z "$CRASH_FILE" ] || [ ! -f "$CRASH_FILE" ]; then
+            echo "错误: 未找到崩溃日志文件"
             exit 1
           fi
-          echo "ips_file=$IPS_FILE" >> $GITHUB_OUTPUT
-          echo "正在解析: $IPS_FILE"
+          echo "crash_file=$CRASH_FILE" >> $GITHUB_OUTPUT
+          echo "正在解析: $CRASH_FILE"
 
-      - name: 解析 .ips 提取关键信息
+      - name: 解析崩溃日志提取关键信息
         id: parse
         run: |
-          IPS_FILE="${{ steps.find_ips.outputs.ips_file }}"
-          python3 parse_ips.py "$IPS_FILE" > parse_output.txt
+          CRASH_FILE="${{ steps.find_file.outputs.crash_file }}"
+          python3 parse_ips.py "$CRASH_FILE" > parse_output.txt
           cat parse_output.txt
 
-          # 提取关键信息：同时设置当前 shell 变量和写入 GITHUB_ENV（供后续 step 使用）
+          # 提取关键信息：同时设置当前 shell 变量和写入 GITHUB_ENV
           while IFS='=' read -r key value; do
             case "$key" in
-              VERSION|BUILD|UUID|LOAD_ADDRESS|APP_NAME)
+              FORMAT|VERSION|BUILD|UUID|LOAD_ADDRESS|APP_NAME|CRASH_TYPE|CRASH_REASON)
                 echo "$key=$value" >> $GITHUB_ENV
                 eval "$key=\"$value\""
                 ;;
@@ -53,19 +58,47 @@ jobs:
           done < parse_output.txt
 
           # 检查是否提取成功
-          if [ -z "$VERSION" ] || [ -z "$UUID" ]; then
-            echo "错误: 未能从 .ips 中提取版本或 UUID"
+          if [ -z "$VERSION" ]; then
+            echo "错误: 未能从崩溃日志中提取版本信息"
             cat parse_output.txt
             exit 1
           fi
 
-          # 同时输出到 step outputs，供后续 step 引用
+          echo "format=$FORMAT" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "build=$BUILD" >> $GITHUB_OUTPUT
-          echo "uuid=$UUID" >> $GITHUB_OUTPUT
-          echo "load_address=$LOAD_ADDRESS" >> $GITHUB_OUTPUT
 
-      - name: 下载对应版本 dSYM
+      - name: TXT格式 - 直接生成报告
+        if: env.FORMAT == 'txt'
+        run: |
+          echo "检测到 TXT 格式（App内部CrashLogger导出），调用栈已符号化，无需atos处理"
+
+          # 提取调用栈部分（--- CRASH ADDRESSES --- 之后的内容）
+          awk '/^--- CRASH ADDRESSES ---$/{found=1; next} found' parse_output.txt > call_stack.txt
+
+          {
+            echo "# iOS 崩溃日志分析报告（TXT格式）"
+            echo ""
+            echo "## 基本信息"
+            echo "- **崩溃文件**: ${{ steps.find_file.outputs.crash_file }}"
+            echo "- **格式**: App内部CrashLogger导出（已符号化）"
+            echo "- **应用版本**: $VERSION"
+            echo "- **构建版本**: $BUILD"
+            echo "- **崩溃类型**: $CRASH_TYPE"
+            echo "- **崩溃原因**: $CRASH_REASON"
+            echo ""
+            echo "## 调用栈（已符号化）"
+            echo '```text'
+            cat call_stack.txt
+            echo '```'
+            echo ""
+            echo "## 说明"
+            echo "- TXT格式来自App内部CrashLogger，调用栈为系统符号化结果"
+            echo "- 如需更精确的文件行号信息，请使用iOS系统导出的.ips格式崩溃日志"
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: IPS格式 - 下载对应版本 dSYM
+        if: env.FORMAT == 'ips'
         id: download_dsym
         continue-on-error: true
         uses: dawidd6/action-download-artifact@v3
@@ -76,29 +109,42 @@ jobs:
           if_no_artifact_found: warn
           search_artifacts: true
 
-      - name: 检查 dSYM 是否下载成功
+      - name: IPS格式 - 检查 dSYM 是否下载成功
+        if: env.FORMAT == 'ips'
         run: |
           if [ ! -d "./dSYMs" ] || [ -z "$(ls -A ./dSYMs 2>/dev/null)" ]; then
             echo "::warning::未找到版本 v${{ env.VERSION }} (build ${{ env.BUILD }}) 对应的 dSYM 产物"
             echo "dSYM 产物从 v0.3.0 版本开始上传，旧版本崩溃无法符号化"
-            echo "崩溃日志基本信息已提取："
-            echo "- 版本: $VERSION"
-            echo "- UUID: $UUID"
-            echo "- 基地址: $LOAD_ADDRESS"
-            echo "- 崩溃地址数量: $(grep -c '^0x' parse_output.txt)"
-            echo "请使用 v0.3.0 及以上版本产生的崩溃日志进行符号化"
+            {
+              echo "# iOS 崩溃日志分析报告（IPS格式）"
+              echo ""
+              echo "## 基本信息"
+              echo "- **崩溃文件**: ${{ steps.find_file.outputs.crash_file }}"
+              echo "- **应用版本**: $VERSION"
+              echo "- **构建版本**: $BUILD"
+              echo "- **UUID**: $UUID"
+              echo "- **加载基地址**: $LOAD_ADDRESS"
+              echo ""
+              echo "## 崩溃地址（未符号化）"
+              echo '```text'
+              grep "^0x" parse_output.txt
+              echo '```'
+              echo ""
+              echo "## 说明"
+              echo "- 未找到对应版本的dSYM，无法进行符号化"
+              echo "- dSYM产物从v0.3.0版本开始上传，请使用新版本产生的崩溃日志"
+            } >> $GITHUB_STEP_SUMMARY
             exit 0
           fi
           echo "dSYM 下载成功"
-          ls -la ./dSYMs/
 
-      - name: 解压 dSYM
+      - name: IPS格式 - 解压 dSYM
+        if: env.FORMAT == 'ips'
         id: unzip
         run: |
           mkdir -p unzipped
           find ./dSYMs -name "*.zip" -exec unzip -q {} -d unzipped \;
 
-          # 查找 DWARF 文件
           DWARF_PATH=$(find ./unzipped -path "*.app.dSYM/Contents/Resources/DWARF/*" -type f | head -n 1)
           if [ -z "$DWARF_PATH" ]; then
             echo "错误: 未找到 DWARF 文件"
@@ -119,38 +165,21 @@ jobs:
             echo "UUID 匹配成功"
           fi
 
-      - name: 验证 dSYM 调试信息
+      - name: IPS格式 - 使用 atos 符号化
+        if: env.FORMAT == 'ips'
         run: |
-          echo "=== dSYM 调试信息验证 ==="
-          # 检查 DWARF 文件是否包含行号信息
-          dwarfdump --debug-line "$DWARF_PATH" 2>/dev/null | head -5
-          LINE_COUNT=$(dwarfdump --debug-line "$DWARF_PATH" 2>/dev/null | wc -l)
-          echo "行号信息条目数: $LINE_COUNT"
-          if [ "$LINE_COUNT" -gt 10 ]; then
-            echo "✓ dSYM 包含完整行号信息，atos 可解析到具体代码行"
-          else
-            echo "⚠ dSYM 行号信息不足，可能只能解析到函数名"
-          fi
-
-      - name: 使用 atos 符号化
-        run: |
-          # 提取崩溃地址（以 0x 开头的行）
           mapfile -t ADDRESS_ARRAY < <(grep "^0x" parse_output.txt | awk '{print $1}')
 
           if [ ${#ADDRESS_ARRAY[@]} -eq 0 ]; then
             echo "错误: 未提取到崩溃地址"
-            cat parse_output.txt
             exit 1
           fi
 
           echo "崩溃地址数量: ${#ADDRESS_ARRAY[@]}"
           echo "基地址: $LOAD_ADDRESS"
-          echo ""
 
-          # 使用 atos 批量符号化
           xcrun atos -arch arm64 -l "$LOAD_ADDRESS" -o "$DWARF_PATH" "${ADDRESS_ARRAY[@]}" > symbolicated_raw.txt 2>&1 || true
 
-          # 将原始地址与符号化结果对应输出
           echo "=== 符号化结果（地址 → 符号） ===" > symbolicated.txt
           idx=0
           while IFS= read -r line; do
@@ -161,13 +190,14 @@ jobs:
             idx=$((idx + 1))
           done < symbolicated_raw.txt
 
-      - name: 生成符号化报告
+      - name: IPS格式 - 生成符号化报告
+        if: env.FORMAT == 'ips'
         run: |
           {
-            echo "# iOS 崩溃日志符号化报告"
+            echo "# iOS 崩溃日志符号化报告（IPS格式）"
             echo ""
             echo "## 基本信息"
-            echo "- **崩溃文件**: ${{ steps.find_ips.outputs.ips_file }}"
+            echo "- **崩溃文件**: ${{ steps.find_file.outputs.crash_file }}"
             echo "- **应用版本**: $VERSION"
             echo "- **构建版本**: $BUILD"
             echo "- **UUID**: $UUID"
@@ -181,15 +211,15 @@ jobs:
             echo ""
             echo "## 说明"
             echo "- 格式: \`内存地址 → 函数名 (模块) (文件名:行号)\`"
-            echo "- 若只显示函数名无行号，说明 dSYM 调试信息不完整"
             echo "- 崩溃栈顶第一帧通常是直接触发崩溃的代码位置"
           } >> $GITHUB_STEP_SUMMARY
 
-      - name: 上传符号化结果
+      - name: 上传分析结果
         uses: actions/upload-artifact@v4
         with:
-          name: symbolicated_${{ env.VERSION }}_${{ env.BUILD }}
+          name: crash_analysis_${{ env.VERSION }}_${{ env.BUILD }}
           path: |
             parse_output.txt
             symbolicated.txt
+            call_stack.txt
           retention-days: 30
