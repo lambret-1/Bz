@@ -1,0 +1,378 @@
+超分效率优化改造
+
+当前超分 4x 处理 124 帧需 611 秒（约 5 秒/帧），CPU 仅 27%，根因是解码与推理串行无重叠、音频二次编码、瓦片调度开销大。本文档给出分阶段改造方案，预期综合提升 50-70%。
+
+---
+
+1. 现状瓶颈分析
+
+```
+当前流程（串行）：
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│ 解码一帧  │──▶│ AI推理一帧│──▶│ 编码一帧  │──▶│ 下一帧    │
+│ (IO空闲) │   │ (IO等待) │   │ (推理等待)│   │          │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘
+                          ↑
+                     音频 ExportSession 二次编码（视频再跑一遍）
+```
+
+五大瓶颈：
+
+| 编号 | 瓶颈 | 影响 | 严重度 |
+|------|------|------|--------|
+| B1 | 解码与推理串行，CPU 空转等 ANE | 吞吐量上不去 | ★★★★★ |
+| B2 | AVAssetExportSession 音频合成导致视频二次编码 | 总时间 +30-40% | ★★★★★ |
+| B3 | 128×128 瓦片，1080p 需 135 次 CoreML 调用/帧 | ANE 调度开销 1s+/帧 | ★★★★☆ |
+| B4 | 每帧新建 CVPixelBuffer，内存分配开销 | 延迟抖动、内存碎片 | ★★★☆☆ |
+| B5 | 每 0.5% 帧 DispatchQueue.main.async 回调 | 主线程频繁打断 | ★★☆☆☆ |
+
+---
+
+2. 改造目标
+
+· 124 帧 720p 4x 超分：从 611 秒降至 250-300 秒
+· CPU 利用率：从 27% 提升至 60%+
+· 内存峰值：控制在 500MB 以内（iPhone 8 Plus 安全线）
+· 进度更新：从 200 次/视频降至 ~20 次/视频
+
+---
+
+3. 第一阶段：低风险高收益（预计提升 30-40%）
+
+### 3.1 音频直写 AVAssetWriter（消除 B2）
+
+当前流程：写无声临时视频 → AVAssetExportSession 合成音频（视频重编码）
+改造后：AVAssetWriter 同时写 videoInput 和 audioInput，一次编码完成
+
+实现要点：
+
+```swift
+// VideoPipeline.swift 中新增音频输入
+private var audioWriterInput: AVAssetWriterInput?
+private var audioReaderOutput: AVAssetReaderTrackOutput?
+
+// 配置 Writer 时增加音频轨
+func configureAudioWriter(asset: AVAsset) throws {
+    guard let audioTrack = try? asset.loadTracks(withMediaType: .audio).first else { return }
+
+    let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+    audioOutput.alwaysCopiesSampleData = false
+    guard reader.canAdd(audioOutput) else { return }
+    reader.add(audioOutput)
+    audioReaderOutput = audioOutput
+
+    let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+    audioInput.expectsMediaDataInRealTime = false
+    guard writer.canAdd(audioInput) else { return }
+    writer.add(audioInput)
+    audioWriterInput = audioInput
+}
+```
+
+音频编码队列（独立于视频编码队列）：
+
+```swift
+private let audioEncodeQueue = DispatchQueue(label: "com.lambret.bz.audio.encode", qos: .userInitiated)
+
+func startAudioEncoding() {
+    guard let audioInput = audioWriterInput, let audioOutput = audioReaderOutput else { return }
+
+    audioInput.requestMediaDataWhenReady(on: audioEncodeQueue) { [weak self] in
+        guard let self = self else { return }
+        while audioInput.isReadyForMoreMediaData {
+            guard let sample = audioOutput.copyNextSampleBuffer() else {
+                audioInput.markAsFinished()
+                return
+            }
+            audioInput.append(sample)
+        }
+    }
+}
+```
+
+注意事项：
+· 音频 outputSettings 传 nil 表示透传原格式（不重编码）
+· 音频和视频的 writer.startWriting() 只需调用一次
+· 完成等待：videoInput.markAsFinished() 和 audioInput.markAsFinished() 都调用后再 writer.finishWriting()
+
+### 3.2 进度回调防抖（消除 B5）
+
+当前：每处理 0.5% 帧 DispatchQueue.main.async { progress = ... }
+改造后：原子变量记录进度，Timer 每 0.5 秒读取并刷新 UI
+
+```swift
+// ProcessingView 或 AppState 中
+private let progressLock = NSLock()
+private var _progress: Double = 0
+private var progressTimer: Timer?
+
+var progress: Double {
+    progressLock.lock()
+    defer { progressLock.unlock() }
+    return _progress
+}
+
+func updateProgress(_ value: Double) {
+    progressLock.lock()
+    _progress = value
+    progressLock.unlock()
+}
+
+// 启动时开启定时器
+func startProgressTimer() {
+    progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        guard let self = self else { return }
+        let p = self.progress
+        DispatchQueue.main.async {
+            self.appState.progress = p
+        }
+    }
+}
+
+// 解码/推理循环中只更新原子变量，不切主线程
+frameIndex += 1
+updateProgress(Double(frameIndex) / Double(totalFrames))
+```
+
+### 3.3 CVPixelBufferPool 复用（消除 B4）
+
+为三种尺寸分别创建缓冲池：
+· 输入池：reader 输出尺寸（如 1280×720）
+· AI 输出池：4x 尺寸（如 5120×2880）
+· 最终输出池：outputWidth × outputHeight
+
+```swift
+final class PixelBufferPool {
+    private let pool: CVPixelBufferPool
+
+    init(width: Int, height: Int, pixelFormat: OSType = kCVPixelFormatType_32BGRA, minBufferCount: Int = 4) {
+        let poolAttributes: [String: Any] = [
+            kCVPixelBufferPoolMinimumBufferCountKey as String: minBufferCount
+        ]
+        let bufferAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(nil, poolAttributes as CFDictionary, bufferAttributes as CFDictionary, &pool)
+        self.pool = pool!
+    }
+
+    func create() -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+        return buffer
+    }
+}
+```
+
+使用方式：
+
+```swift
+// VideoPipeline 中持有三个池
+private var inputPool: PixelBufferPool?
+private var aiOutputPool: PixelBufferPool?
+private var outputPool: PixelBufferPool?
+
+// 初始化时创建
+inputPool = PixelBufferPool(width: Int(naturalWidth), height: Int(naturalHeight))
+aiOutputPool = PixelBufferPool(width: Int(naturalWidth * 4), height: Int(naturalHeight * 4))
+outputPool = PixelBufferPool(width: Int(outputWidth), height: Int(outputHeight))
+
+// 循环中从池取 buffer，不再 CVPixelBufferCreate
+guard let outputBuffer = outputPool?.create() else { break }
+```
+
+---
+
+4. 第二阶段：架构改造（预计提升 20-30%）
+
+### 4.1 拆分 ReaderQueue 和 InferenceQueue（消除 B1）
+
+当前：decodeQueue 中 copyNextSampleBuffer → engine.upscale → enqueue 串行
+改造后：三队列流水线
+
+```
+┌─────────────┐    ┌──────────────┐    ┌─────────────┐
+│ ReaderQueue │───▶│ InferenceQueue│───▶│ EncodeQueue │
+│ 读帧+深拷贝  │    │  AI超分+缩放  │    │  写入编码器  │
+│ (IO密集)    │    │ (ANE密集)    │    │ (编码密集)  │
+└─────────────┘    └──────────────┘    └─────────────┘
+       │                   │                   │
+       ▼                   ▼                   ▼
+   BoundedQueue A      BoundedQueue B     writer
+   (容量 4)           (容量 6)
+```
+
+```swift
+private let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
+private let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)
+
+// ReaderQueue：只负责读帧和深拷贝
+func runReader() {
+    readerQueue.async { [weak self] in
+        guard let self = self else { return }
+        var frameIndex = 0
+        while !self.isCancelled {
+            guard let sample = self.videoReaderOutput?.copyNextSampleBuffer() else { break }
+            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+
+            // alwaysCopiesSampleData=false 时必须深拷贝，否则 buffer 会被 reader 复用
+            guard let copiedBuffer = self.deepCopyPixelBuffer(pixelBuffer) else { continue }
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            // 放入 Reader→Inference 队列
+            if !self.readerToInferenceQueue.enqueue((copiedBuffer, pts, frameIndex)) {
+                break // 被取消
+            }
+            frameIndex += 1
+        }
+        self.readerToInferenceQueue.close()
+    }
+}
+
+// InferenceQueue：只负责 AI 推理
+func runInference() {
+    inferenceQueue.async { [weak self] in
+        guard let self = self else { return }
+        while !self.isCancelled {
+            guard let (pixelBuffer, pts, frameIndex) = self.readerToInferenceQueue.dequeue() else { break }
+
+            autoreleasepool {
+                let result = self.engine?.upscale(pixelBuffer) ?? self.scalePixelBuffer(pixelBuffer, scale: 4)
+                // 缩放到最终输出尺寸（合并缩放，见 5.1）
+                let final = self.scaleToOutput(result)
+                // 放入 Inference→Encode 队列
+                _ = self.inferenceToEncodeQueue.enqueue((final, pts, frameIndex))
+            }
+
+            // 只更新原子进度，不切主线程
+            self.updateProgress(Double(frameIndex) / Double(self.totalFrames))
+        }
+        self.inferenceToEncodeQueue.close()
+    }
+}
+```
+
+### 4.2 FrameBuffer 容量调整 + autoreleasepool
+
+· FrameBuffer（Inference→Encode）容量从 6 调整为 10
+· Reader→Inference 队列容量 4
+· 每帧推理包裹 autoreleasepool，防止 CoreML 临时对象堆积
+
+```swift
+// 容量计算依据：1080p 4x 输出每帧 ~33MB，10帧 = 330MB，在安全线内
+let inferenceToEncodeQueue = BoundedQueue<ProcessedFrame>(capacity: 10)
+let readerToInferenceQueue = BoundedQueue<RawFrame>(capacity: 4)
+
+// InferenceQueue 中每帧包裹
+autoreleasepool {
+    let upscaled = engine.upscale(pixelBuffer)
+    let final = scaleToOutput(upscaled)
+    _ = inferenceToEncodeQueue.enqueue((final, pts, frameIndex))
+}
+```
+
+---
+
+5. 第三阶段：算法与模型优化（预计提升 20-50%）
+
+### 5.1 合并缩放（消除冗余 vImage）
+
+当前：AI 4x 输出 → 如果 targetScale<4x 先缩回 → 如果 needsScaling 再缩放到 outputResolution
+改造后：AI 4x 输出 → 一次性缩放到最终 outputWidth/outputHeight
+
+```swift
+func scaleToOutput(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+    let targetWidth = Int(outputWidth)
+    let targetHeight = Int(outputHeight)
+    let sourceWidth = CVPixelBufferGetWidth(buffer)
+    let sourceHeight = CVPixelBufferGetHeight(buffer)
+
+    // 尺寸相同直接返回
+    if sourceWidth == targetWidth && sourceHeight == targetHeight {
+        return buffer
+    }
+
+    guard let outputBuffer = outputPool?.create() else { return nil }
+    // vImage 一次性缩放
+    var sourceBuffer = vImage_Buffer()
+    var destBuffer = vImage_Buffer()
+    // ... vImageScale_ARGB8888 一次性缩放
+    return outputBuffer
+}
+```
+
+### 5.2 模型重转：256×256 输入尺寸（消除 B3）
+
+当前：128×128 瓦片，1080p 需 135 次/帧
+改造后：256×256 瓦片，1080p 需 (1920/256)×(1080/256) = 8×5 = 40 次/帧，调度开销降 70%
+
+转换脚本修改（Scripts/convert_fast_srgan.py）：
+
+```python
+# 将输入尺寸从 128 改为 256
+input_shape = (1, 3, 256, 256)
+mlmodel = ct.convert(
+    torch_model,
+    inputs=[ct.ImageType(name="input", shape=input_shape, scale=1/255.0)],
+    outputs=[ct.ImageType(name="output", scale=1/255.0)],
+    compute_precision=ct.precision.FLOAT16,
+    minimum_deployment_target=ct.target.iOS16
+)
+```
+
+注意：
+· 模型权重不变，只改输入尺寸，需验证卷积层 padding 是否正确
+· 256×256 单次推理内存是 128×128 的 4 倍，需确认 ANE 内存足够
+· Fast-SRGAN 模型较小（1.9MB），256×256 应该没问题
+· Real-ESRGAN 模型较大，建议先保持 128×128
+
+### 5.3（可选）Metal 瓦片拼接
+
+当前瓦片拼接在 CPU 上 memcpy，4x 输出 33MB/帧
+改造后用 MTLBlitCommandEncoder 做 GPU 端拷贝
+
+---
+
+6. 改造顺序与风险控制
+
+| 阶段 | 步骤 | 风险 | 回滚方式 | 验证标准 |
+|------|------|------|----------|----------|
+| 一 | 音频直写 | 中（音视频同步） | 保留 muxAudio 旧代码，开关切换 | 输出视频有声音、音画同步 |
+| 一 | 进度防抖 | 低 | 恢复原回调 | 进度环流畅更新 |
+| 一 | CVPixelBufferPool | 低 | 恢复 CVPixelBufferCreate | 内存峰值下降、无崩溃 |
+| 二 | 拆队列 | 高（同步复杂） | 保留 runSuperResolutionAsync 旧实现 | 速度提升、无死锁、无顺序错乱 |
+| 二 | 缓冲+autoreleasepool | 低 | 调回原参数 | 内存峰值 < 500MB |
+| 三 | 合并缩放 | 低 | 恢复两次缩放 | 输出尺寸正确 |
+| 三 | 256×256 模型 | 中（模型转换） | 保留 128×128 模型文件 | 推理结果正确、速度提升 |
+
+建议：第一阶段三个步骤一次性提交，验证稳定后再做第二阶段，第三阶段最后做。
+
+---
+
+7. 验证方法
+
+每阶段完成后运行以下测试：
+
+1. 功能测试：720p 视频 4x 超分，输出视频可播放、有声音、音画同步
+2. 性能测试：记录 124 帧处理总时间，对比基线 611 秒
+3. 内存测试：用 Instruments 记录内存峰值，确认 < 500MB
+4. 稳定性测试：连续处理 3 个视频，无崩溃、无内存泄漏
+5. 边界测试：1x（跳过 AI）、2x、3x、4x 各跑一次
+6. 取消测试：处理中途点取消，确认所有队列正确退出、临时文件清理
+
+---
+
+8. 预期收益汇总
+
+| 阶段 | 预期提升 | 累计速度 |
+|------|----------|----------|
+| 基线 | - | 611 秒（5.0 秒/帧） |
+| 第一阶段完成 | +30-40% | 370-430 秒（3.0-3.5 秒/帧） |
+| 第二阶段完成 | +20-30% | 280-340 秒（2.3-2.7 秒/帧） |
+| 第三阶段完成 | +20-50% | 180-270 秒（1.5-2.2 秒/帧） |
+
+最终目标：124 帧 720p 4x 超分控制在 5 分钟以内。
