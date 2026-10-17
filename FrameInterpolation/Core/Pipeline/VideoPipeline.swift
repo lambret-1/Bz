@@ -158,26 +158,9 @@ final class VideoPipeline {
     ) throws {
         let asset = AVURLAsset(url: inputURL)
 
-        // 异步加载轨道（iOS 16+ 同步属性可能返回空，必须用 loadTracks）
-        let tracksSemaphore = DispatchSemaphore(value: 0)
-        var loadedVideoTrack: AVAssetTrack?
-        var loadedAudioTrack: AVAssetTrack?
-        asset.loadTracks(withMediaType: .video) { videoTracks, error in
-            loadedVideoTrack = videoTracks?.first
-            asset.loadTracks(withMediaType: .audio) { audioTracks, audioError in
-                loadedAudioTrack = audioTracks?.first
-                // 备选：异步加载失败时尝试同步获取（部分视频异步加载音频轨道返回空）
-                if loadedAudioTrack == nil {
-                    loadedAudioTrack = asset.tracks(withMediaType: .audio).first
-                }
-                tracksSemaphore.signal()
-            }
-        }
-        tracksSemaphore.wait()
-        // 备选：异步加载视频轨道也可能失败
-        if loadedVideoTrack == nil {
-            loadedVideoTrack = asset.tracks(withMediaType: .video).first
-        }
+        // 同步加载轨道（iOS 16 中 tracks(withMediaType:) 会阻塞等待元数据加载，比异步 loadTracks 更可靠）
+        let loadedVideoTrack = asset.tracks(withMediaType: .video).first
+        let loadedAudioTrack = asset.tracks(withMediaType: .audio).first
 
         print("[Bz音频诊断] 视频轨道: \(loadedVideoTrack != nil ? "有" : "无"), 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
         if let audioTrack = loadedAudioTrack {
