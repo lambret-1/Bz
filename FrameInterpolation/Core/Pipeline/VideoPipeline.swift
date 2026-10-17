@@ -1203,8 +1203,10 @@ final class VideoPipeline {
             return nil
         }
 
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        CVPixelBufferLockBaseAddress(result, [])
+        guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess else {
+            return nil
+        }
         defer {
             CVPixelBufferUnlockBaseAddress(source, .readOnly)
             CVPixelBufferUnlockBaseAddress(result, [])
@@ -1233,11 +1235,16 @@ final class VideoPipeline {
 
     // MARK: - vImage 缩放 CVPixelBuffer（输出分辨率控制）
     private func scalePixelBuffer(_ source: CVPixelBuffer, to width: Int, _ height: Int) -> CVPixelBuffer? {
-        CVPixelBufferLockBaseAddress(source, .readOnly)
+        guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
         defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
 
+        guard let srcData = CVPixelBufferGetBaseAddress(source) else {
+            return nil
+        }
         var srcBuffer = vImage_Buffer(
-            data: CVPixelBufferGetBaseAddress(source),
+            data: srcData,
             height: vImagePixelCount(CVPixelBufferGetHeight(source)),
             width: vImagePixelCount(CVPixelBufferGetWidth(source)),
             rowBytes: CVPixelBufferGetBytesPerRow(source)
@@ -1255,11 +1262,16 @@ final class VideoPipeline {
             return nil
         }
 
-        CVPixelBufferLockBaseAddress(dst, [])
+        guard CVPixelBufferLockBaseAddress(dst, []) == kCVReturnSuccess else {
+            return nil
+        }
         defer { CVPixelBufferUnlockBaseAddress(dst, []) }
 
+        guard let dstData = CVPixelBufferGetBaseAddress(dst) else {
+            return nil
+        }
         var dstBuffer = vImage_Buffer(
-            data: CVPixelBufferGetBaseAddress(dst),
+            data: dstData,
             height: vImagePixelCount(height),
             width: vImagePixelCount(width),
             rowBytes: CVPixelBufferGetBytesPerRow(dst)
@@ -1285,8 +1297,11 @@ final class VideoPipeline {
         let smallW = 64
         let smallH = 64
 
-        CVPixelBufferLockBaseAddress(frame0, .readOnly)
-        CVPixelBufferLockBaseAddress(frame1, .readOnly)
+        // iOSurface-backed 的 CVPixelBuffer Lock 可能失败
+        guard CVPixelBufferLockBaseAddress(frame0, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(frame1, .readOnly) == kCVReturnSuccess else {
+            return 255
+        }
         defer {
             CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
             CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
@@ -1354,18 +1369,26 @@ final class VideoPipeline {
             return nil
         }
 
-        CVPixelBufferLockBaseAddress(frame0, .readOnly)
-        CVPixelBufferLockBaseAddress(frame1, .readOnly)
-        CVPixelBufferLockBaseAddress(result, [])
+        // iOSurface-backed 的 CVPixelBuffer Lock 可能失败，GetBaseAddress 返回 NULL
+        guard CVPixelBufferLockBaseAddress(frame0, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(frame1, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess else {
+            return nil
+        }
         defer {
             CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
             CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
             CVPixelBufferUnlockBaseAddress(result, [])
         }
 
-        let src0 = CVPixelBufferGetBaseAddress(frame0)!.assumingMemoryBound(to: UInt8.self)
-        let src1 = CVPixelBufferGetBaseAddress(frame1)!.assumingMemoryBound(to: UInt8.self)
-        let dst = CVPixelBufferGetBaseAddress(result)!.assumingMemoryBound(to: UInt8.self)
+        guard let src0Ptr = CVPixelBufferGetBaseAddress(frame0),
+              let src1Ptr = CVPixelBufferGetBaseAddress(frame1),
+              let dstPtr = CVPixelBufferGetBaseAddress(result) else {
+            return nil
+        }
+        let src0 = src0Ptr.assumingMemoryBound(to: UInt8.self)
+        let src1 = src1Ptr.assumingMemoryBound(to: UInt8.self)
+        let dst = dstPtr.assumingMemoryBound(to: UInt8.self)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(result)
         let totalBytes = bytesPerRow * height
 
