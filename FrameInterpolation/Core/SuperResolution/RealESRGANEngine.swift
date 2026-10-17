@@ -91,7 +91,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
                 autoreleasepool {
                     guard let tileBuffer = reusableTileBuffer else { return }
-                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, x: srcX, y: srcY)
+                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
 
                     guard let outputBuffer = predictTile(tileBuffer) else { return }
 
@@ -146,19 +146,25 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return buffer
     }
 
-    private func fillTileBuffer(_ tile: CVPixelBuffer, from src: UnsafePointer<UInt8>, srcBytesPerRow: Int, x: Int, y: Int) {
+    private func fillTileBuffer(_ tile: CVPixelBuffer, from src: UnsafePointer<UInt8>, srcBytesPerRow: Int, srcWidth: Int, srcHeight: Int, x: Int, y: Int) {
         CVPixelBufferLockBaseAddress(tile, [])
         defer { CVPixelBufferUnlockBaseAddress(tile, []) }
 
         guard let dstBase = CVPixelBufferGetBaseAddress(tile) else { return }
         let dstBytesPerRow = CVPixelBufferGetBytesPerRow(tile)
         let dst = dstBase.assumingMemoryBound(to: UInt8.self)
-        let srcStart = src.advanced(by: y * srcBytesPerRow + x * 4)
 
-        for row in 0..<inputHeight {
+        // 先清零整个瓦片缓冲区（padding区域为0）
+        memset(dstBase, 0, dstBytesPerRow * inputHeight)
+
+        let srcStart = src.advanced(by: y * srcBytesPerRow + x * 4)
+        let copyWidth = min(inputWidth, srcWidth - x)
+        let copyHeight = min(inputHeight, srcHeight - y)
+
+        for row in 0..<copyHeight {
             memcpy(dst.advanced(by: row * dstBytesPerRow),
                    srcStart.advanced(by: row * srcBytesPerRow),
-                   min(inputWidth * 4, dstBytesPerRow))
+                   min(copyWidth * 4, dstBytesPerRow))
         }
     }
 
