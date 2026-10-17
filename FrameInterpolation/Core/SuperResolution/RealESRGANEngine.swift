@@ -3,11 +3,11 @@ import CoreVideo
 import Accelerate
 import OSLog
 
-// MARK: - Real-ESRGAN x4v3 轻量版超分引擎（ImageType零拷贝+资源复用版）
+// MARK: - Real-ESRGAN x4v3 轻量版超分引擎（多线程瓦片并行版）
 
 /// Real-ESRGAN General-x4v3 轻量版 4x 超分引擎
-/// ImageType 输入输出：直接喂 CVPixelBuffer，零拷贝
-/// 优化：原帧单次锁定、瓦片缓冲区复用、瓦片级autoreleasepool，解决推理时间随帧数退化
+/// 多线程瓦片并行推理：18个瓦片分发到多核并行执行，充分利用CPU+ANE
+/// ImageType零拷贝输入输出，瓦片级autoreleasepool，累加器线程安全
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
@@ -22,13 +22,17 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     private let tileStride = 96
     private let featherWidth = 32
+    /// 并行推理线程数（A11六核，用4线程平衡ANE资源竞争）
+    private let parallelThreads = 4
 
     // MARK: - 私有属性
 
     private let model: MLModel
     private var isCancelledFlag = false
-    /// 复用的瓦片输入缓冲区（避免每瓦片创建CVPixelBuffer）
-    private var reusableTileBuffer: CVPixelBuffer?
+    /// 累加器线程安全锁
+    private let accumLock = OSAllocatedUnfairLock()
+    /// 瓦片缓冲区池（每个线程独立使用，避免竞争）
+    private var tileBufferPool: [CVPixelBuffer] = []
 
     // MARK: - 初始化
 
@@ -47,10 +51,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
         self.model = model
 
-        // 预分配瓦片缓冲区
-        reusableTileBuffer = createTileBuffer(width: inputWidth, height: inputHeight)
+        // 预分配瓦片缓冲区池（每个线程一个）
+        for _ in 0..<parallelThreads {
+            if let buffer = createTileBuffer(width: inputWidth, height: inputHeight) {
+                tileBufferPool.append(buffer)
+            }
+        }
 
-        logger.info("RealESRGAN x4v3 ImageType引擎初始化成功（资源复用版）")
+        logger.info("RealESRGAN x4v3 多线程并行引擎初始化成功，线程数: \(self.parallelThreads)")
     }
 
     // MARK: - 公开方法
@@ -65,7 +73,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let outputHeight = srcHeight * scaleFactor
         let pixelCount = outputWidth * outputHeight
 
-        // Float 累加器
+        // Float 累加器（多线程共享，加锁保护）
         var accumR = [Float](repeating: 0, count: pixelCount)
         var accumG = [Float](repeating: 0, count: pixelCount)
         var accumB = [Float](repeating: 0, count: pixelCount)
@@ -74,8 +82,9 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let cols = max((srcWidth - inputWidth + tileStride - 1) / tileStride + 1, 1)
         let rows = max((srcHeight - inputHeight + tileStride - 1) / tileStride + 1, 1)
         let outputTileSize = inputWidth * scaleFactor
+        let totalTiles = cols * rows
 
-        // 单次锁定原帧，所有瓦片直接读取（避免18次锁定/解锁）
+        // 单次锁定原帧
         guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
             return nil
         }
@@ -85,26 +94,60 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let src = srcBase.assumingMemoryBound(to: UInt8.self)
 
-        // 逐瓦片推理
+        // 构建瓦片任务列表
+        struct TileTask {
+            let row: Int
+            let col: Int
+            let srcX: Int
+            let srcY: Int
+        }
+        var tasks: [TileTask] = []
+        tasks.reserveCapacity(totalTiles)
         for row in 0..<rows {
             for col in 0..<cols {
-                if isCancelledFlag { return nil }
-
                 let srcX = min(col * tileStride, max(srcWidth - inputWidth, 0))
                 let srcY = min(row * tileStride, max(srcHeight - inputHeight, 0))
+                tasks.append(TileTask(row: row, col: col, srcX: srcX, srcY: srcY))
+            }
+        }
+
+        // 多线程并行推理
+        let concurrentQueue = DispatchQueue(label: "com.lambret.bz.esrgan.tiles", attributes: .concurrent)
+        let group = DispatchGroup()
+        var hasError = false
+
+        for (index, task) in tasks.enumerated() {
+            if isCancelledFlag { break }
+
+            group.enter()
+            concurrentQueue.async { [weak self] in
+                guard let self = self else { group.leave(); return }
+                if self.isCancelledFlag { group.leave(); return }
 
                 autoreleasepool {
-                    // 填充复用的瓦片缓冲区
-                    guard let tileBuffer = reusableTileBuffer else { return }
-                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, x: srcX, y: srcY)
+                    // 从池中取当前线程的瓦片缓冲区
+                    let bufferIndex = index % self.tileBufferPool.count
+                    guard bufferIndex < self.tileBufferPool.count else {
+                        group.leave()
+                        return
+                    }
+                    let tileBuffer = self.tileBufferPool[bufferIndex]
 
-                    // ImageType零拷贝推理
-                    guard let outputBuffer = predictTile(tileBuffer) else { return }
+                    // 填充瓦片
+                    self.fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, x: task.srcX, y: task.srcY)
 
-                    // 累加
-                    let dstX = srcX * scaleFactor
-                    let dstY = srcY * scaleFactor
-                    accumulateOutputBuffer(
+                    // ImageType零拷贝推理（MLModel线程安全，可并发调用）
+                    guard let outputBuffer = self.predictTile(tileBuffer) else {
+                        hasError = true
+                        group.leave()
+                        return
+                    }
+
+                    // 线程安全累加
+                    let dstX = task.srcX * self.scaleFactor
+                    let dstY = task.srcY * self.scaleFactor
+                    self.accumLock.lock()
+                    self.accumulateOutputBuffer(
                         outputBuffer,
                         accumR: &accumR,
                         accumG: &accumG,
@@ -116,9 +159,15 @@ final class RealESRGANEngine: SuperResolutionEngine {
                         outputWidth: outputWidth,
                         outputHeight: outputHeight
                     )
+                    self.accumLock.unlock()
                 }
+                group.leave()
             }
         }
+
+        group.wait()
+
+        if isCancelledFlag { return nil }
 
         // 归一化并创建输出
         guard let outputBuffer = createOutputBuffer(
@@ -154,7 +203,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return buffer
     }
 
-    /// 直接从原帧内存填充瓦片缓冲区（原帧已锁定）
     private func fillTileBuffer(_ tile: CVPixelBuffer, from src: UnsafePointer<UInt8>, srcBytesPerRow: Int, x: Int, y: Int) {
         CVPixelBufferLockBaseAddress(tile, [])
         defer { CVPixelBufferUnlockBaseAddress(tile, []) }
@@ -218,7 +266,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let srcOffset = ty * srcBytesPerRow + tx * 4
                 let outIdx = outY * outputWidth + outX
 
-                // 模型输出已是[0,255]，除以255归一化到[0,1]
                 accumR[outIdx] += Float(src[srcOffset + 2]) / 255.0 * weight
                 accumG[outIdx] += Float(src[srcOffset + 1]) / 255.0 * weight
                 accumB[outIdx] += Float(src[srcOffset + 0]) / 255.0 * weight
