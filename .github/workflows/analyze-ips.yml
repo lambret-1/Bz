@@ -66,13 +66,31 @@ jobs:
           echo "load_address=$LOAD_ADDRESS" >> $GITHUB_OUTPUT
 
       - name: 下载对应版本 dSYM
+        id: download_dsym
+        continue-on-error: true
         uses: dawidd6/action-download-artifact@v3
         with:
           workflow: ios-build.yml
           name: dSYM_v${{ env.VERSION }}_${{ env.BUILD }}
           path: ./dSYMs
-          if_no_artifact_found: fail
+          if_no_artifact_found: warn
           search_artifacts: true
+
+      - name: 检查 dSYM 是否下载成功
+        run: |
+          if [ ! -d "./dSYMs" ] || [ -z "$(ls -A ./dSYMs 2>/dev/null)" ]; then
+            echo "::warning::未找到版本 v${{ env.VERSION }} (build ${{ env.BUILD }}) 对应的 dSYM 产物"
+            echo "dSYM 产物从 v0.3.0 版本开始上传，旧版本崩溃无法符号化"
+            echo "崩溃日志基本信息已提取："
+            echo "- 版本: $VERSION"
+            echo "- UUID: $UUID"
+            echo "- 基地址: $LOAD_ADDRESS"
+            echo "- 崩溃地址数量: $(grep -c '^0x' parse_output.txt)"
+            echo "请使用 v0.3.0 及以上版本产生的崩溃日志进行符号化"
+            exit 0
+          fi
+          echo "dSYM 下载成功"
+          ls -la ./dSYMs/
 
       - name: 解压 dSYM
         id: unzip
