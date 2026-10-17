@@ -14,6 +14,9 @@ final class VideoPipeline {
     /// 后台处理队列
     private let processingQueue = DispatchQueue(label: "com.lambret.bz.pipeline", qos: .userInitiated)
 
+    /// CVPixelBuffer 内存池（复用缓冲，避免循环中频繁分配释放）
+    private let bufferPool = PixelBufferPoolManager(minBufferCount: 12)
+
     /// 原子进度保护（iOS 16+ OSAllocatedUnfairLock，开销仅为 NSLock 的几十分之一）
     private let progressLock = OSAllocatedUnfairLock(initialState: (value: 0.0, stage: ProcessingStage.decoding))
 
@@ -448,6 +451,9 @@ final class VideoPipeline {
 
         Self.音频诊断结果 = audioWriterInput != nil ? "音视频直写完成" : "无声视频处理完成"
         print("[Bz音频诊断] 全部完成，输出: \(outputURL.lastPathComponent)")
+
+        // 释放内存池
+        bufferPool.reset()
 
         Task { @MainActor in
             progress(1.0, .finished)
@@ -1232,17 +1238,22 @@ final class VideoPipeline {
         let height = CVPixelBufferGetHeight(source)
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
 
-        var resultBuffer: CVPixelBuffer?
-        let attrs = [
-            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
-        ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixelFormat, attrs, &resultBuffer) == kCVReturnSuccess,
-              let result = resultBuffer else {
-            return nil
+        // 优先从内存池获取，池枯竭时降级为临时分配
+        var resultBuffer: CVPixelBuffer? = bufferPool.makeBuffer(width: width, height, pixelFormat)
+        if resultBuffer == nil {
+            let attrs = [
+                kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]
+            ] as CFDictionary
+            guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixelFormat, attrs, &resultBuffer) == kCVReturnSuccess,
+                  let result = resultBuffer else {
+                return nil
+            }
+            resultBuffer = result
         }
+        guard let result = resultBuffer else { return nil }
 
         guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess,
               CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess else {
@@ -1291,17 +1302,22 @@ final class VideoPipeline {
             rowBytes: CVPixelBufferGetBytesPerRow(source)
         )
 
-        var dstPixelBuffer: CVPixelBuffer?
-        let attrs = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
-        ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &dstPixelBuffer) == kCVReturnSuccess,
-              let dst = dstPixelBuffer else {
-            return nil
+        // 优先从内存池获取，池枯竭时降级为临时分配
+        var dstPixelBuffer: CVPixelBuffer? = bufferPool.makeBuffer(width: width, height, kCVPixelFormatType_32BGRA)
+        if dstPixelBuffer == nil {
+            let attrs = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]
+            ] as CFDictionary
+            guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &dstPixelBuffer) == kCVReturnSuccess,
+                  let dst = dstPixelBuffer else {
+                return nil
+            }
+            dstPixelBuffer = dst
         }
+        guard let dst = dstPixelBuffer else { return nil }
 
         guard CVPixelBufferLockBaseAddress(dst, []) == kCVReturnSuccess else {
             return nil
