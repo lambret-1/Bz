@@ -14,14 +14,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
     // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .realESRGAN
-    let inputWidth: Int = 128
-    let inputHeight: Int = 128
+    let inputWidth: Int = 256
+    let inputHeight: Int = 256
     let scaleFactor: Int = 4
 
     // MARK: - 瓦片配置
 
-    private let tileStride = 96
-    private let featherWidth = 32
+    private let tileStride = 192
+    private let featherWidth = 64
 
     // MARK: - 私有属性
 
@@ -41,8 +41,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
 
         let config = MLModelConfiguration()
-        // 默认使用CPU+GPU，避开ANE↔CPU跨芯片搬运（PixelShuffle→depth_to_space回退）
-        config.computeUnits = .cpuAndGPU
+        config.computeUnits = .all
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
             return nil
         }
@@ -50,7 +49,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
         reusableTileBuffer = createTileBuffer(width: inputWidth, height: inputHeight)
 
-        logger.info("RealESRGAN x4v3 引擎初始化成功（computeUnits: cpuAndGPU）")
+        logger.info("RealESRGAN x4v3 256x256引擎初始化成功（computeUnits: all）")
     }
 
     // MARK: - 公开方法
