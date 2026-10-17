@@ -52,6 +52,8 @@ final class AppState: ObservableObject {
     @Published var stage: ProcessingStage = .idle
     /// 预计剩余时间（秒），基于已用时间和进度估算
     @Published var estimatedRemaining: TimeInterval = 0
+    /// 进度轮询定时器（每 0.5s 从 pipeline 读取原子进度，避免高频主线程回调）
+    private var progressTimer: Timer?
 
     // MARK: - 结果
     /// 输出视频 URL，非空时展示结果页
@@ -240,6 +242,22 @@ final class AppState: ObservableObject {
             .appendingPathComponent("output_\(UUID().uuidString).mp4")
         self.outputURL = nil
 
+        // 启动进度轮询定时器（每 0.5s 从 pipeline 读取原子进度，避免高频主线程回调）
+        progressTimer?.invalidate()
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let (value, stage) = self.pipeline.pollProgress()
+            self.progress = value
+            self.stage = stage
+            if self.totalFrames > 0 {
+                self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
+            }
+            if let start = self.processingStartTime, value > 0.01 {
+                let elapsed = Date().timeIntervalSince(start)
+                self.estimatedRemaining = elapsed * (1.0 - value) / value
+            }
+        }
+
         pipeline.process(
             inputURL: video.url,
             outputURL: outputURL,
@@ -247,21 +265,17 @@ final class AppState: ObservableObject {
             fastMode: fastMode,
             outputResolution: outputResolution,
             progress: { [weak self] value, stage in
+                // 进度防抖：循环中不再调用此闭包，仅完成时可能调用 1.0
                 guard let self = self else { return }
                 self.progress = value
                 self.stage = stage
-                // 根据进度计算已处理帧数
-                if self.totalFrames > 0 {
-                    self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
-                }
-                // 基于已用时间和进度估算剩余时间（超分模式进度更新细，降低阈值到 0.1%）
-                if let start = self.processingStartTime, value > 0.001 {
-                    let elapsed = Date().timeIntervalSince(start)
-                    self.estimatedRemaining = elapsed * (1.0 - value) / value
-                }
             },
             completion: { [weak self] result in
                 guard let self = self else { return }
+
+                // 停止进度轮询定时器
+                self.progressTimer?.invalidate()
+                self.progressTimer = nil
 
                 // 停止性能监控
                 self.performanceMonitor.stop()

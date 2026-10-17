@@ -14,6 +14,22 @@ final class VideoPipeline {
     /// 后台处理队列
     private let processingQueue = DispatchQueue(label: "com.lambret.bz.pipeline", qos: .userInitiated)
 
+    /// 原子进度保护（iOS 16+ OSAllocatedUnfairLock，开销仅为 NSLock 的几十分之一）
+    private let progressLock = OSAllocatedUnfairLock(initialState: (value: 0.0, stage: ProcessingStage.decoding))
+
+    /// 轮询当前进度（线程安全，供外部 Timer 每 0.5s 调用一次）
+    func pollProgress() -> (value: Double, stage: ProcessingStage) {
+        progressLock.withLock { ($0.value, $0.stage) }
+    }
+
+    /// 内部更新进度（只写原子变量，不切主线程）
+    private func updateProgress(_ value: Double, stage: ProcessingStage) {
+        progressLock.withLock {
+            $0.value = value
+            $0.stage = stage
+        }
+    }
+
     /// 音频诊断结果（供结果页展示，不依赖Xcode控制台）
     static var 音频诊断结果: String = "未执行"
 
@@ -220,11 +236,6 @@ final class VideoPipeline {
         print("[Bz音频诊断] 输入: \(Int(naturalSize.width))x\(Int(naturalSize.height)), 输出: \(outputWidth)x\(outputHeight), 缩放:\(needsScaling), 快速模式:\(fastMode)")
         print("[Bz音频诊断] 输出: \(outputFPS)fps, 模式:\(mode.displayName)")
 
-        // 临时无声视频文件（第一阶段输出）
-        let tempVideoURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("mp4")
-
         // 删除已存在的输出文件
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try? FileManager.default.removeItem(at: outputURL)
@@ -242,8 +253,20 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // MARK: 配置 Writer（仅视频，音频后续用 AVAssetExportSession 合成）
-        let writer = try AVAssetWriter(outputURL: tempVideoURL, fileType: .mp4)
+        // MARK: 配置音频 Reader（直写模式，不再二次编码）
+        var audioReaderOutput: AVAssetReaderTrackOutput?
+        if let audioTrack = loadedAudioTrack {
+            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+            output.alwaysCopiesSampleData = false
+            if reader.canAdd(output) {
+                reader.add(output)
+                audioReaderOutput = output
+                print("[Bz音频诊断] 音频直写模式：已配置音频 Reader")
+            }
+        }
+
+        // MARK: 配置 Writer（音视频同时写入，消除二次编码）
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
 
         // 按像素数比例动态计算码率，优先使用 HEVC 降低开销
         // 原理：放大分辨率 = 像素数增加 = 需要更高码率承载新增细节
@@ -306,13 +329,46 @@ final class VideoPipeline {
             ]
         )
 
+        // MARK: 配置音频 Writer Input（透传原格式，不重编码）
+        var audioWriterInput: AVAssetWriterInput?
+        if audioReaderOutput != nil {
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+            input.expectsMediaDataInRealTime = false
+            if writer.canAdd(input) {
+                writer.add(input)
+                audioWriterInput = input
+                print("[Bz音频诊断] 音频直写模式：已配置音频 Writer Input")
+            }
+        }
+
         // MARK: 启动读写
         guard reader.startReading() else {
             throw PipelineError.readerStartFailed(reader.error ?? PipelineError.unknown)
         }
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
-        Self.音频诊断结果 = "视频处理中，后续合成音频"
+        Self.音频诊断结果 = audioWriterInput != nil ? "音视频直写中" : "无声视频处理中"
+
+        // MARK: 启动音频直写（独立队列，与视频处理并行）
+        let audioEncodeGroup = DispatchGroup()
+        if let audioInput = audioWriterInput, let audioOutput = audioReaderOutput {
+            audioEncodeGroup.enter()
+            let audioQueue = DispatchQueue(label: "com.lambret.bz.audio.encode", qos: .userInitiated)
+            audioInput.requestMediaDataWhenReady(on: audioQueue) {
+                while audioInput.isReadyForMoreMediaData {
+                    guard let sample = audioOutput.copyNextSampleBuffer() else {
+                        audioInput.markAsFinished()
+                        audioEncodeGroup.leave()
+                        return
+                    }
+                    // PTS 直接透传，音视频同源保持同步
+                    if !audioInput.append(sample) {
+                        print("[Bz音频诊断] 音频 append 失败: \(writer.error?.localizedDescription ?? "未知")")
+                    }
+                }
+            }
+            print("[Bz音频诊断] 音频直写已启动")
+        }
 
         // MARK: 视频处理循环（按模式分发）
         var outputFrameIndex = 0
@@ -369,7 +425,14 @@ final class VideoPipeline {
         videoWriterInput.markAsFinished()
         print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)")
 
-        // MARK: 完成视频写入
+        // 等待音频编码完成（如果有音频）
+        if audioWriterInput != nil {
+            print("[Bz音频诊断] 等待音频编码完成...")
+            audioEncodeGroup.wait()
+            print("[Bz音频诊断] 音频编码完成")
+        }
+
+        // MARK: 完成写入（音视频都已 markAsFinished）
         let semaphore = DispatchSemaphore(value: 0)
         writer.finishWriting {
             semaphore.signal()
@@ -378,31 +441,13 @@ final class VideoPipeline {
 
         guard writer.status == .completed else {
             let error = writer.error ?? PipelineError.writerFailed
-            logger.error("视频编码失败: \(error.localizedDescription, privacy: .public)")
-            try? FileManager.default.removeItem(at: tempVideoURL)
+            logger.error("编码失败: \(error.localizedDescription, privacy: .public)")
+            try? FileManager.default.removeItem(at: outputURL)
             throw error
         }
 
-        // MARK: 第二阶段：用 AVAssetExportSession 合成原视频音频
-        if loadedAudioTrack != nil {
-            Self.音频诊断结果 = "合成音频中..."
-            print("[Bz音频诊断] 开始合成原视频音频")
-            try self.muxAudio(
-                videoURL: tempVideoURL,
-                sourceAsset: asset,
-                outputURL: outputURL
-            )
-            print("[Bz音频诊断] 音频合成完成")
-        } else {
-            // 无音频轨道，直接移动临时文件到输出位置
-            try? FileManager.default.removeItem(at: outputURL)
-            try FileManager.default.moveItem(at: tempVideoURL, to: outputURL)
-            Self.音频诊断结果 = "原视频无音频轨道"
-            print("[Bz音频诊断] 原视频无音频，直接输出无声视频")
-        }
-
-        // 清理临时文件
-        try? FileManager.default.removeItem(at: tempVideoURL)
+        Self.音频诊断结果 = audioWriterInput != nil ? "音视频直写完成" : "无声视频处理完成"
+        print("[Bz音频诊断] 全部完成，输出: \(outputURL.lastPathComponent)")
 
         Task { @MainActor in
             progress(1.0, .finished)
@@ -460,9 +505,8 @@ final class VideoPipeline {
             if progressValue - lastProgressReport >= 0.01 {
                 lastProgressReport = progressValue
                 let stage: ProcessingStage = interpolator != nil ? .inferring : .decoding
-                Task { @MainActor in
-                    progress(progressValue, stage)
-                }
+                // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI，避免高频主线程回调
+                updateProgress(progressValue, stage)
             }
 
             autoreleasepool {
@@ -565,12 +609,11 @@ final class VideoPipeline {
 
             // 进度计算（超分模式一进一出，inputFrameIndex == outputFrameIndex）
             let progressValue = min(Double(inputFrameIndex) / Double(totalInputFrames), 0.99)
-            if progressValue - lastProgressReport >= 0.001 {
+            if progressValue - lastProgressReport >= 0.01 {
                 lastProgressReport = progressValue
                 let stage: ProcessingStage = usingAI ? .superResolving : .decoding
-                Task { @MainActor in
-                    progress(progressValue, stage)
-                }
+                // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
+                updateProgress(progressValue, stage)
             }
 
             autoreleasepool {
@@ -703,12 +746,11 @@ final class VideoPipeline {
 
                 // 进度计算
                 let progressValue = min(Double(localFrameIndex) / Double(totalInputFrames), 0.99)
-                if progressValue - localProgress >= 0.005 {
+                if progressValue - localProgress >= 0.01 {
                     localProgress = progressValue
                     let stage: ProcessingStage = usingAI ? .superResolving : .decoding
-                    Task { @MainActor in
-                        progress(progressValue, stage)
-                    }
+                    // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
+                    updateProgress(progressValue, stage)
                 }
 
                 autoreleasepool {
@@ -938,9 +980,8 @@ final class VideoPipeline {
                 if progressValue - localProgress >= 0.01 {
                     localProgress = progressValue
                     let stage: ProcessingStage = self.interpolator != nil ? .inferring : .decoding
-                    Task { @MainActor in
-                        progress(progressValue, stage)
-                    }
+                    // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
+                    updateProgress(progressValue, stage)
                 }
 
                 autoreleasepool {
