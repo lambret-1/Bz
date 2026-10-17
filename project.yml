@@ -12,6 +12,8 @@ settings:
     CODE_SIGN_STYLE: Manual
     CODE_SIGNING_REQUIRED: NO
     CODE_SIGNING_ALLOWED: NO
+    DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+    GCC_GENERATE_DEBUGGING_SYMBOLS: YES
 
 targets:
   FrameInterpolation:

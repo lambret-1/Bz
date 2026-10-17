@@ -94,27 +94,47 @@ jobs:
             echo "UUID 匹配成功"
           fi
 
+      - name: 验证 dSYM 调试信息
+        run: |
+          echo "=== dSYM 调试信息验证 ==="
+          # 检查 DWARF 文件是否包含行号信息
+          dwarfdump --debug-line "$DWARF_PATH" 2>/dev/null | head -5
+          LINE_COUNT=$(dwarfdump --debug-line "$DWARF_PATH" 2>/dev/null | wc -l)
+          echo "行号信息条目数: $LINE_COUNT"
+          if [ "$LINE_COUNT" -gt 10 ]; then
+            echo "✓ dSYM 包含完整行号信息，atos 可解析到具体代码行"
+          else
+            echo "⚠ dSYM 行号信息不足，可能只能解析到函数名"
+          fi
+
       - name: 使用 atos 符号化
         run: |
           # 提取崩溃地址（以 0x 开头的行）
-          ADDRESSES=$(grep "^0x" parse_output.txt | awk '{print $1}' | tr '\n' ' ')
+          mapfile -t ADDRESS_ARRAY < <(grep "^0x" parse_output.txt | awk '{print $1}')
 
-          if [ -z "$ADDRESSES" ]; then
+          if [ ${#ADDRESS_ARRAY[@]} -eq 0 ]; then
             echo "错误: 未提取到崩溃地址"
             cat parse_output.txt
             exit 1
           fi
 
-          echo "崩溃地址数量: $(echo $ADDRESSES | wc -w)"
+          echo "崩溃地址数量: ${#ADDRESS_ARRAY[@]}"
           echo "基地址: $LOAD_ADDRESS"
+          echo ""
 
           # 使用 atos 批量符号化
-          # -arch arm64 指定架构，-l 指定加载基地址，-o 指定 DWARF 文件
-          xcrun atos -arch arm64 -l "$LOAD_ADDRESS" -o "$DWARF_PATH" $ADDRESSES > symbolicated.txt 2>&1 || true
+          xcrun atos -arch arm64 -l "$LOAD_ADDRESS" -o "$DWARF_PATH" "${ADDRESS_ARRAY[@]}" > symbolicated_raw.txt 2>&1 || true
 
-          echo ""
-          echo "=== 符号化结果 ==="
-          cat symbolicated.txt
+          # 将原始地址与符号化结果对应输出
+          echo "=== 符号化结果（地址 → 符号） ===" > symbolicated.txt
+          idx=0
+          while IFS= read -r line; do
+            if [ $idx -lt ${#ADDRESS_ARRAY[@]} ]; then
+              echo "${ADDRESS_ARRAY[$idx]}  →  $line" >> symbolicated.txt
+              echo "${ADDRESS_ARRAY[$idx]}  →  $line"
+            fi
+            idx=$((idx + 1))
+          done < symbolicated_raw.txt
 
       - name: 生成符号化报告
         run: |
@@ -129,15 +149,15 @@ jobs:
             echo "- **加载基地址**: $LOAD_ADDRESS"
             echo "- **应用名称**: $APP_NAME"
             echo ""
-            echo "## 原始崩溃地址"
-            echo '```text'
-            grep "^0x" parse_output.txt
-            echo '```'
-            echo ""
-            echo "## 符号化结果"
+            echo "## 符号化结果（地址 → 代码位置）"
             echo '```text'
             cat symbolicated.txt
             echo '```'
+            echo ""
+            echo "## 说明"
+            echo "- 格式: \`内存地址 → 函数名 (模块) (文件名:行号)\`"
+            echo "- 若只显示函数名无行号，说明 dSYM 调试信息不完整"
+            echo "- 崩溃栈顶第一帧通常是直接触发崩溃的代码位置"
           } >> $GITHUB_STEP_SUMMARY
 
       - name: 上传符号化结果
