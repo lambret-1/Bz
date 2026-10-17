@@ -215,35 +215,35 @@ struct AppSettingsView: View {
 
 struct CrashLogListView: View {
     @Binding var crashLogs: [CrashLog]
-    @State private var exportURL: URL?
 
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
-        f.dateFormat = "MM-dd HH:mm:ss"
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return f
     }()
 
     var body: some View {
         List {
             if crashLogs.isEmpty {
-                Section {
-                    VStack(spacing: 12) {
-                        Image(systemName: "checkmark.circle")
-                            .font(.system(size: 48))
-                            .foregroundColor(.green)
-                        Text("暂无崩溃日志")
-                            .font(.headline)
-                        Text("应用运行稳定，未捕获到崩溃")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
+                Text("暂无崩溃日志")
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 40)
-                }
             } else {
                 ForEach(crashLogs) { log in
                     NavigationLink(value: log) {
-                        crashLogRow(log: log)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(log.crashType)
+                                .font(.subheadline.weight(.medium))
+                            Text(log.crashReason)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                            Text(dateFormatter.string(from: log.timestamp))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.vertical, 4)
                     }
                 }
                 .onDelete(perform: deleteCrashLog)
@@ -257,25 +257,11 @@ struct CrashLogListView: View {
         .toolbar {
             if !crashLogs.isEmpty {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Menu {
-                        if let url = exportURL {
-                            ShareLink(item: url) {
-                                Label("导出全部", systemImage: "square.and.arrow.up")
-                            }
-                        } else {
-                            Button {
-                                exportURL = CrashLogger.shared.exportAllLogs()
-                            } label: {
-                                Label("导出全部", systemImage: "square.and.arrow.up")
-                            }
-                        }
-                        Button(role: .destructive) {
-                            clearAllLogs()
-                        } label: {
-                            Label("清除全部", systemImage: "trash")
-                        }
+                    Button(role: .destructive) {
+                        clearAllLogs()
                     } label: {
-                        Image(systemName: "ellipsis.circle")
+                        Text("清除")
+                            .foregroundColor(.red)
                     }
                 }
             }
@@ -285,32 +271,9 @@ struct CrashLogListView: View {
         }
     }
 
-    private func crashLogRow(log: CrashLog) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
-                .font(.title3)
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(log.crashType)
-                    .font(.subheadline.weight(.medium))
-                Text(log.crashReason)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                Text(dateFormatter.string(from: log.timestamp))
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-            Spacer()
-        }
-        .padding(.vertical, 4)
-    }
-
     private func deleteCrashLog(at offsets: IndexSet) {
         for index in offsets {
-            let log = crashLogs[index]
-            CrashLogger.shared.deleteLog(log)
+            CrashLogger.shared.deleteLog(crashLogs[index])
         }
         crashLogs = CrashLogger.shared.loadAllLogs()
     }
@@ -321,144 +284,26 @@ struct CrashLogListView: View {
     }
 }
 
-// MARK: - 崩溃日志详情页
+// MARK: - 崩溃日志详情页（纯文本展示）
 
 struct CrashLogDetailView: View {
     let crashLog: CrashLog
-    @Environment(\.dismiss) private var dismiss
-    @State private var exportURL: URL?
-
-    private let dateFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return f
-    }()
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                // 摘要卡片
-                summaryCard
-
-                // 设备信息
-                infoSection(title: "设备信息", items: [
-                    ("设备型号", crashLog.deviceModel),
-                    ("系统版本", crashLog.systemVersion),
-                    ("设备名称", crashLog.deviceName),
-                    ("屏幕尺寸", crashLog.screenSize),
-                    ("屏幕缩放", crashLog.screenScale)
-                ])
-
-                // 应用信息
-                infoSection(title: "应用信息", items: [
-                    ("应用名称", crashLog.appName),
-                    ("应用版本", crashLog.appVersion),
-                    ("构建版本", crashLog.buildVersion),
-                    ("Bundle ID", crashLog.bundleID)
-                ])
-
-                // 调用栈
-                callStackSection
-            }
-            .padding()
+            Text(crashLog.formattedReport)
+                .font(.system(.caption, design: .monospaced))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
         }
         .navigationTitle("崩溃详情")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                if let url = exportURL {
-                    ShareLink(item: url) {
-                        Image(systemName: "square.and.arrow.up")
-                    }
-                } else {
-                    Button {
-                        exportLog()
-                    } label: {
-                        Image(systemName: "square.and.arrow.up")
-                    }
+                ShareLink(item: crashLog.formattedReport) {
+                    Image(systemName: "square.and.arrow.up")
                 }
             }
-        }
-        .onAppear {
-            // 预生成导出文件，确保分享时立即可用
-            exportLog()
-        }
-    }
-
-    private var summaryCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundColor(.orange)
-                Text(crashLog.crashType)
-                    .font(.headline)
-            }
-            Text(crashLog.crashReason)
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-            Text("崩溃时间: \(dateFormatter.string(from: crashLog.timestamp))")
-                .font(.caption)
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(Color.orange.opacity(0.1))
-        .cornerRadius(12)
-    }
-
-    private func infoSection(title: String, items: [(String, String)]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.headline)
-            ForEach(items, id: \.0) { key, value in
-                HStack(alignment: .top) {
-                    Text(key)
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                        .frame(width: 80, alignment: .leading)
-                    Text(value)
-                        .font(.subheadline)
-                        .lineLimit(2)
-                    Spacer()
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(12)
-    }
-
-    private var callStackSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("调用栈")
-                .font(.headline)
-            // 使用 Text 直接展示，避免嵌套 ScrollView 导致空白
-            VStack(alignment: .leading, spacing: 2) {
-                ForEach(Array(crashLog.callStack.enumerated()), id: \.offset) { index, frame in
-                    Text("\(index)  \(frame)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .multilineTextAlignment(.leading)
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding()
-        .background(Color(.secondarySystemBackground))
-        .cornerRadius(12)
-    }
-
-    private func exportLog() {
-        guard exportURL == nil else { return }
-        let text = crashLog.formattedReport
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("crash_\(Int(crashLog.timestamp.timeIntervalSince1970)).txt")
-        do {
-            try text.write(to: tempURL, atomically: true, encoding: .utf8)
-            exportURL = tempURL
-        } catch {
-            // 导出失败静默处理
         }
     }
 }
