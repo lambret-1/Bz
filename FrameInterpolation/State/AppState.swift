@@ -346,6 +346,12 @@ final class AppState: ObservableObject {
                     )
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
+                    // 处理完成发本地通知（用户切后台时能收到）
+                    self.sendBackgroundNotification(
+                        title: "处理完成",
+                        body: "视频已处理完成，点击查看结果",
+                        identifier: "bz_process_complete"
+                    )
                     // 记录本机实测处理速度系数（视频时长/实际耗时）
                     if let start = self.processingStartTime,
                        let videoDuration = self.selectedVideo?.duration,
