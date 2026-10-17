@@ -726,6 +726,12 @@ final class VideoPipeline {
             progress(0.0, usingAI ? .superResolving : .decoding)
         }
 
+        // 启动诊断日志会话
+        DiagnosticLogger.shared.startSession()
+        DiagnosticLogger.shared.writeLine("模式: \(usingAI ? engineType.displayName : "vImage缩放")")
+        DiagnosticLogger.shared.writeLine("输入: \(totalInputFrames)帧, 输出: \(outputWidth)x\(outputHeight)")
+        DiagnosticLogger.shared.writeLine("----------------------------------------")
+
         // MARK: 黄金三队列流水线
         // Reader（只读不拷）→ Inference（深拷贝+ANE+缩放）→ Encode
         // 队列容量：Reader→Inference(6)、Inference→Encode(10)
@@ -867,9 +873,11 @@ final class VideoPipeline {
                     }
                     let t5 = CACurrentMediaTime()
 
-                    // 诊断日志（每10帧打印一次）
+                    // 诊断日志（每10帧打印一次，同时写入文件）
                     if frameIndex % 10 == 0 {
-                        self.logger.info("帧\(frameIndex) 等待出队:\(String(format: "%.3f", t1-t0))s 深拷:\(String(format: "%.3f", t2-t1))s 推理:\(String(format: "%.3f", t3-t2))s 缩放:\(String(format: "%.3f", t4-t3))s 入队:\(String(format: "%.3f", t5-t4))s")
+                        let logLine = "帧\(frameIndex) 等待出队:\(String(format: "%.3f", t1-t0))s 深拷:\(String(format: "%.3f", t2-t1))s 推理:\(String(format: "%.3f", t3-t2))s 缩放:\(String(format: "%.3f", t4-t3))s 入队:\(String(format: "%.3f", t5-t4))s"
+                        self.logger.info("\(logLine)")
+                        DiagnosticLogger.shared.writeLine(logLine)
                     }
                     frameIndex += 1
                 }
@@ -966,6 +974,11 @@ final class VideoPipeline {
         let finalFrameCount = inferenceToEncode.totalEnqueued
         outputFrameIndex = finalFrameCount
         logger.info("黄金三队列超分管线完成，输出帧数: \(finalFrameCount)")
+
+        // 结束诊断日志会话
+        DiagnosticLogger.shared.writeLine("----------------------------------------")
+        DiagnosticLogger.shared.writeLine("输出帧数: \(finalFrameCount)")
+        DiagnosticLogger.shared.endSession()
     }
 
     // MARK: - 异步补帧管线（解码+推理与编码并发）
