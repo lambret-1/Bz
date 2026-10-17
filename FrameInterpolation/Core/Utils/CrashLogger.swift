@@ -4,7 +4,7 @@ import UIKit
 // MARK: - 崩溃日志模型
 
 /// 单条崩溃日志记录
-struct CrashLog: Identifiable, Codable {
+struct CrashLog: Identifiable, Codable, Hashable {
     let id: UUID
     let timestamp: Date
     let crashType: String

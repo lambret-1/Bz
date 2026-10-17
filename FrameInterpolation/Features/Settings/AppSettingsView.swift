@@ -17,10 +17,6 @@ struct AppSettingsView: View {
 
     // 崩溃日志
     @State private var crashLogs: [CrashLog] = []
-    @State private var showingCrashDetail = false
-    @State private var selectedCrashLog: CrashLog?
-    @State private var showingExportSheet = false
-    @State private var exportedFileURL: URL?
     @State private var cacheSize = "计算中..."
 
     var body: some View {
@@ -67,11 +63,7 @@ struct AppSettingsView: View {
                 // MARK: 崩溃日志
                 Section {
                     NavigationLink {
-                        CrashLogListView(
-                            crashLogs: $crashLogs,
-                            showingCrashDetail: $showingCrashDetail,
-                            selectedCrashLog: $selectedCrashLog
-                        )
+                        CrashLogListView(crashLogs: $crashLogs)
                     } label: {
                         HStack {
                             Image(systemName: "exclamationmark.triangle")
@@ -132,16 +124,6 @@ struct AppSettingsView: View {
             .onAppear {
                 loadCrashLogs()
                 calculateCacheSize()
-            }
-            .sheet(isPresented: $showingExportSheet) {
-                if let url = exportedFileURL {
-                    ShareSheet(activityItems: [url])
-                }
-            }
-            .sheet(isPresented: $showingCrashDetail) {
-                if let log = selectedCrashLog {
-                    CrashLogDetailView(crashLog: log)
-                }
             }
         }
     }
@@ -233,10 +215,13 @@ struct AppSettingsView: View {
 
 struct CrashLogListView: View {
     @Binding var crashLogs: [CrashLog]
-    @Binding var showingCrashDetail: Bool
-    @Binding var selectedCrashLog: CrashLog?
-    @State private var showingExportSheet = false
-    @State private var exportedFileURL: URL?
+    @State private var exportURL: URL?
+
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MM-dd HH:mm:ss"
+        return f
+    }()
 
     var body: some View {
         List {
@@ -257,10 +242,7 @@ struct CrashLogListView: View {
                 }
             } else {
                 ForEach(crashLogs) { log in
-                    Button {
-                        selectedCrashLog = log
-                        showingCrashDetail = true
-                    } label: {
+                    NavigationLink(value: log) {
                         crashLogRow(log: log)
                     }
                 }
@@ -269,14 +251,23 @@ struct CrashLogListView: View {
         }
         .navigationTitle("崩溃日志")
         .navigationBarTitleDisplayMode(.inline)
+        .navigationDestination(for: CrashLog.self) { log in
+            CrashLogDetailView(crashLog: log)
+        }
         .toolbar {
             if !crashLogs.isEmpty {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Menu {
-                        Button {
-                            exportAllLogs()
-                        } label: {
-                            Label("导出全部", systemImage: "square.and.arrow.up")
+                        if let url = exportURL {
+                            ShareLink(item: url) {
+                                Label("导出全部", systemImage: "square.and.arrow.up")
+                            }
+                        } else {
+                            Button {
+                                exportURL = CrashLogger.shared.exportAllLogs()
+                            } label: {
+                                Label("导出全部", systemImage: "square.and.arrow.up")
+                            }
                         }
                         Button(role: .destructive) {
                             clearAllLogs()
@@ -289,21 +280,13 @@ struct CrashLogListView: View {
                 }
             }
         }
-        .sheet(isPresented: $showingExportSheet) {
-            if let url = exportedFileURL {
-                ShareSheet(activityItems: [url])
-            }
-        }
         .onAppear {
             crashLogs = CrashLogger.shared.loadAllLogs()
         }
     }
 
     private func crashLogRow(log: CrashLog) -> some View {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "MM-dd HH:mm:ss"
-
-        return HStack(spacing: 12) {
+        HStack(spacing: 12) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundColor(.orange)
                 .font(.title3)
@@ -320,9 +303,6 @@ struct CrashLogListView: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
-            Image(systemName: "chevron.right")
-                .foregroundColor(.secondary)
-                .font(.caption)
         }
         .padding(.vertical, 4)
     }
@@ -339,13 +319,6 @@ struct CrashLogListView: View {
         CrashLogger.shared.clearAllLogs()
         crashLogs = []
     }
-
-    private func exportAllLogs() {
-        if let url = CrashLogger.shared.exportAllLogs() {
-            exportedFileURL = url
-            showingExportSheet = true
-        }
-    }
 }
 
 // MARK: - 崩溃日志详情页
@@ -353,47 +326,51 @@ struct CrashLogListView: View {
 struct CrashLogDetailView: View {
     let crashLog: CrashLog
     @Environment(\.dismiss) private var dismiss
-    @State private var showingExportSheet = false
-    @State private var exportedFileURL: URL?
+    @State private var exportURL: URL?
+
+    private let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f
+    }()
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    // 摘要卡片
-                    summaryCard
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // 摘要卡片
+                summaryCard
 
-                    // 设备信息
-                    infoSection(title: "设备信息", items: [
-                        ("设备型号", crashLog.deviceModel),
-                        ("系统版本", crashLog.systemVersion),
-                        ("设备名称", crashLog.deviceName),
-                        ("屏幕尺寸", crashLog.screenSize),
-                        ("屏幕缩放", crashLog.screenScale)
-                    ])
+                // 设备信息
+                infoSection(title: "设备信息", items: [
+                    ("设备型号", crashLog.deviceModel),
+                    ("系统版本", crashLog.systemVersion),
+                    ("设备名称", crashLog.deviceName),
+                    ("屏幕尺寸", crashLog.screenSize),
+                    ("屏幕缩放", crashLog.screenScale)
+                ])
 
-                    // 应用信息
-                    infoSection(title: "应用信息", items: [
-                        ("应用名称", crashLog.appName),
-                        ("应用版本", crashLog.appVersion),
-                        ("构建版本", crashLog.buildVersion),
-                        ("Bundle ID", crashLog.bundleID)
-                    ])
+                // 应用信息
+                infoSection(title: "应用信息", items: [
+                    ("应用名称", crashLog.appName),
+                    ("应用版本", crashLog.appVersion),
+                    ("构建版本", crashLog.buildVersion),
+                    ("Bundle ID", crashLog.bundleID)
+                ])
 
-                    // 调用栈
-                    callStackSection
-                }
-                .padding()
+                // 调用栈
+                callStackSection
             }
-            .navigationTitle("崩溃详情")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("关闭") {
-                        dismiss()
+            .padding()
+        }
+        .navigationTitle("崩溃详情")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .navigationBarTrailing) {
+                if let url = exportURL {
+                    ShareLink(item: url) {
+                        Image(systemName: "square.and.arrow.up")
                     }
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
+                } else {
                     Button {
                         exportLog()
                     } label: {
@@ -401,19 +378,15 @@ struct CrashLogDetailView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showingExportSheet) {
-                if let url = exportedFileURL {
-                    ShareSheet(activityItems: [url])
-                }
-            }
+        }
+        .onAppear {
+            // 预生成导出文件，确保分享时立即可用
+            exportLog()
         }
     }
 
     private var summaryCard: some View {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
-
-        return VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundColor(.orange)
@@ -460,13 +433,13 @@ struct CrashLogDetailView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("调用栈")
                 .font(.headline)
-            ScrollView(.horizontal, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(Array(crashLog.callStack.enumerated()), id: \.offset) { index, frame in
-                        Text("\(index)\t\(frame)")
-                            .font(.system(.caption, design: .monospaced))
-                            .lineLimit(1)
-                    }
+            // 使用 Text 直接展示，避免嵌套 ScrollView 导致空白
+            VStack(alignment: .leading, spacing: 2) {
+                ForEach(Array(crashLog.callStack.enumerated()), id: \.offset) { index, frame in
+                    Text("\(index)  \(frame)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .multilineTextAlignment(.leading)
                 }
             }
         }
@@ -477,27 +450,15 @@ struct CrashLogDetailView: View {
     }
 
     private func exportLog() {
+        guard exportURL == nil else { return }
         let text = crashLog.formattedReport
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("crash_\(Int(crashLog.timestamp.timeIntervalSince1970)).txt")
         do {
             try text.write(to: tempURL, atomically: true, encoding: .utf8)
-            exportedFileURL = tempURL
-            showingExportSheet = true
+            exportURL = tempURL
         } catch {
-            // 导出失败
+            // 导出失败静默处理
         }
     }
-}
-
-// MARK: - 分享 Sheet 封装
-
-struct ShareSheet: UIViewControllerRepresentable {
-    let activityItems: [Any]
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
-    }
-
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
