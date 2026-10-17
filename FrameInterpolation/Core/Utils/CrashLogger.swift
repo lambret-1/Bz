@@ -105,14 +105,14 @@ final class CrashLogger {
             SIGTRAP  // 5  陷阱（Swift 运行时崩溃）
         ]
 
-        for signal in signals {
-            signal(signal) { sig in
+        for sigNum in signals {
+            signal(sigNum) { sig in
                 CrashLogger.shared.handleSignal(sig)
             }
         }
     }
 
-    private func handleSignal(_ signal: Int32) {
+    private func handleSignal(_ sigNum: Int32) {
         let signalNames: [Int32: String] = [
             SIGABRT: "SIGABRT",
             SIGBUS: "SIGBUS",
@@ -121,14 +121,14 @@ final class CrashLogger {
             SIGSEGV: "SIGSEGV",
             SIGTRAP: "SIGTRAP"
         ]
-        let signalName = signalNames[signal] ?? "Signal \(signal)"
-        let reason = "Signal \(signal) (\(signalName))"
+        let signalName = signalNames[sigNum] ?? "Signal \(sigNum)"
+        let reason = "Signal \(sigNum) (\(signalName))"
 
         saveCrashLog(type: "Signal", reason: reason)
 
         // 重新抛出信号，让系统生成标准崩溃报告
-        signal(signal, SIG_DFL)
-        raise(signal)
+        signal(sigNum, SIG_DFL)
+        raise(sigNum)
     }
 
     // MARK: - NSException 处理
