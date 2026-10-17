@@ -231,7 +231,9 @@ struct CrashLogListView: View {
                     .padding(.vertical, 40)
             } else {
                 ForEach(crashLogs) { log in
-                    NavigationLink(value: log) {
+                    NavigationLink {
+                        CrashLogDetailView(crashLog: log)
+                    } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(log.crashType)
                                 .font(.subheadline.weight(.medium))
@@ -251,9 +253,6 @@ struct CrashLogListView: View {
         }
         .navigationTitle("崩溃日志")
         .navigationBarTitleDisplayMode(.inline)
-        .navigationDestination(for: CrashLog.self) { log in
-            CrashLogDetailView(crashLog: log)
-        }
         .toolbar {
             if !crashLogs.isEmpty {
                 ToolbarItem(placement: .navigationBarTrailing) {
