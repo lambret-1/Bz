@@ -37,6 +37,10 @@ final class FastSRGANEngine: SuperResolutionEngine {
     /// 取消标志
     private var isCancelledFlag = false
 
+    /// 复用的输入 MLMultiArray（避免每瓦片新建，减少内存分配）
+    /// 同步 prediction 返回后可安全复用，CoreML 不再引用输入
+    private var reusableInputArray: MLMultiArray?
+
     // MARK: - 初始化
 
     init?() {
@@ -98,7 +102,12 @@ final class FastSRGANEngine: SuperResolutionEngine {
         let rows = max((srcHeight - inputHeight + tileStride - 1) / tileStride + 1, 1)
         let outputTileSize = inputWidth * scaleFactor
 
-        // 3. 逐瓦片推理并累加
+        // 3. 逐瓦片推理并累加（复用输入MLMultiArray，避免每瓦片新建）
+        guard let inputArray = getReusableInputArray() else {
+            logger.error("创建复用输入数组失败")
+            return nil
+        }
+
         for row in 0..<rows {
             for col in 0..<cols {
                 if isCancelledFlag { return nil }
@@ -106,14 +115,14 @@ final class FastSRGANEngine: SuperResolutionEngine {
                 let srcX = min(col * tileStride, max(srcWidth - inputWidth, 0))
                 let srcY = min(row * tileStride, max(srcHeight - inputHeight, 0))
 
-                // 提取瓦片（128x128）并转为 MLMultiArray
-                guard let tileArray = makeTileArray(from: pixelBuffer, x: srcX, y: srcY) else {
-                    logger.error("瓦片提取失败 (\(col),\(row))")
+                // 填充瓦片数据到复用数组
+                guard fillTileArray(inputArray, from: pixelBuffer, x: srcX, y: srcY) else {
+                    logger.error("瓦片填充失败 (\(col),\(row))")
                     continue
                 }
 
                 // 推理瓦片
-                guard let outputArray = processTile(tileArray) else {
+                guard let outputArray = processTile(inputArray) else {
                     logger.error("瓦片推理失败 (\(col),\(row))")
                     continue
                 }
@@ -160,16 +169,25 @@ final class FastSRGANEngine: SuperResolutionEngine {
 
     // MARK: - 瓦片提取与预处理（BGRA → NCHW MLMultiArray）
 
-    private func makeTileArray(from source: CVPixelBuffer, x: Int, y: Int) -> MLMultiArray? {
+    /// 获取复用的输入数组（不存在则创建）
+    private func getReusableInputArray() -> MLMultiArray? {
+        if let array = reusableInputArray {
+            return array
+        }
         let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
         guard let array = try? MLMultiArray(shape: shape, dataType: inputDataType) else {
             return nil
         }
+        reusableInputArray = array
+        return array
+    }
 
+    /// 填充瓦片数据到复用的 MLMultiArray（避免每瓦片新建数组）
+    private func fillTileArray(_ array: MLMultiArray, from source: CVPixelBuffer, x: Int, y: Int) -> Bool {
         CVPixelBufferLockBaseAddress(source, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
 
-        guard let srcBase = CVPixelBufferGetBaseAddress(source) else { return nil }
+        guard let srcBase = CVPixelBufferGetBaseAddress(source) else { return false }
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
         let src = srcBase.assumingMemoryBound(to: UInt8.self)
 
@@ -201,10 +219,10 @@ final class FastSRGANEngine: SuperResolutionEngine {
             }
         default:
             logger.error("不支持的输入数据类型: \(self.inputDataType.rawValue)")
-            return nil
+            return false
         }
 
-        return array
+        return true
     }
 
     // MARK: - 单瓦片推理
