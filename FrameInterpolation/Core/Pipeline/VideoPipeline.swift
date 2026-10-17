@@ -340,7 +340,7 @@ final class VideoPipeline {
         var audioWriterInput: AVAssetWriterInput?
         if audioReaderOutput != nil {
             // 从音频轨道获取声道数和采样率，用于 AAC 编码配置
-            let audioFormatDesc = loadedAudioTrack?.formatDescriptions.first as? CMFormatDescription
+            let audioFormatDesc = loadedAudioTrack?.formatDescriptions.first.map { $0 as! CMFormatDescription }
             let audioChannels = audioFormatDesc.flatMap { desc -> Int? in
                 let basicDesc = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
                 return Int(basicDesc?.pointee.mChannelsPerFrame ?? 2)
