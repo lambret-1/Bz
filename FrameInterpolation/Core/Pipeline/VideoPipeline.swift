@@ -816,20 +816,24 @@ final class VideoPipeline {
                 inferenceGroup.leave()
             }
 
+            var frameIndex = 0
             while true {
                 if self.isCancelled {
                     setError(PipelineError.cancelled)
                     return
                 }
 
+                let t0 = CACurrentMediaTime()
                 // 从Reader队列取原始帧
                 guard let frame = readerToInference.dequeue() else {
                     break
                 }
+                let t1 = CACurrentMediaTime()
 
                 autoreleasepool {
                     // 1. 深拷贝（reader的buffer生命周期由reader管理，必须拷贝）
                     guard let copiedFrame = self.deepCopyPixelBuffer(frame.pixelBuffer) else { return }
+                    let t2 = CACurrentMediaTime()
 
                     // 2. ANE推理
                     let aiFrame: CVPixelBuffer
@@ -841,6 +845,7 @@ final class VideoPipeline {
                     } else {
                         aiFrame = copiedFrame
                     }
+                    let t3 = CACurrentMediaTime()
 
                     // 3. vImage统一缩放到最终输出尺寸（一步到位）
                     var finalFrame = aiFrame
@@ -851,6 +856,7 @@ final class VideoPipeline {
                             finalFrame = scaled
                         }
                     }
+                    let t4 = CACurrentMediaTime()
 
                     // 4. 复制颜色空间附件
                     self.copyColorSpaceAttachments(from: frame.pixelBuffer, to: finalFrame)
@@ -859,6 +865,13 @@ final class VideoPipeline {
                     if !inferenceToEncode.enqueue(ProcessedFrame(pixelBuffer: finalFrame, presentationTime: frame.presentationTime)) {
                         return
                     }
+                    let t5 = CACurrentMediaTime()
+
+                    // 诊断日志（每10帧打印一次）
+                    if frameIndex % 10 == 0 {
+                        self.logger.info("帧\(frameIndex) 等待出队:\(String(format: "%.3f", t1-t0))s 深拷:\(String(format: "%.3f", t2-t1))s 推理:\(String(format: "%.3f", t3-t2))s 缩放:\(String(format: "%.3f", t4-t3))s 入队:\(String(format: "%.3f", t5-t4))s")
+                    }
+                    frameIndex += 1
                 }
             }
         }

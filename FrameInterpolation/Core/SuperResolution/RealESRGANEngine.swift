@@ -228,10 +228,10 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let srcOffset = ty * srcBytesPerRow + tx * 4
                 let outIdx = outY * outputWidth + outX
 
-                // BGRA → RGB
-                accumR[outIdx] += Float(src[srcOffset + 2]) * weight
-                accumG[outIdx] += Float(src[srcOffset + 1]) * weight
-                accumB[outIdx] += Float(src[srcOffset + 0]) * weight
+                // BGRA → RGB，模型输出已是[0,255]，需除以255归一化到[0,1]再累加
+                accumR[outIdx] += Float(src[srcOffset + 2]) / 255.0 * weight
+                accumG[outIdx] += Float(src[srcOffset + 1]) / 255.0 * weight
+                accumB[outIdx] += Float(src[srcOffset + 0]) / 255.0 * weight
                 accumW[outIdx] += weight
             }
         }
