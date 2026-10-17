@@ -32,8 +32,8 @@ from esrgan_model.srvgg_net import SRVGGNetCompact
 # ==================== 配置 ====================
 # 模型权重下载地址
 MODEL_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
-# 固定输入瓦片尺寸（x4v3 轻量版使用 128×128 瓦片）
-INPUT_SIZE = 128
+# 固定输入瓦片尺寸（256×256，减少瓦片数量从18到6）
+INPUT_SIZE = 256
 # 输出路径
 OUTPUT_PACKAGE = os.path.join(SCRIPT_DIR, "real_esrgan_x4v3.mlpackage")
 
@@ -126,8 +126,8 @@ def convert_to_coreml(model: SRVGGNetCompact) -> ct.models.MLModel:
 
     # 设置模型元数据
     mlmodel.short_description = "Real-ESRGAN General-x4v3 轻量版 4x 超分模型（ImageType零拷贝）"
-    mlmodel.input_description["input"] = "输入图像 128x128，BGRA CVPixelBuffer，自动归一化[0,1]"
-    mlmodel.output_description["output"] = "超分输出图像 512x512，BGRA CVPixelBuffer"
+    mlmodel.input_description["input"] = "输入图像 256x256，BGRA CVPixelBuffer，自动归一化[0,1]"
+    mlmodel.output_description["output"] = "超分输出图像 1024x1024，BGRA CVPixelBuffer"
 
     print("✅ Core ML 转换完成")
     return mlmodel
