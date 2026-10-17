@@ -1,0 +1,150 @@
+name: Auto Symbolicate iOS .ips
+
+on:
+  push:
+    paths:
+      - 'crash_logs/*.ips'
+  workflow_dispatch:
+    inputs:
+      ips_file:
+        description: '崩溃日志文件名（位于 crash_logs/ 目录）'
+        required: false
+        default: ''
+
+jobs:
+  analyze:
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 查找 .ips 文件
+        id: find_ips
+        run: |
+          if [ -n "${{ github.event.inputs.ips_file }}" ]; then
+            IPS_FILE="crash_logs/${{ github.event.inputs.ips_file }}"
+          else
+            IPS_FILE=$(find crash_logs -name "*.ips" -type f | head -n 1)
+          fi
+          if [ -z "$IPS_FILE" ] || [ ! -f "$IPS_FILE" ]; then
+            echo "错误: 未找到 .ips 文件"
+            exit 1
+          fi
+          echo "ips_file=$IPS_FILE" >> $GITHUB_OUTPUT
+          echo "正在解析: $IPS_FILE"
+
+      - name: 解析 .ips 提取关键信息
+        id: parse
+        run: |
+          IPS_FILE="${{ steps.find_ips.outputs.ips_file }}"
+          python3 parse_ips.py "$IPS_FILE" > parse_output.txt
+          cat parse_output.txt
+
+          # 提取关键信息到环境变量
+          while IFS='=' read -r key value; do
+            case "$key" in
+              VERSION|BUILD|UUID|LOAD_ADDRESS|APP_NAME)
+                echo "$key=$value" >> $GITHUB_ENV
+                ;;
+            esac
+          done < parse_output.txt
+
+          # 检查是否提取成功
+          if [ -z "$VERSION" ] || [ -z "$UUID" ]; then
+            echo "错误: 未能从 .ips 中提取版本或 UUID"
+            cat parse_output.txt
+            exit 1
+          fi
+
+      - name: 下载对应版本 dSYM
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: ios-build.yml
+          name: dSYM_v${{ env.VERSION }}_${{ env.BUILD }}
+          path: ./dSYMs
+          if_no_artifact_found: fail
+          search_artifacts: true
+
+      - name: 解压 dSYM
+        id: unzip
+        run: |
+          mkdir -p unzipped
+          find ./dSYMs -name "*.zip" -exec unzip -q {} -d unzipped \;
+
+          # 查找 DWARF 文件
+          DWARF_PATH=$(find ./unzipped -path "*.app.dSYM/Contents/Resources/DWARF/*" -type f | head -n 1)
+          if [ -z "$DWARF_PATH" ]; then
+            echo "错误: 未找到 DWARF 文件"
+            find ./unzipped -type f | head -20
+            exit 1
+          fi
+          echo "DWARF_PATH=$DWARF_PATH" >> $GITHUB_ENV
+          echo "DWARF 路径: $DWARF_PATH"
+
+          # 验证 UUID 匹配
+          ACTUAL_UUID=$(dwarfdump --uuid "$DWARF_PATH" | head -1 | awk '{print $2}' | tr '[:upper:]' '[:lower:]')
+          EXPECTED_UUID=$(echo "$UUID" | tr '[:upper:]' '[:lower:]')
+          echo "dSYM UUID: $ACTUAL_UUID"
+          echo "崩溃 UUID: $EXPECTED_UUID"
+          if [ "$ACTUAL_UUID" != "$EXPECTED_UUID" ]; then
+            echo "警告: UUID 不匹配，符号化结果可能不准确"
+          else
+            echo "UUID 匹配成功"
+          fi
+
+      - name: 使用 atos 符号化
+        run: |
+          # 提取崩溃地址（以 0x 开头的行）
+          ADDRESSES=$(grep "^0x" parse_output.txt | awk '{print $1}' | tr '\n' ' ')
+
+          if [ -z "$ADDRESSES" ]; then
+            echo "错误: 未提取到崩溃地址"
+            cat parse_output.txt
+            exit 1
+          fi
+
+          echo "崩溃地址数量: $(echo $ADDRESSES | wc -w)"
+          echo "基地址: $LOAD_ADDRESS"
+
+          # 使用 atos 批量符号化
+          # -arch arm64 指定架构，-l 指定加载基地址，-o 指定 DWARF 文件
+          xcrun atos -arch arm64 -l "$LOAD_ADDRESS" -o "$DWARF_PATH" $ADDRESSES > symbolicated.txt 2>&1 || true
+
+          echo ""
+          echo "=== 符号化结果 ==="
+          cat symbolicated.txt
+
+      - name: 生成符号化报告
+        run: |
+          {
+            echo "# iOS 崩溃日志符号化报告"
+            echo ""
+            echo "## 基本信息"
+            echo "- **崩溃文件**: ${{ steps.find_ips.outputs.ips_file }}"
+            echo "- **应用版本**: $VERSION"
+            echo "- **构建版本**: $BUILD"
+            echo "- **UUID**: $UUID"
+            echo "- **加载基地址**: $LOAD_ADDRESS"
+            echo "- **应用名称**: $APP_NAME"
+            echo ""
+            echo "## 原始崩溃地址"
+            echo '```text'
+            grep "^0x" parse_output.txt
+            echo '```'
+            echo ""
+            echo "## 符号化结果"
+            echo '```text'
+            cat symbolicated.txt
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: 上传符号化结果
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbolicated_${{ env.VERSION }}_${{ env.BUILD }}
+          path: |
+            parse_output.txt
+            symbolicated.txt
+          retention-days: 30

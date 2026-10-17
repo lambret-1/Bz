@@ -122,3 +122,16 @@ jobs:
           name: AI补帧_${{ github.ref_name }}_v${{ steps.version.outputs.version }}
           path: build/${{ steps.export.outputs.ipa_name }}
           retention-days: 30
+
+      - name: 打包 dSYM
+        run: |
+          cd build/FrameInterpolation.xcarchive/dSYMs
+          zip -r "../../dSYM_v${{ steps.version.outputs.version }}_${{ steps.version.outputs.build_number }}.zip" .
+          echo "dSYM 打包完成: dSYM_v${{ steps.version.outputs.version }}_${{ steps.version.outputs.build_number }}.zip"
+
+      - name: 上传 dSYM
+        uses: actions/upload-artifact@v4
+        with:
+          name: dSYM_v${{ steps.version.outputs.version }}_${{ steps.version.outputs.build_number }}
+          path: build/dSYM_v${{ steps.version.outputs.version }}_${{ steps.version.outputs.build_number }}.zip
+          retention-days: 90
