@@ -726,13 +726,17 @@ final class VideoPipeline {
             progress(0.0, usingAI ? .superResolving : .decoding)
         }
 
-        // 创建有界帧缓冲队列（容量 6 帧，平衡内存与吞吐）
-        let frameBuffer = FrameBuffer(capacity: 6)
-        let decodeQueue = DispatchQueue(label: "com.lambret.bz.sr.decode", qos: .userInitiated)
-        let encodeQueue = DispatchQueue(label: "com.lambret.bz.sr.encode", qos: .userInitiated)
+        // MARK: 四队列流水线
+        // Reader → Inference → PostProcess → Encode
+        // 队列容量按文档：Reader→Inference(4)、Inference→Post(6)、Post→Encode(10)
+        let readerToInference = FrameBuffer(capacity: 4)
+        let inferenceToPost = FrameBuffer(capacity: 6)
+        let postToEncode = FrameBuffer(capacity: 10)
 
-        // 用局部变量跟踪输出帧数（避免 inout 参数被异步闭包捕获）
-        var localOutputFrameCount = 0
+        let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
+        let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)
+        let postProcessQueue = DispatchQueue(label: "com.lambret.bz.sr.postprocess", qos: .utility)
+        let encodeQueue = DispatchQueue(label: "com.lambret.bz.sr.encode", qos: .userInitiated)
 
         // 跨队列错误传递
         let errorLock = NSLock()
@@ -744,24 +748,29 @@ final class VideoPipeline {
             errorLock.unlock()
         }
 
-        // MARK: 解码+推理队列
-        let decodeGroup = DispatchGroup()
-        decodeGroup.enter()
-        decodeQueue.async { [weak self] in
+        // 关闭所有队列（cancel或错误时调用）
+        func closeAllQueues() {
+            readerToInference.close()
+            inferenceToPost.close()
+            postToEncode.close()
+        }
+
+        // MARK: 队列1：Reader（只负责解码+深拷贝，不做推理）
+        let readerGroup = DispatchGroup()
+        readerGroup.enter()
+        readerQueue.async { [weak self] in
             guard let self = self else {
-                frameBuffer.close()
-                decodeGroup.leave()
+                readerToInference.close()
+                readerGroup.leave()
                 return
             }
 
             var localFrameIndex = 0
             var localProgress = 0.0
 
-            // 确保解码队列退出时关闭缓冲队列，唤醒编码端
             defer {
-                frameBuffer.close()
-                localOutputFrameCount = localFrameIndex
-                decodeGroup.leave()
+                readerToInference.close()
+                readerGroup.leave()
             }
 
             while reader.status == .reading {
@@ -776,57 +785,23 @@ final class VideoPipeline {
                     break
                 }
 
-                // 进度计算
+                // 进度计算（在Reader阶段更新，因为帧率不变）
                 let progressValue = min(Double(localFrameIndex) / Double(totalInputFrames), 0.99)
                 if progressValue - localProgress >= 0.01 {
                     localProgress = progressValue
                     let stage: ProcessingStage = usingAI ? .superResolving : .decoding
-                    // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
                     updateProgress(progressValue, stage: stage)
                 }
 
                 autoreleasepool {
-                    let processedFrame: CVPixelBuffer
+                    // 深拷贝原帧（reader的buffer生命周期由reader管理，必须拷贝）
+                    guard let copiedFrame = self.deepCopyPixelBuffer(pixelBuffer) else { return }
 
-                    if !needsAI {
-                        // 1x 模式：深拷贝原帧（原帧来自 reader，生命周期由 reader 管理）
-                        processedFrame = self.deepCopyPixelBuffer(pixelBuffer) ?? pixelBuffer
-                    } else if let engine = engine,
-                              let aiFrame = engine.upscale(pixelBuffer) {
-                        // AI 超分（原生 4x），若目标倍数 < 4x 则缩放到目标尺寸
-                        if targetScale.rawValue < nativeScale {
-                            let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
-                            let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
-                            let targetW = srcWidth * targetScale.rawValue
-                            let targetH = srcHeight * targetScale.rawValue
-                            processedFrame = self.scalePixelBuffer(aiFrame, to: targetW, targetH) ?? aiFrame
-                        } else {
-                            processedFrame = aiFrame
-                        }
-                    } else {
-                        // 降级：vImage 缩放到目标尺寸
-                        let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
-                        let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
-                        let targetW = srcWidth * targetScale.rawValue
-                        let targetH = srcHeight * targetScale.rawValue
-                        processedFrame = self.scalePixelBuffer(pixelBuffer, to: targetW, targetH)
-                            ?? (self.deepCopyPixelBuffer(pixelBuffer) ?? pixelBuffer)
-                    }
-
-                    // 复制颜色空间附件
-                    self.copyColorSpaceAttachments(from: pixelBuffer, to: processedFrame)
-
-                    // 最终输出缩放
-                    let finalFrame = needsScaling
-                        ? self.scalePixelBuffer(processedFrame, to: outputWidth, outputHeight) ?? processedFrame
-                        : processedFrame
-
-                    // 计算 PTS
+                    // 计算PTS（超分帧率不变，PTS = frameIndex / outputFPS）
                     let pts = CMTime(value: Int64(localFrameIndex), timescale: Int32(outputFPS))
 
-                    // 入队（阻塞等待缓冲空间）
-                    if !frameBuffer.enqueue(ProcessedFrame(pixelBuffer: finalFrame, presentationTime: pts)) {
-                        // 队列已关闭，退出
+                    // 入队到Inference
+                    if !readerToInference.enqueue(ProcessedFrame(pixelBuffer: copiedFrame, presentationTime: pts)) {
                         return
                     }
 
@@ -835,7 +810,107 @@ final class VideoPipeline {
             }
         }
 
-        // MARK: 编码队列（requestMediaDataWhenReady 驱动）
+        // MARK: 队列2：Inference（只做AI推理，不混入CPU缩放，防止ANE饿死）
+        let inferenceGroup = DispatchGroup()
+        inferenceGroup.enter()
+        inferenceQueue.async { [weak self] in
+            guard let self = self else {
+                inferenceToPost.close()
+                inferenceGroup.leave()
+                return
+            }
+
+            defer {
+                inferenceToPost.close()
+                inferenceGroup.leave()
+            }
+
+            while true {
+                if self.isCancelled {
+                    setError(PipelineError.cancelled)
+                    return
+                }
+
+                // 从Reader队列取帧
+                guard let frame = readerToInference.dequeue() else {
+                    // Reader队列已关闭且为空，推理完成
+                    break
+                }
+
+                autoreleasepool {
+                    let resultFrame: CVPixelBuffer
+
+                    if !needsAI {
+                        // 1x模式：直接透传
+                        resultFrame = frame.pixelBuffer
+                    } else if let engine = engine,
+                              let aiFrame = engine.upscale(frame.pixelBuffer) {
+                        // AI超分（原生4x），不做任何CPU缩放，留给PostProcess
+                        resultFrame = aiFrame
+                    } else {
+                        // 降级：透传原帧，缩放留给PostProcess
+                        resultFrame = frame.pixelBuffer
+                    }
+
+                    // 入队到PostProcess
+                    if !inferenceToPost.enqueue(ProcessedFrame(pixelBuffer: resultFrame, presentationTime: frame.presentationTime)) {
+                        return
+                    }
+                }
+            }
+        }
+
+        // MARK: 队列3：PostProcess（vImage缩放+颜色空间，CPU密集操作独立队列）
+        let postProcessGroup = DispatchGroup()
+        postProcessGroup.enter()
+        postProcessQueue.async { [weak self] in
+            guard let self = self else {
+                postToEncode.close()
+                postProcessGroup.leave()
+                return
+            }
+
+            defer {
+                postToEncode.close()
+                postProcessGroup.leave()
+            }
+
+            while true {
+                if self.isCancelled {
+                    setError(PipelineError.cancelled)
+                    return
+                }
+
+                // 从Inference队列取帧
+                guard let frame = inferenceToPost.dequeue() else {
+                    break
+                }
+
+                autoreleasepool {
+                    var processedFrame = frame.pixelBuffer
+
+                    // 统一缩放到最终输出尺寸（一步到位，避免两次缩放）
+                    // outputWidth/outputHeight已在runPipeline中计算好，包含目标倍数和分辨率限制
+                    let currentWidth = CVPixelBufferGetWidth(processedFrame)
+                    let currentHeight = CVPixelBufferGetHeight(processedFrame)
+                    if currentWidth != outputWidth || currentHeight != outputHeight {
+                        if let scaled = self.scalePixelBuffer(processedFrame, to: outputWidth, outputHeight) {
+                            processedFrame = scaled
+                        }
+                    }
+
+                    // 复制颜色空间附件
+                    self.copyColorSpaceAttachments(from: frame.pixelBuffer, to: processedFrame)
+
+                    // 入队到Encode
+                    if !postToEncode.enqueue(ProcessedFrame(pixelBuffer: processedFrame, presentationTime: frame.presentationTime)) {
+                        return
+                    }
+                }
+            }
+        }
+
+        // MARK: 队列4：Encode（requestMediaDataWhenReady驱动，保持不变）
         let encodeGroup = DispatchGroup()
         encodeGroup.enter()
         var encodeFinished = false
@@ -853,9 +928,8 @@ final class VideoPipeline {
             }
 
             while videoWriterInput.isReadyForMoreMediaData {
-                // 从缓冲队列取帧（可能阻塞等待）
-                guard let frame = frameBuffer.dequeue() else {
-                    // 队列已关闭且为空，编码完成
+                // 从PostProcess队列取帧
+                guard let frame = postToEncode.dequeue() else {
                     finishEncode()
                     return
                 }
@@ -866,7 +940,7 @@ final class VideoPipeline {
                     return
                 }
 
-                // 追加到 writer
+                // 追加到writer
                 let appended = pixelBufferAdaptor.append(frame.pixelBuffer, withPresentationTime: frame.presentationTime)
                 if !appended {
                     if writer.status == .failed {
@@ -878,16 +952,18 @@ final class VideoPipeline {
             }
         }
 
-        // 等待解码+推理完成
-        decodeGroup.wait()
+        // 等待所有队列完成
+        readerGroup.wait()
+        inferenceGroup.wait()
+        postProcessGroup.wait()
 
-        // 检查解码端错误
+        // 检查前置队列错误
         errorLock.lock()
-        let decodeError = pipelineError
+        let preError = pipelineError
         errorLock.unlock()
 
-        if let error = decodeError {
-            // 取消编码
+        if let error = preError {
+            closeAllQueues()
             if writer.status == .writing {
                 writer.cancelWriting()
             }
@@ -913,7 +989,7 @@ final class VideoPipeline {
             throw error
         }
 
-        // 检查 reader 最终状态
+        // 检查reader最终状态
         if reader.status == .failed {
             if let error = reader.error {
                 throw error
@@ -921,9 +997,9 @@ final class VideoPipeline {
             throw PipelineError.readerFailed
         }
 
-        outputFrameIndex = localOutputFrameCount
-        let finalFrameCount = localOutputFrameCount
-        logger.info("异步超分管线完成，输出帧数: \(finalFrameCount)")
+        // 输出帧数 = PostProcess队列的入队数
+        outputFrameIndex = postToEncode.totalEnqueued
+        logger.info("四队列超分管线完成，输出帧数: \(outputFrameIndex)")
     }
 
     // MARK: - 异步补帧管线（解码+推理与编码并发）
