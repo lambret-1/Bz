@@ -95,6 +95,12 @@ func startAudioEncoding() {
 · 音频和视频的 writer.startWriting() 只需调用一次
 · 完成等待：videoInput.markAsFinished() 和 audioInput.markAsFinished() 都调用后再 writer.finishWriting()
 
+⚠️ PTS 同步（极易踩坑）：
+· 超分模式帧率不变，**视频 PTS 必须直接透传原 sample buffer 的时间戳**，禁止用 frameIndex/outputFPS 重新计算
+· 音频 PTS 同样直接透传，音视频时间戳同源即可保证同步
+· 补帧模式帧率变化时，视频 PTS 重新计算后，音频 PTS 需用 CMSampleBufferSetOutputPresentationTimeStamp 整体平移对齐
+· 第一帧音视频起点必须一致（通常都是 kCMTimeZero 或原始时间戳），否则 writer.finishWriting() 会报错或音画不同步
+
 ### 3.2 进度回调防抖（消除 B5）
 
 当前：每处理 0.5% 帧 DispatchQueue.main.async { progress = ... }
@@ -102,20 +108,16 @@ func startAudioEncoding() {
 
 ```swift
 // ProcessingView 或 AppState 中
-private let progressLock = NSLock()
-private var _progress: Double = 0
+// iOS 16+ 推荐 OSAllocatedUnfairLock，开销仅为 NSLock 的几十分之一
+private let progressLock = OSAllocatedUnfairLock(initialState: 0.0)
 private var progressTimer: Timer?
 
 var progress: Double {
-    progressLock.lock()
-    defer { progressLock.unlock() }
-    return _progress
+    progressLock.withLock { $0 }
 }
 
 func updateProgress(_ value: Double) {
-    progressLock.lock()
-    _progress = value
-    progressLock.unlock()
+    progressLock.withLock { $0 = value }
 }
 
 // 启动时开启定时器
@@ -183,6 +185,29 @@ outputPool = PixelBufferPool(width: Int(outputWidth), height: Int(outputHeight))
 
 // 循环中从池取 buffer，不再 CVPixelBufferCreate
 guard let outputBuffer = outputPool?.create() else { break }
+```
+
+⚠️ 深拷贝也必须用池（性能暗坑）：
+· alwaysCopiesSampleData=false 时，copyNextSampleBuffer 返回的 buffer 可能被 reader 复用，必须深拷贝
+· 禁止每次 malloc 新建 buffer，应从 inputPool 取 buffer 后用 memcpy/vImageCopyBuffer 拷贝数据
+· 深拷贝实现：
+
+```swift
+func deepCopyWithPool(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+    guard let dest = inputPool?.create() else { return nil }
+    CVPixelBufferLockBaseAddress(source, .readOnly)
+    CVPixelBufferLockBaseAddress(dest, [])
+    defer {
+        CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        CVPixelBufferUnlockBaseAddress(dest, [])
+    }
+    guard let srcAddr = CVPixelBufferGetBaseAddress(source),
+          let dstAddr = CVPixelBufferGetBaseAddress(dest) else { return nil }
+    let height = CVPixelBufferGetHeight(source)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(source)
+    memcpy(dstAddr, srcAddr, height * bytesPerRow)
+    return dest
+}
 ```
 
 ---
@@ -253,6 +278,22 @@ func runInference() {
         }
         self.inferenceToEncodeQueue.close()
     }
+}
+```
+
+⚠️ 取消时的死锁陷阱（必须处理）：
+· BoundedQueue 的 enqueue 和 dequeue 都会阻塞，用户点取消时必须唤醒所有阻塞线程
+· 队列必须提供 cancel() 方法，内部调用 condition.broadcast() 唤醒所有等待者
+· 取消路径：用户点取消 → isCancelled=true → 两个队列都调用 cancel() → 阻塞的 enqueue/dequeue 被唤醒 → 检查 isCancelled 后返回 false/nil → 各队列自然退出
+· 禁止只设 isCancelled 而不 broadcast，否则线程永远卡在 wait() 导致内存泄漏和后台任务无法结束
+
+```swift
+// BoundedQueue 必须实现的取消方法
+func cancel() {
+    condition.lock()
+    isCancelled = true
+    condition.broadcast()  // 唤醒所有阻塞在 enqueue 和 dequeue 的线程
+    condition.unlock()
 }
 ```
 
@@ -335,6 +376,17 @@ mlmodel = ct.convert(
 当前瓦片拼接在 CPU 上 memcpy，4x 输出 33MB/帧
 改造后用 MTLBlitCommandEncoder 做 GPU 端拷贝
 
+### 5.4（可选）NV12 输入 + Metal 色彩转换
+
+当前：AVAssetReaderTrackOutput 强制输出 32BGRA，触发 CPU 端 NV12→BGRA 转换，消耗内存带宽
+改造后：reader outputSettings 传 nil 输出原生 NV12（420YpCbCr8BiPlanarVideoRange），用 Metal shader 做 NV12→RGB 转换后直接构造 MLMultiArray
+
+实现要点：
+· reader 输出 NV12 是 VideoToolbox 硬件解码原生格式，零 CPU 转换
+· Metal compute shader 读取 Y 平面和 UV 平面，输出 RGB 三通道到 MTLTexture
+· 从 MTLTexture 读取数据构造 MLMultiArray，或直接用 CoreML 的 CVPixelBuffer 输入（如模型支持）
+· 此优化需重写引擎预处理逻辑，风险较高，放在 256×256 模型之后做
+
 ---
 
 6. 改造顺序与风险控制
@@ -349,7 +401,11 @@ mlmodel = ct.convert(
 | 三 | 合并缩放 | 低 | 恢复两次缩放 | 输出尺寸正确 |
 | 三 | 256×256 模型 | 中（模型转换） | 保留 128×128 模型文件 | 推理结果正确、速度提升 |
 
-建议：第一阶段三个步骤一次性提交，验证稳定后再做第二阶段，第三阶段最后做。
+建议：第一阶段分三步提交，每步打包验证后再做下一步，降低风险：
+1. 先做 3.2 进度防抖（零风险，解决 UI 卡顿）
+2. 再做 3.1 音频直写（收益最大，重点验证音画同步）
+3. 最后做 3.3 PixelBufferPool（涉及多线程内存，最容易出 Bug）
+第二阶段拆队列是硬骨头，确认深拷贝用池、cancel 不死锁、PTS 同步后再动手。第三阶段最后做。
 
 ---
 
@@ -376,3 +432,9 @@ mlmodel = ct.convert(
 | 第三阶段完成 | +20-50% | 180-270 秒（1.5-2.2 秒/帧） |
 
 最终目标：124 帧 720p 4x 超分控制在 5 分钟以内。
+
+⚠️ 收益预期修正：
+· 第二阶段拆队列不会让 ANE 变快，ANE 算一帧的时间是固定的
+· 拆队列的意义是让解码 IO 和编码不再拖后腿，把这部分时间隐藏掉
+· 如果瓶颈 100% 在 AI 推理，拆队列提升可能只有 5%；如果解码编码占 30%，就能隐藏这 30%
+· 20-30% 的预估基于当前 CPU 仅 27%（说明 IO/编码有较大占比）的实测数据
