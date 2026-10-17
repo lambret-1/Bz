@@ -466,10 +466,42 @@ mlmodel = ct.convert(
 4. 稳定性测试：连续处理 3 个视频，无崩溃、无内存泄漏
 5. 边界测试：1x（跳过 AI）、2x、3x、4x 各跑一次
 6. 取消测试：处理中途点取消，确认所有队列正确退出、临时文件清理
+7. B帧视频测试：用含B帧的H.264/HEVC视频测试，确认 append 返回值检查生效，无 PTS 乱序导致的写入失败
+8. 性能测试必须用 Release/Profile 包，禁止用 Debug 包测速度（Debug 无 -O 优化，memcpy/vImage 慢数倍）
 
 ---
 
-8. 预期收益汇总
+8. 极端边缘场景预警（真机联调必遇）
+
+### 8.1 B帧导致 PTS 乱序
+
+· H.264/HEVC 视频大量使用 B 帧时，copyNextSampleBuffer 输出是解码顺序（DTS），PTS 可能乱序（如 0,3,1,2）
+· AVAssetWriterInput 默认 expectsMediaDataInRealTime=false 时内部会自动缓存排序，但乱序严重时 append() 会返回 false
+· **强制要求**：每次 pixelBufferAdaptor.append() 后必须检查返回值，false 时立即打印 writer.error，禁止硬塞
+· 音频 append 同样需要检查返回值
+
+### 8.2 四队列线程竞争（老机型）
+
+· Reader/Inference/PostProcess/Encode 四个串行队列，在老设备（iPhone 8 Plus 及更早）可能出现 CPU 时间片竞争
+· 缓解措施：用 QoS 区分优先级——InferenceQueue=.userInitiated，PostProcessQueue=.utility，EncodeQueue=.userInitiated
+· 禁止用 usleep() 主动降速，会降低吞吐量
+· BoundedQueue 内部锁必须轻量（NSCondition 或 os_unfair_lock），禁止用 pthread_mutex 重量级锁
+
+### 8.3 CoreML 异步推理 Buffer 生命周期
+
+· 当前使用同步 prediction()，无此问题
+· 未来若改为异步 prediction(from:options:) 配合回调，从池中取出的 Buffer 在推理回调完成前绝对不能 unlock 或还回池子
+· 否则 CoreML 读到脏数据，画面绿屏或闪烁
+
+### 8.4 Debug 与 Release 性能落差
+
+· Debug 模式无 -O 优化，memcpy、vImage、Swift 数组操作都比 Release 慢 3-10 倍
+· **性能测试必须用 Profile（Release）或 AdHoc 包**，Debug 包的速度数据无参考价值
+· Debug 模式可用于内存测试（guard 检查更完整），但速度数据以 Release 为准
+
+---
+
+9. 预期收益汇总
 
 | 阶段 | 预期提升 | 累计速度 |
 |------|----------|----------|
