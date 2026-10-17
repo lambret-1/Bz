@@ -42,11 +42,12 @@ jobs:
           python3 parse_ips.py "$IPS_FILE" > parse_output.txt
           cat parse_output.txt
 
-          # 提取关键信息到环境变量
+          # 提取关键信息：同时设置当前 shell 变量和写入 GITHUB_ENV（供后续 step 使用）
           while IFS='=' read -r key value; do
             case "$key" in
               VERSION|BUILD|UUID|LOAD_ADDRESS|APP_NAME)
                 echo "$key=$value" >> $GITHUB_ENV
+                eval "$key=\"$value\""
                 ;;
             esac
           done < parse_output.txt
@@ -57,6 +58,12 @@ jobs:
             cat parse_output.txt
             exit 1
           fi
+
+          # 同时输出到 step outputs，供后续 step 引用
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "build=$BUILD" >> $GITHUB_OUTPUT
+          echo "uuid=$UUID" >> $GITHUB_OUTPUT
+          echo "load_address=$LOAD_ADDRESS" >> $GITHUB_OUTPUT
 
       - name: 下载对应版本 dSYM
         uses: dawidd6/action-download-artifact@v3
