@@ -2,7 +2,7 @@ name: iOS Build
 
 on:
   push:
-    branches: [main, testping]
+    branches: [main, testping, feature/speed-optimization]
     paths-ignore:
       - '**.md'
       - '资料/**'
