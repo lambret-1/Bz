@@ -104,7 +104,9 @@ final class PerformanceMonitor: ObservableObject {
         let kr = task_threads(mach_task_self_, &threadList, &threadCount)
         guard kr == KERN_SUCCESS, let threads = threadList, threadCount > 0 else { return 0 }
         defer {
-            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: threads), vm_size_t(threadCount * UInt32(MemoryLayout<thread_t>.size)))
+            // 正确计算释放大小，避免 UInt32 乘法溢出
+            let deallocSize = vm_size_t(threadCount) * vm_size_t(MemoryLayout<thread_t>.size)
+            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: threads), deallocSize)
         }
 
         var totalUserTime: UInt64 = 0
@@ -112,7 +114,7 @@ final class PerformanceMonitor: ObservableObject {
 
         for i in 0..<Int(threadCount) {
             var threadInfo = thread_basic_info()
-            var threadInfoCount = mach_msg_type_number_t(THREAD_INFO_MAX)
+            var threadInfoCount = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
             let tkr = withUnsafeMutablePointer(to: &threadInfo) {
                 $0.withMemoryRebound(to: integer_t.self, capacity: Int(threadInfoCount)) {
                     thread_info(threads[i], thread_flavor_t(THREAD_BASIC_INFO), $0, &threadInfoCount)
@@ -124,9 +126,19 @@ final class PerformanceMonitor: ObservableObject {
         }
 
         // 与上一次采样的差值计算 CPU 占比
+        // 使用 subtractingReportingOverflow 避免 UInt64 下溢导致 SIGTRAP
         if let prev = previousCPUInfo {
-            let userDiff = Double(totalUserTime - prev.userTime) / 1_000_000.0
-            let systemDiff = Double(totalSystemTime - prev.systemTime) / 1_000_000.0
+            let userSub = totalUserTime.subtractingReportingOverflow(prev.userTime)
+            let systemSub = totalSystemTime.subtractingReportingOverflow(prev.systemTime)
+
+            // 如果发生下溢（线程重建导致时间回退），重置基准并返回0
+            guard !userSub.overflow, !systemSub.overflow else {
+                previousCPUInfo = (totalUserTime, totalSystemTime)
+                return 0
+            }
+
+            let userDiff = Double(userSub.partialValue) / 1_000_000.0
+            let systemDiff = Double(systemSub.partialValue) / 1_000_000.0
             let elapsed = 1.0 // 每秒采样一次
             let cpuPercent = ((userDiff + systemDiff) / elapsed) * 100.0
             previousCPUInfo = (totalUserTime, totalSystemTime)
