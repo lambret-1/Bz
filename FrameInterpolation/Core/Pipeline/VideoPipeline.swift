@@ -998,8 +998,9 @@ final class VideoPipeline {
         }
 
         // 输出帧数 = PostProcess队列的入队数
-        outputFrameIndex = postToEncode.totalEnqueued
-        logger.info("四队列超分管线完成，输出帧数: \(outputFrameIndex)")
+        let finalFrameCount = postToEncode.totalEnqueued
+        outputFrameIndex = finalFrameCount
+        logger.info("四队列超分管线完成，输出帧数: \(finalFrameCount)")
     }
 
     // MARK: - 异步补帧管线（解码+推理与编码并发）
