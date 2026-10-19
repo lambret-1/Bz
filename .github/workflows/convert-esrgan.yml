@@ -1,13 +1,17 @@
-name: Convert Real-ESRGAN x4v3 to Core ML
+name: Convert Real-ESRGAN x4plus to Core ML
 
 on:
   workflow_dispatch:
   push:
     branches: [test]
     paths:
-      - 'Scripts/convert_esrgan.py'
+      - 'Scripts/convert_x4plus.py'
       - 'Scripts/esrgan_model/**'
       - '.github/workflows/convert-esrgan.yml'
+
+# 赋予 Workflow 写入仓库的权限
+permissions:
+  contents: write
 
 jobs:
   convert:
@@ -19,6 +23,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+          fetch-depth: 0 # 需要完整历史才能正常 Push
+
+      - name: 设置 Git 身份
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -28,26 +38,53 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install torch==2.7.0 torchvision==0.22.0 coremltools==8.0 numpy
+          # 注意：x4plus 必须安装 basicsr-fixed，否则会因 tb-nightly 依赖报错
+          pip install torch==2.7.0 torchvision==0.22.0 coremltools==8.0 numpy Pillow basicsr-fixed
 
       - name: 运行模型转换
         run: |
           cd Scripts
-          python convert_esrgan.py
+          python convert_x4plus.py
 
       - name: 验证模型文件
         run: |
-          if [ -d "Scripts/real_esrgan_x4v3.mlpackage" ]; then
+          if [ -d "Scripts/real_esrgan_x4plus.mlpackage" ]; then
             echo "✅ 模型转换成功"
-            find Scripts/real_esrgan_x4v3.mlpackage -type f | head -20
+            find Scripts/real_esrgan_x4plus.mlpackage -type f | head -20
           else
-            echo "❌ 模型转换失败，未找到 real_esrgan_x4v3.mlpackage"
+            echo "❌ 模型转换失败，未找到 real_esrgan_x4plus.mlpackage"
             exit 1
           fi
 
-      - name: 上传 mlpackage
+      - name: 上传临时 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: real_esrgan_x4v3
-          path: Scripts/real_esrgan_x4v3.mlpackage
+          name: real_esrgan_x4plus
+          path: Scripts/real_esrgan_x4plus.mlpackage
           retention-days: 90
+
+      - name: 自动推送到仓库资源目录
+        run: |
+          # 1. 确保 Git LFS 配置存在并追踪 mlpackage 内部文件
+          git lfs install
+          git lfs track "*.mlpackage/**/*"
+          git add .gitattributes
+
+          # 2. 清理旧的模型文件夹，避免残留文件冲突
+          rm -rf FrameInterpolation/Resources/real_esrgan_x4plus.mlpackage
+
+          # 3. 把新生成的模型移动过去
+          mv Scripts/real_esrgan_x4plus.mlpackage FrameInterpolation/Resources/
+
+          # 4. 提交并推送到当前分
+          git add FrameInterpolation/Resources/real_esrgan_x4plus.mlpackage
+          
+          # 判断是否有变更
+          if git diff-index --quiet HEAD; then
+            echo "⚠️ 模型没有任何变化，跳过提交"
+          else
+            # 加上 [skip ci] 防止流水线无限死循环触发
+            git commit -m "chore: 自动更新 x4plus 模型文件 [skip ci]"
+            git push origin HEAD:${GITHUB_REF_NAME}
+            echo "🚀 模型已自动推送至仓库 Resources 目录"
+          fi
