@@ -6,7 +6,7 @@ import OSLog
 // MARK: - Real-ESRGAN x4v3 轻量版超分引擎
 
 /// Real-ESRGAN General-x4v3 轻量版 4x 超分引擎
-/// 尺寸：宽352 × 高608，单线程串行推
+/// 尺寸：宽352 × 高608，单线程串行推理
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
