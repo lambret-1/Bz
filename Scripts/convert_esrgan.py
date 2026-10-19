@@ -4,16 +4,11 @@ Real-ESRGAN General-x4v3 轻量版 → Core ML 模型转换脚本
 功能：
     1. 自动从 GitHub Releases 下载 realesr-general-x4v3.pth 权重
     2. 加载 SRVGGNetCompact 模型并载入权重
-    3. 转换为 Core ML mlprogram 格式（FP16，128×128 输入）
+    3. 转换为 Core ML mlprogram 格式（FP16，352×608 输入）
     4. 输出 real_esrgan_x4v3.mlpackage，可直接放入 iOS App Resources
 
 使用方式：
     python convert_esrgan.py
-
-模型来源： 
-    官方仓库：https://github.com/xinntao/Real-ESRGAN
-    权重地址：https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
-    许可证：BSD-3-Clause
 """
 
 import os
@@ -32,8 +27,9 @@ from esrgan_model.srvgg_net import SRVGGNetCompact
 # ==================== 配置 ====================
 # 模型权重下载地址
 MODEL_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
-# 固定输入瓦片尺寸（512×512，608×352视频只需2个瓦片）
-INPUT_SIZE = 512
+# 固定输入瓦片尺寸（注意：宽 352，高 608）
+INPUT_WIDTH = 352
+INPUT_HEIGHT = 608
 # 输出路径
 OUTPUT_PACKAGE = os.path.join(SCRIPT_DIR, "real_esrgan_x4v3.mlpackage")
 
@@ -69,7 +65,7 @@ def load_model(pth_path: str) -> SRVGGNetCompact:
         act_type='prelu'
     )
 
-    # 加载权重（Real-ESRGAN 的权重可能包含 'params_ema' 或 'params' 键）
+    # 加载权重
     checkpoint = torch.load(pth_path, map_location='cpu', weights_only=False)
 
     if 'params_ema' in checkpoint:
@@ -94,25 +90,23 @@ def load_model(pth_path: str) -> SRVGGNetCompact:
 # ==================== 转换为 Core ML ====================
 def convert_to_coreml(model: SRVGGNetCompact) -> ct.models.MLModel:
     """将 PyTorch 模型转换为 Core ML 格式"""
-    print("🔄 正在转换为 Core ML...")
+    print(f"🔄 正在转换为 Core ML（输入尺寸: {INPUT_WIDTH}x{INPUT_HEIGHT}）...")
 
-    # 创建示例输入（归一化到 [0,1]）
-    example_input = torch.rand(1, 3, INPUT_SIZE, INPUT_SIZE)
+    # 创建示例输入（PyTorch 格式 NCHW，归一化到 [0,1]）
+    example_input = torch.rand(1, 3, INPUT_HEIGHT, INPUT_WIDTH)
 
     # TorchScript Trace
     traced_model = torch.jit.trace(model, example_input)
     print("   TorchScript Trace 完成")
 
     # 转换为 Core ML
-    # ImageType 输入输出：Zero-Copy，直接喂 CVPixelBuffer，避免 MLMultiArray 转换开销
-    # scale=1/255.0：自动将 [0,255] 归一化到 [0,1]，与模型输入匹配
-    # 输出 scale=255.0：自动将 [0,1] 反归一化到 [0,255]
+    # 注意：CoreML 的 shape 维度是 (Batch, Channel, Height, Width)
     mlmodel = ct.convert(
         traced_model,
         convert_to="mlprogram",
         inputs=[ct.ImageType(
             name="input",
-            shape=(1, 3, INPUT_SIZE, INPUT_SIZE),
+            shape=(1, 3, INPUT_HEIGHT, INPUT_WIDTH), # 高 608，宽 352
             scale=1/255.0,
             bias=[0, 0, 0]
         )],
@@ -125,9 +119,9 @@ def convert_to_coreml(model: SRVGGNetCompact) -> ct.models.MLModel:
     )
 
     # 设置模型元数据
-    mlmodel.short_description = "Real-ESRGAN General-x4v3 轻量版 4x 超分模型（ImageType零拷贝，512瓦片）"
-    mlmodel.input_description["input"] = "输入图像 512x512，BGRA CVPixelBuffer，自动归一化[0,1]"
-    mlmodel.output_description["output"] = "超分输出图像 2048x2048，BGRA CVPixelBuffer"
+    mlmodel.short_description = f"Real-ESRGAN General-x4v3 轻量版 4x 超分模型（{INPUT_WIDTH}x{INPUT_HEIGHT} 矩形瓦片）"
+    mlmodel.input_description["input"] = f"输入图像 {INPUT_WIDTH}x{INPUT_HEIGHT}，BGRA CVPixelBuffer，自动归一化[0,1]"
+    mlmodel.output_description["output"] = f"超分输出图像 {INPUT_WIDTH*4}x{INPUT_HEIGHT*4}，BGRA CVPixelBuffer"
 
     print("✅ Core ML 转换完成")
     return mlmodel
@@ -140,7 +134,8 @@ def verify_model(mlmodel: ct.models.MLModel):
 
     # ImageType 输入：用 PIL Image 或 numpy array
     from PIL import Image
-    input_image = Image.fromarray(np.random.randint(0, 256, (INPUT_SIZE, INPUT_SIZE, 3), dtype=np.uint8))
+    # 注意：PIL 的尺寸是 (宽, 高)，即 (352, 608)
+    input_image = Image.fromarray(np.random.randint(0, 256, (INPUT_HEIGHT, INPUT_WIDTH, 3), dtype=np.uint8))
 
     # 推理
     result = mlmodel.predict({"input": input_image})
@@ -157,7 +152,7 @@ def verify_model(mlmodel: ct.models.MLModel):
 # ==================== 主函数 ====================
 def main():
     print("=" * 60)
-    print("Real-ESRGAN General-x4v3 → Core ML 转换")
+    print(f"Real-ESRGAN General-x4v3 → Core ML 转换 (尺寸: {INPUT_WIDTH}x{INPUT_HEIGHT})")
     print("=" * 60)
 
     # 1. 下载权重
