@@ -1,7 +1,3 @@
-"""
-Real-ESRGAN x4plus → Core ML转换脚本 (伪装成 v3 文件名)
-"""
-
 import os
 import sys
 import urllib.request
@@ -18,8 +14,9 @@ except ImportError:
     print("❌ 缺少 basicsr 库，请先运行: pip install basicsr-fixed")
     sys.exit(1)
 
-# ==================== 配置 ====================
-MODEL_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/RealESRGAN_x4plus.pth"
+# ==================== 配置====================
+# 修正：将 v0.2.5.0 改为 v0.1.0
+MODEL_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 INPUT_WIDTH = 352
 INPUT_HEIGHT = 608
 
@@ -56,7 +53,6 @@ def convert_to_coreml(model: RRDBNet) -> ct.models.MLModel:
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS16
     )
-    # 改个描述，方便你以后看到时知道这是 x4plus
     mlmodel.short_description = "Real-ESRGAN x4plus (伪装为v3)"
     return mlmodel
 
