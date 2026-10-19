@@ -5,8 +5,6 @@ import OSLog
 
 // MARK: - Real-ESRGAN x4v3 轻量版超分引擎
 
-/// Real-ESRGAN General-x4v3 轻量版 4x 超分引擎
-/// 尺寸：宽352 × 高608，单线程串行推理
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
@@ -17,14 +15,10 @@ final class RealESRGANEngine: SuperResolutionEngine {
     let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
-    // MARK: - 瓦片配置 (宽352，高608)
+    // MARK: - 瓦片配置
 
-    // X轴步长 = 352 - 64 = 288（输入图上重叠 64 像素）
     private let tileStrideX = 288
-    // Y轴步长 = 608 - 64 = 544（输入图上重叠 64 像素）
     private let tileStrideY = 544
-    
-    // 放大 4 倍后的输出重叠区域宽度 = 64 * 4 = 256 像素
     private let outputFeatherWidth = 256
 
     // MARK: - 私有属性
@@ -71,7 +65,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
         var accumB = [Float](repeating: 0, count: pixelCount)
         var accumW = [Float](repeating: 0, count: pixelCount)
 
-        // 计算需要多少行、多少列瓦片
         let cols = max((srcWidth - inputWidth + tileStrideX - 1) / tileStrideX + 1, 1)
         let rows = max((srcHeight - inputHeight + tileStrideY - 1) / tileStrideY + 1, 1)
         
@@ -95,7 +88,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let srcY = min(row * tileStrideY, max(srcHeight - inputHeight, 0))
 
                 autoreleasepool {
-                    // 每次循环创建局部的 buffer，由 ARC 自动回收，避免跨线程数据踩踏
                     guard let tileBuffer = createPixelBuffer(width: inputWidth, height: inputHeight) else { return }
                     
                     fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
@@ -149,13 +141,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess else {
+        
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
+        guard status == kCVReturnSuccess else {
             return nil
         }
         return buffer
     }
 
-    // 修复了黑边问题和镜像填充
     private func fillTileBuffer(_ tile: CVPixelBuffer, from src: UnsafePointer<UInt8>, srcBytesPerRow: Int, srcWidth: Int, srcHeight: Int, x: Int, y: Int) {
         CVPixelBufferLockBaseAddress(tile, [])
         defer { CVPixelBufferUnlockBaseAddress(tile, []) }
@@ -167,13 +160,11 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let copyWidth = min(inputWidth, srcWidth - x)
         let copyHeight = min(inputHeight, srcHeight - y)
         
-        // 1. 拷贝有效区域的像素
         for row in 0..<copyHeight {
             let srcRow = src.advanced(by: (y + row) * srcBytesPerRow + x * 4)
             let dstRow = dst.advanced(by: row * dstBytesPerRow)
             memcpy(dstRow, srcRow, copyWidth * 4)
             
-            // 2. 【镜像填充】处理右侧不足的区域
             if copyWidth < inputWidth {
                 let lastPixelOffset = (copyWidth - 1) * 4
                 for outX in copyWidth..<inputWidth {
@@ -189,7 +180,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
             }
         }
         
-        // 3. 【镜像填充】处理底部不足的区域
         if copyHeight < inputHeight {
             let lastRowOffset = (copyHeight - 1) * dstBytesPerRow
             for outY in copyHeight..<inputHeight {
@@ -231,7 +221,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
             for tx in 0..<tileWidth {
                 let outY = dstY + ty
                 let outX = dstX + tx
-                // 边界保护
                 guard outY >= 0 && outY < outputHeight && outX >= 0 && outX < outputWidth else { continue }
 
                 let yWeight = featherWeight(position: ty, size: tileHeight)
@@ -250,15 +239,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
     }
 
-    // 修复了平滑过渡算法（Smoothstep）
     private func featherWeight(position: Int, size: Int) -> Float {
         let fw: Float = Float(outputFeatherWidth)
         let pos: Float = Float(position)
         let sz: Float = Float(size)
         
         if pos < fw {
-            let ratio: Float = pos / f =w
-            return ratio * ratio * (3.0 - 2.0 * ratio) // 平滑步进曲线，防止线性过渡带来的模糊
+            let ratio: Float = pos / fw
+            return ratio * ratio * (3.0 - 2.0 * ratio)
         } else if pos >= sz - fw {
             let ratio: Float = (sz - pos) / fw
             return ratio * ratio * (3.0 - 2.0 * ratio)
@@ -278,13 +266,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
         var buffer: CVPixelBuffer?
         let attrs = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            buffer kCVPixelBufferWidthKey: width,
-            kCVPixelBuffer elseHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: {
- [:]
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        guard CVPixelBuffer           Create(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
- return              let result nil
+        
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
+        guard status == kCVReturnSuccess, let result = buffer else {
+            return nil
         }
 
         CVPixelBufferLockBaseAddress(result, [])
@@ -320,6 +309,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return result
     }
 
+    // MARK: - 颜色空间附件复制 (已修复API 报错)
+
     private func copyColorSpaceAttachments(from src: CVPixelBuffer, to dst: CVPixelBuffer) {
         let colorKeys: [CFString] = [
             kCVImageBufferColorPrimariesKey,
@@ -329,8 +320,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            if let unmanagedValue = CVBufferCopyAttachment(src, key, nil) {
-                let value = unmanagedValue.takeUnretainedValue()
+            // CVBufferCopyAttachment 返回的已经是 Any? 对象，不需要 takeUnretainedValue()
+            if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
         }
