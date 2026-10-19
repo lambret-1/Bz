@@ -17,6 +17,40 @@ final class PerformanceMonitor: ObservableObject {
     /// 监控是否已启动
     private(set) var isRunning = false
 
+    // MARK: - 统计数据
+
+    /// CPU 采样总和（用于计算平均值）
+    private var cpuSum: Double = 0
+    /// CPU 采样次数
+    private var cpuSampleCount: Int = 0
+    /// CPU 峰值
+    private(set) var cpuPeak: Double = 0
+    /// 内存采样总和
+    private var memorySum: Double = 0
+    /// 内存采样次数
+    private var memorySampleCount: Int = 0
+    /// 内存峰值（MB）
+    private(set) var memoryPeak: Double = 0
+
+    /// CPU 平均使用率（%）
+    var cpuAverage: Double {
+        cpuSampleCount > 0 ? cpuSum / Double(cpuSampleCount) : 0
+    }
+    /// 内存平均占用（MB）
+    var memoryAverage: Double {
+        memorySampleCount > 0 ? memorySum / Double(memorySampleCount) : 0
+    }
+
+    /// 重置统计数据（开始新任务前调用）
+    func resetStatistics() {
+        cpuSum = 0
+        cpuSampleCount = 0
+        cpuPeak = 0
+        memorySum = 0
+        memorySampleCount = 0
+        memoryPeak = 0
+    }
+
     // MARK: - 私有属性
 
     private var displayLink: CADisplayLink?
@@ -85,6 +119,14 @@ final class PerformanceMonitor: ObservableObject {
     private func updateMetrics() {
         cpuUsage = currentCPUUsage()
         memoryUsageMB = currentMemoryUsage()
+
+        // 更新统计数据
+        cpuSum += cpuUsage
+        cpuSampleCount += 1
+        if cpuUsage > cpuPeak { cpuPeak = cpuUsage }
+        memorySum += memoryUsageMB
+        memorySampleCount += 1
+        if memoryUsageMB > memoryPeak { memoryPeak = memoryUsageMB }
     }
 
     /// 读取当前进程 CPU 使用率（%）

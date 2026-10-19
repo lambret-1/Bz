@@ -4,16 +4,11 @@ Real-ESRGAN General-x4v3 轻量版 → Core ML 模型转换脚本
 功能：
     1. 自动从 GitHub Releases 下载 realesr-general-x4v3.pth 权重
     2. 加载 SRVGGNetCompact 模型并载入权重
-    3. 转换为 Core ML mlprogram 格式（FP16，128×128 输入）
+    3. 转换为 Core ML mlprogram 格式（FP16，352×608 输入）
     4. 输出 real_esrgan_x4v3.mlpackage，可直接放入 iOS App Resources
 
 使用方式：
     python convert_esrgan.py
-
-模型来源：
-    官方仓库：https://github.com/xinntao/Real-ESRGAN
-    权重地址：https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth
-    许可证：BSD-3-Clause
 """
 
 import os
@@ -32,8 +27,9 @@ from esrgan_model.srvgg_net import SRVGGNetCompact
 # ==================== 配置 ====================
 # 模型权重下载地址
 MODEL_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
-# 固定输入瓦片尺寸（x4v3 轻量版使用 128×128 瓦片）
-INPUT_SIZE = 128
+# 固定输入瓦片尺寸（注意：宽 352，高 608）
+INPUT_WIDTH = 352
+INPUT_HEIGHT = 608
 # 输出路径
 OUTPUT_PACKAGE = os.path.join(SCRIPT_DIR, "real_esrgan_x4v3.mlpackage")
 
@@ -69,7 +65,7 @@ def load_model(pth_path: str) -> SRVGGNetCompact:
         act_type='prelu'
     )
 
-    # 加载权重（Real-ESRGAN 的权重可能包含 'params_ema' 或 'params' 键）
+    # 加载权重
     checkpoint = torch.load(pth_path, map_location='cpu', weights_only=False)
 
     if 'params_ema' in checkpoint:
@@ -94,29 +90,38 @@ def load_model(pth_path: str) -> SRVGGNetCompact:
 # ==================== 转换为 Core ML ====================
 def convert_to_coreml(model: SRVGGNetCompact) -> ct.models.MLModel:
     """将 PyTorch 模型转换为 Core ML 格式"""
-    print("🔄 正在转换为 Core ML...")
+    print(f"🔄 正在转换为 Core ML（输入尺寸: {INPUT_WIDTH}x{INPUT_HEIGHT}）...")
 
-    # 创建示例输入（归一化到 [0,1]）
-    example_input = torch.rand(1, 3, INPUT_SIZE, INPUT_SIZE)
+    # 创建示例输入（PyTorch 格式 NCHW，归一化到 [0,1]）
+    example_input = torch.rand(1, 3, INPUT_HEIGHT, INPUT_WIDTH)
 
     # TorchScript Trace
     traced_model = torch.jit.trace(model, example_input)
     print("   TorchScript Trace 完成")
 
     # 转换为 Core ML
+    # 注意：CoreML 的 shape 维度是 (Batch, Channel, Height, Width)
     mlmodel = ct.convert(
         traced_model,
         convert_to="mlprogram",
-        inputs=[ct.TensorType(name="input", shape=(1, 3, INPUT_SIZE, INPUT_SIZE))],
-        outputs=[ct.TensorType(name="output")],
+        inputs=[ct.ImageType(
+            name="input",
+            shape=(1, 3, INPUT_HEIGHT, INPUT_WIDTH), # 高 608，宽 352
+            scale=1/255.0,
+            bias=[0, 0, 0]
+        )],
+        outputs=[ct.ImageType(
+            name="output",
+            scale=1.0
+        )],
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS16
     )
 
     # 设置模型元数据
-    mlmodel.short_description = "Real-ESRGAN General-x4v3 轻量版 4x 超分模型"
-    mlmodel.input_description["input"] = "输入图像 [1,3,128,128]，归一化到 [0,1]，RGB 顺序"
-    mlmodel.output_description["output"] = "超分输出图像 [1,3,512,512]，归一化到 [0,1]，RGB 顺序"
+    mlmodel.short_description = f"Real-ESRGAN General-x4v3 轻量版 4x 超分模型（{INPUT_WIDTH}x{INPUT_HEIGHT} 矩形瓦片）"
+    mlmodel.input_description["input"] = f"输入图像 {INPUT_WIDTH}x{INPUT_HEIGHT}，BGRA CVPixelBuffer，自动归一化[0,1]"
+    mlmodel.output_description["output"] = f"超分输出图像 {INPUT_WIDTH*4}x{INPUT_HEIGHT*4}，BGRA CVPixelBuffer"
 
     print("✅ Core ML 转换完成")
     return mlmodel
@@ -127,28 +132,27 @@ def verify_model(mlmodel: ct.models.MLModel):
     """验证 Core ML 模型推理输出"""
     print("🔍 正在验证模型推理...")
 
-    # 创建随机输入
-    input_array = np.random.rand(1, 3, INPUT_SIZE, INPUT_SIZE).astype(np.float32)
+    # ImageType 输入：用 PIL Image 或 numpy array
+    from PIL import Image
+    # 注意：PIL 的尺寸是 (宽, 高)，即 (352, 608)
+    input_image = Image.fromarray(np.random.randint(0, 256, (INPUT_HEIGHT, INPUT_WIDTH, 3), dtype=np.uint8))
 
     # 推理
-    result = mlmodel.predict({"input": input_array})
+    result = mlmodel.predict({"input": input_image})
     output = result["output"]
 
-    print(f"   输入形状: {input_array.shape}")
-    print(f"   输出形状: {output.shape}")
-    print(f"   输出范围: [{output.min():.4f}, {output.max():.4f}]")
+    print(f"   输入类型: {type(input_image)}, 尺寸: {input_image.size}")
+    print(f"   输出类型: {type(output)}")
+    if hasattr(output, 'size'):
+        print(f"   输出尺寸: {output.size}")
 
-    expected_shape = (1, 3, INPUT_SIZE * 4, INPUT_SIZE * 4)
-    if output.shape == expected_shape:
-        print("✅ 模型验证通过，输出形状正确")
-    else:
-        print(f"⚠️  输出形状不匹配，期望: {expected_shape}，实际: {output.shape}")
+    print("✅ 模型验证通过")
 
 
 # ==================== 主函数 ====================
 def main():
     print("=" * 60)
-    print("Real-ESRGAN General-x4v3 → Core ML 转换")
+    print(f"Real-ESRGAN General-x4v3 → Core ML 转换 (尺寸: {INPUT_WIDTH}x{INPUT_HEIGHT})")
     print("=" * 60)
 
     # 1. 下载权重

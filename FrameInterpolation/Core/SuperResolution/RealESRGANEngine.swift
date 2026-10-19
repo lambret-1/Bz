@@ -5,78 +5,51 @@ import OSLog
 
 // MARK: - Real-ESRGAN x4v3 轻量版超分引擎
 
-/// Real-ESRGAN General-x4v3 轻量版 4x 超分引擎
-/// SRVGGNetCompact 架构，128×128 瓦片拼接（带羽化融合），适合极低清素材（480p 及以下）
-/// MLMultiArray 输入输出，归一化到 [0,1]，RGB 通道顺序
-/// 模型文件缺失时 init 返回 nil，VideoPipeline 自动降级为 vImage 缩放
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
     // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .realESRGAN
-    let inputWidth: Int = 128
-    let inputHeight: Int = 128
+    let inputWidth: Int = 352
+    let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
     // MARK: - 瓦片配置
 
-    /// 瓦片步长（输入空间），重叠 = tileSize - tileStride
-    private let tileStride = 96
-    /// 边缘羽化宽度（输出空间），用于瓦片拼接时平滑过渡
-    private let featherWidth = 32
+    private let tileStrideX = 288
+    private let tileStrideY = 544
+    private let outputFeatherWidth = 256
 
     // MARK: - 私有属性
 
     private let model: MLModel
-    /// 模型输入数据类型（float16 或 float32）
-    private let inputDataType: MLMultiArrayDataType
-    /// 模型输出数据类型
-    private let outputDataType: MLMultiArrayDataType
-
-    /// 取消标志
     private var isCancelledFlag = false
 
     // MARK: - 初始化
 
     init?() {
-        // 1. 加载 Core ML 模型
         guard let modelURL = Bundle.main.url(
             forResource: SuperResolutionEngineType.realESRGAN.modelFileName,
             withExtension: "mlmodelc"
         ) else {
+            logger.error("找不到模型文件")
             return nil
         }
 
         let config = MLModelConfiguration()
         config.computeUnits = .all
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
+            logger.error("模型加载失败")
             return nil
         }
         self.model = model
-
-        // 2. 读取输入输出数据类型
-        let inputDesc = model.modelDescription.inputDescriptionsByName["input"]
-        let outputDesc = model.modelDescription.outputDescriptionsByName["output"]
-
-        if let descDataType = inputDesc?.multiArrayConstraint?.dataType {
-            inputDataType = descDataType
-        } else {
-            inputDataType = .float16
-        }
-
-        if let descDataType = outputDesc?.multiArrayConstraint?.dataType {
-            outputDataType = descDataType
-        } else {
-            outputDataType = .float16
-        }
-
-        logger.info("RealESRGAN x4v3 引擎初始化成功，瓦片: \(self.inputWidth)x\(self.inputHeight)，步长: \(self.tileStride)，输入: \(self.inputDataType.rawValue)，输出: \(self.outputDataType.rawValue)")
+        
+        logger.info("RealESRGAN 引擎初始化成功，瓦片尺寸: \(self.inputWidth)x\(self.inputHeight)")
     }
 
-    // MARK: - 公开方法
+    // MARK: - 核心方法
 
-    /// 对单帧执行 4x 超分（128×128 瓦片拼接）
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         isCancelledFlag = false
         let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
@@ -87,56 +60,60 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let outputHeight = srcHeight * scaleFactor
         let pixelCount = outputWidth * outputHeight
 
-        // 1. Float 累加器（3通道 + 权重）
         var accumR = [Float](repeating: 0, count: pixelCount)
         var accumG = [Float](repeating: 0, count: pixelCount)
         var accumB = [Float](repeating: 0, count: pixelCount)
         var accumW = [Float](repeating: 0, count: pixelCount)
 
-        // 2. 计算瓦片网格
-        let cols = max((srcWidth - inputWidth + tileStride - 1) / tileStride + 1, 1)
-        let rows = max((srcHeight - inputHeight + tileStride - 1) / tileStride + 1, 1)
-        let outputTileSize = inputWidth * scaleFactor
+        let cols = max((srcWidth - inputWidth + tileStrideX - 1) / tileStrideX + 1, 1)
+        let rows = max((srcHeight - inputHeight + tileStrideY - 1) / tileStrideY + 1, 1)
+        
+        let outputTileWidth = inputWidth * scaleFactor
+        let outputTileHeight = inputHeight * scaleFactor
 
-        // 3. 逐瓦片推理并累加
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+
+        guard let srcBase = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        let src = srcBase.assumingMemoryBound(to: UInt8.self)
+
         for row in 0..<rows {
             for col in 0..<cols {
                 if isCancelledFlag { return nil }
 
-                let srcX = min(col * tileStride, max(srcWidth - inputWidth, 0))
-                let srcY = min(row * tileStride, max(srcHeight - inputHeight, 0))
+                let srcX = min(col * tileStrideX, max(srcWidth - inputWidth, 0))
+                let srcY = min(row * tileStrideY, max(srcHeight - inputHeight, 0))
 
-                // 提取瓦片（128x128）并转为 MLMultiArray
-                guard let tileArray = makeTileArray(from: pixelBuffer, x: srcX, y: srcY) else {
-                    logger.error("瓦片提取失败 (\(col),\(row))")
-                    continue
+                autoreleasepool {
+                    guard let tileBuffer = createPixelBuffer(width: inputWidth, height: inputHeight) else { return }
+                    
+                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
+
+                    guard let outputBuffer = predictTile(tileBuffer) else { return }
+
+                    let dstX = srcX * scaleFactor
+                    let dstY = srcY * scaleFactor
+                    
+                    accumulateOutputBuffer(
+                        outputBuffer,
+                        accumR: &accumR,
+                        accumG: &accumG,
+                        accumB: &accumB,
+                        accumW: &accumW,
+                        dstX: dstX,
+                        dstY: dstY,
+                        tileWidth: outputTileWidth,
+                        tileHeight: outputTileHeight,
+                        outputWidth: outputWidth,
+                        outputHeight: outputHeight
+                    )
                 }
-
-                // 推理瓦片
-                guard let outputArray = processTile(tileArray) else {
-                    logger.error("瓦片推理失败 (\(col),\(row))")
-                    continue
-                }
-
-                // 累加到 Float 缓冲区（带羽化权重）
-                let dstX = srcX * scaleFactor
-                let dstY = srcY * scaleFactor
-                accumulateTile(
-                    outputArray,
-                    accumR: &accumR,
-                    accumG: &accumG,
-                    accumB: &accumB,
-                    accumW: &accumW,
-                    dstX: dstX,
-                    dstY: dstY,
-                    tileSize: outputTileSize,
-                    outputWidth: outputWidth,
-                    outputHeight: outputHeight
-                )
             }
         }
 
-        // 4. 归一化并创建输出 CVPixelBuffer
         guard let outputBuffer = createOutputBuffer(
             width: outputWidth,
             height: outputHeight,
@@ -145,166 +122,138 @@ final class RealESRGANEngine: SuperResolutionEngine {
             accumB: &accumB,
             accumW: &accumW
         ) else {
-            logger.error("创建输出缓冲区失败")
             return nil
         }
 
-        // 5. 复制颜色空间附件
         copyColorSpaceAttachments(from: pixelBuffer, to: outputBuffer)
-
         return outputBuffer
     }
 
-    /// 取消处理
     func cancel() { isCancelledFlag = true }
 
-    // MARK: - 瓦片提取与预处理（BGRA → NCHW MLMultiArray）
+    // MARK: - 工具方法
 
-    private func makeTileArray(from source: CVPixelBuffer, x: Int, y: Int) -> MLMultiArray? {
-        let shape: [NSNumber] = [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)]
-        guard let array = try? MLMultiArray(shape: shape, dataType: inputDataType) else {
+    private func createPixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        let attrs = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
+        guard status == kCVReturnSuccess else {
             return nil
         }
-
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
-
-        guard let srcBase = CVPixelBufferGetBaseAddress(source) else { return nil }
-        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
-        let src = srcBase.assumingMemoryBound(to: UInt8.self)
-
-        let plane = inputWidth * inputHeight
-
-        switch inputDataType {
-        case .float16:
-            let dst = array.dataPointer.assumingMemoryBound(to: Float16.self)
-            for ty in 0..<inputHeight {
-                for tx in 0..<inputWidth {
-                    let srcOffset = (y + ty) * srcBytesPerRow + (x + tx) * 4
-                    let idx = ty * inputWidth + tx
-                    // BGRA → RGB，归一化到 [0,1]
-                    dst[0 * plane + idx] = Float16(Float(src[srcOffset + 2]) / 255.0) // R
-                    dst[1 * plane + idx] = Float16(Float(src[srcOffset + 1]) / 255.0) // G
-                    dst[2 * plane + idx] = Float16(Float(src[srcOffset + 0]) / 255.0) // B
-                }
-            }
-        case .float32:
-            let dst = array.dataPointer.assumingMemoryBound(to: Float32.self)
-            for ty in 0..<inputHeight {
-                for tx in 0..<inputWidth {
-                    let srcOffset = (y + ty) * srcBytesPerRow + (x + tx) * 4
-                    let idx = ty * inputWidth + tx
-                    dst[0 * plane + idx] = Float(src[srcOffset + 2]) / 255.0 // R
-                    dst[1 * plane + idx] = Float(src[srcOffset + 1]) / 255.0 // G
-                    dst[2 * plane + idx] = Float(src[srcOffset + 0]) / 255.0 // B
-                }
-            }
-        default:
-            logger.error("不支持的输入数据类型: \(self.inputDataType.rawValue)")
-            return nil
-        }
-
-        return array
+        return buffer
     }
 
-    // MARK: - 单瓦片推理
+    private func fillTileBuffer(_ tile: CVPixelBuffer, from src: UnsafePointer<UInt8>, srcBytesPerRow: Int, srcWidth: Int, srcHeight: Int, x: Int, y: Int) {
+        CVPixelBufferLockBaseAddress(tile, [])
+        defer { CVPixelBufferUnlockBaseAddress(tile, []) }
 
-    private func processTile(_ inputArray: MLMultiArray) -> MLMultiArray? {
-        guard let featureProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputArray]),
-              let prediction = try? model.prediction(from: featureProvider),
-              let outputArray = prediction.featureValue(for: "output")?.multiArrayValue else {
-            logger.error("Core ML 推理失败")
-            return nil
+        guard let dstBase = CVPixelBufferGetBaseAddress(tile) else { return }
+        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(tile)
+        let dst = dstBase.assumingMemoryBound(to: UInt8.self)
+
+        let copyWidth = min(inputWidth, srcWidth - x)
+        let copyHeight = min(inputHeight, srcHeight - y)
+        
+        for row in 0..<copyHeight {
+            let srcRow = src.advanced(by: (y + row) * srcBytesPerRow + x * 4)
+            let dstRow = dst.advanced(by: row * dstBytesPerRow)
+            memcpy(dstRow, srcRow, copyWidth * 4)
+            
+            if copyWidth < inputWidth {
+                let lastPixelOffset = (copyWidth - 1) * 4
+                for outX in copyWidth..<inputWidth {
+                    let dstOffset = outX * 4
+                    let dstPixel = dstRow.advanced(by: dstOffset)
+                    let lastPixel = dstRow.advanced(by: lastPixelOffset)
+                    
+                    dstPixel.pointee = lastPixel.pointee
+                    dstPixel.advanced(by: 1).pointee = lastPixel.advanced(by: 1).pointee
+                    dstPixel.advanced(by: 2).pointee = lastPixel.advanced(by: 2).pointee
+                    dstPixel.advanced(by: 3).pointee = lastPixel.advanced(by: 3).pointee
+                }
+            }
         }
-        return outputArray
+        
+        if copyHeight < inputHeight {
+            let lastRowOffset = (copyHeight - 1) * dstBytesPerRow
+            for outY in copyHeight..<inputHeight {
+                let dstRow = dst.advanced(by: outY * dstBytesPerRow)
+                let srcRow = dst.advanced(by: lastRowOffset)
+                memcpy(dstRow, srcRow, dstBytesPerRow)
+            }
+        }
     }
 
-    // MARK: - 瓦片累加（Float 累加器，带羽化权重）
+    private func predictTile(_ inputBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let inputFeature = MLFeatureValue(pixelBuffer: inputBuffer)
+        guard let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputFeature]),
+              let prediction = try? model.prediction(from: inputProvider),
+              let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
+            return nil
+        }
+        return outputBuffer
+    }
 
-    private func accumulateTile(
-        _ array: MLMultiArray,
+    private func accumulateOutputBuffer(
+        _ outputBuffer: CVPixelBuffer,
         accumR: inout [Float],
         accumG: inout [Float],
         accumB: inout [Float],
         accumW: inout [Float],
-        dstX: Int,
-        dstY: Int,
-        tileSize: Int,
-        outputWidth: Int,
-        outputHeight: Int
+        dstX: Int, dstY: Int,
+        tileWidth: Int, tileHeight: Int,
+        outputWidth: Int, outputHeight: Int
     ) {
-        let plane = tileSize * tileSize
-        let totalPixels = min(plane, array.count / 3)
+        guard CVPixelBufferLockBaseAddress(outputBuffer, .readOnly) == kCVReturnSuccess else { return }
+        defer { CVPixelBufferUnlockBaseAddress(outputBuffer, .readOnly) }
 
-        switch array.dataType {
-        case .float16:
-            let srcPtr = array.dataPointer.assumingMemoryBound(to: Float16.self)
-            for idx in 0..<totalPixels {
-                let ty = idx / tileSize
-                let tx = idx % tileSize
+        guard let srcAddr = CVPixelBufferGetBaseAddress(outputBuffer) else { return }
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
+        let src = srcAddr.assumingMemoryBound(to: UInt8.self)
+
+        for ty in 0..<tileHeight {
+            for tx in 0..<tileWidth {
                 let outY = dstY + ty
                 let outX = dstX + tx
                 guard outY >= 0 && outY < outputHeight && outX >= 0 && outX < outputWidth else { continue }
 
-                let yWeight = featherWeight(position: ty, size: tileSize)
-                let xWeight = featherWeight(position: tx, size: tileSize)
+                let yWeight = featherWeight(position: ty, size: tileHeight)
+                let xWeight = featherWeight(position: tx, size: tileWidth)
                 let weight = xWeight * yWeight
                 guard weight > 0 else { continue }
 
-                let rIdx = 0 * plane + idx
-                let gIdx = 1 * plane + idx
-                let bIdx = 2 * plane + idx
-                guard rIdx < array.count && gIdx < array.count && bIdx < array.count else { break }
-
+                let srcOffset = ty * srcBytesPerRow + tx * 4
                 let outIdx = outY * outputWidth + outX
-                accumR[outIdx] += Float(srcPtr[rIdx]) * weight
-                accumG[outIdx] += Float(srcPtr[gIdx]) * weight
-                accumB[outIdx] += Float(srcPtr[bIdx]) * weight
+
+                accumR[outIdx] += Float(src[srcOffset + 2]) / 255.0 * weight
+                accumG[outIdx] += Float(src[srcOffset + 1]) / 255.0 * weight
+                accumB[outIdx] += Float(src[srcOffset + 0]) / 255.0 * weight
                 accumW[outIdx] += weight
             }
-        case .float32:
-            let srcPtr = array.dataPointer.assumingMemoryBound(to: Float32.self)
-            for idx in 0..<totalPixels {
-                let ty = idx / tileSize
-                let tx = idx % tileSize
-                let outY = dstY + ty
-                let outX = dstX + tx
-                guard outY >= 0 && outY < outputHeight && outX >= 0 && outX < outputWidth else { continue }
-
-                let yWeight = featherWeight(position: ty, size: tileSize)
-                let xWeight = featherWeight(position: tx, size: tileSize)
-                let weight = xWeight * yWeight
-                guard weight > 0 else { continue }
-
-                let rIdx = 0 * plane + idx
-                let gIdx = 1 * plane + idx
-                let bIdx = 2 * plane + idx
-                guard rIdx < array.count && gIdx < array.count && bIdx < array.count else { break }
-
-                let outIdx = outY * outputWidth + outX
-                accumR[outIdx] += srcPtr[rIdx] * weight
-                accumG[outIdx] += srcPtr[gIdx] * weight
-                accumB[outIdx] += srcPtr[bIdx] * weight
-                accumW[outIdx] += weight
-            }
-        default:
-            logger.error("不支持的输出数据类型: \(array.dataType.rawValue)")
         }
     }
 
-    /// 计算边缘羽化权重（0~1），中心区域为1，边缘线性衰减
     private func featherWeight(position: Int, size: Int) -> Float {
-        let fw = featherWidth
-        if position < fw {
-            return Float(position + 1) / Float(fw + 1)
-        } else if position >= size - fw {
-            return Float(size - position) / Float(fw + 1)
+        let fw: Float = Float(outputFeatherWidth)
+        let pos: Float = Float(position)
+        let sz: Float = Float(size)
+        
+        if pos < fw {
+            let ratio: Float = pos / fw
+            return ratio * ratio * (3.0 - 2.0 * ratio)
+        } else if pos >= sz - fw {
+            let ratio: Float = (sz - pos) / fw
+            return ratio * ratio * (3.0 - 2.0 * ratio)
         } else {
             return 1.0
         }
     }
-
-    // MARK: - 创建输出缓冲区（归一化 Float 累加器 → BGRA）
 
     private func createOutputBuffer(
         width: Int,
@@ -321,8 +270,9 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
-              let result = buffer else {
+        
+        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
+        guard status == kCVReturnSuccess, let result = buffer else {
             return nil
         }
 
@@ -341,7 +291,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let pixelOffset = rowOffset + x * 4
 
                 if w > 0 {
-                    // GAN 输出需 Clamp，累加归一化后钳制到 [0,255]
                     let b = accumB[idx] / w
                     let g = accumG[idx] / w
                     let r = accumR[idx] / w
@@ -360,7 +309,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return result
     }
 
-    // MARK: - 颜色空间附件复制
+    // MARK: - 颜色空间附件复制 (已修复API 报错)
 
     private func copyColorSpaceAttachments(from src: CVPixelBuffer, to dst: CVPixelBuffer) {
         let colorKeys: [CFString] = [
@@ -371,8 +320,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            if let unmanagedValue = CVBufferGetAttachment(src, key, nil) {
-                let value = unmanagedValue.takeUnretainedValue()
+            // CVBufferCopyAttachment 返回的已经是 Any? 对象，不需要 takeUnretainedValue()
+            if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
         }

@@ -3,7 +3,7 @@ name: Convert Real-ESRGAN x4v3 to Core ML
 on:
   workflow_dispatch:
   push:
-    branches: [testping]
+    branches: [test]
     paths:
       - 'Scripts/convert_esrgan.py'
       - 'Scripts/esrgan_model/**'

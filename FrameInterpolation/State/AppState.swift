@@ -52,6 +52,8 @@ final class AppState: ObservableObject {
     @Published var stage: ProcessingStage = .idle
     /// 预计剩余时间（秒），基于已用时间和进度估算
     @Published var estimatedRemaining: TimeInterval = 0
+    /// 进度轮询定时器（每 0.5s 从 pipeline 读取原子进度，避免高频主线程回调）
+    private var progressTimer: Timer?
 
     // MARK: - 结果
     /// 输出视频 URL，非空时展示结果页
@@ -62,6 +64,18 @@ final class AppState: ObservableObject {
     @Published var debugInfo: String = ""
     /// 是否使用AI插值（模型加载成功）
     var isUsingAI: Bool { pipeline.isUsingAIInterpolation }
+
+    // MARK: - 处理统计（结果页展示）
+    /// 总耗时（秒）
+    @Published var totalElapsedSeconds: Double = 0
+    /// CPU 平均使用率（%）
+    @Published var cpuAverage: Double = 0
+    /// CPU 峰值使用率（%）
+    @Published var cpuPeak: Double = 0
+    /// 内存平均占用（MB）
+    @Published var memoryAverageMB: Double = 0
+    /// 内存峰值占用（MB）
+    @Published var memoryPeakMB: Double = 0
 
     // MARK: - Toast
     @Published var toastMessage: String?
@@ -230,6 +244,7 @@ final class AppState: ObservableObject {
         processingStartTime = Date()
 
         // 启动性能监控（处理中页面显示 CPU/内存）
+        performanceMonitor.resetStatistics()
         performanceMonitor.start()
 
         // 统一申请后台任务，处理全程持有（包括最小化到首页）
@@ -240,6 +255,22 @@ final class AppState: ObservableObject {
             .appendingPathComponent("output_\(UUID().uuidString).mp4")
         self.outputURL = nil
 
+        // 启动进度轮询定时器（每 0.5s 从 pipeline 读取原子进度，避免高频主线程回调）
+        progressTimer?.invalidate()
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let (value, stage) = self.pipeline.pollProgress()
+            self.progress = value
+            self.stage = stage
+            if self.totalFrames > 0 {
+                self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
+            }
+            if let start = self.processingStartTime, value > 0.01 {
+                let elapsed = Date().timeIntervalSince(start)
+                self.estimatedRemaining = elapsed * (1.0 - value) / value
+            }
+        }
+
         pipeline.process(
             inputURL: video.url,
             outputURL: outputURL,
@@ -247,21 +278,17 @@ final class AppState: ObservableObject {
             fastMode: fastMode,
             outputResolution: outputResolution,
             progress: { [weak self] value, stage in
+                // 进度防抖：循环中不再调用此闭包，仅完成时可能调用 1.0
                 guard let self = self else { return }
                 self.progress = value
                 self.stage = stage
-                // 根据进度计算已处理帧数
-                if self.totalFrames > 0 {
-                    self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
-                }
-                // 基于已用时间和进度估算剩余时间（超分模式进度更新细，降低阈值到 0.1%）
-                if let start = self.processingStartTime, value > 0.001 {
-                    let elapsed = Date().timeIntervalSince(start)
-                    self.estimatedRemaining = elapsed * (1.0 - value) / value
-                }
             },
             completion: { [weak self] result in
                 guard let self = self else { return }
+
+                // 停止进度轮询定时器
+                self.progressTimer?.invalidate()
+                self.progressTimer = nil
 
                 // 停止性能监控
                 self.performanceMonitor.stop()
@@ -272,6 +299,15 @@ final class AppState: ObservableObject {
                     self.progress = 1.0
                     self.estimatedRemaining = 0
                     self.outputURL = url
+
+                    // 记录处理统计（总耗时、CPU/内存平均与峰值）
+                    if let start = self.processingStartTime {
+                        self.totalElapsedSeconds = Date().timeIntervalSince(start)
+                    }
+                    self.cpuAverage = self.performanceMonitor.cpuAverage
+                    self.cpuPeak = self.performanceMonitor.cpuPeak
+                    self.memoryAverageMB = self.performanceMonitor.memoryAverage
+                    self.memoryPeakMB = self.performanceMonitor.memoryPeak
 
                     // 根据实际模式设置处理描述
                     switch mode {
@@ -310,6 +346,12 @@ final class AppState: ObservableObject {
                     )
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
+                    // 处理完成发本地通知（用户切后台时能收到）
+                    self.sendBackgroundNotification(
+                        title: "处理完成",
+                        body: "视频已处理完成，点击查看结果",
+                        identifier: "bz_process_complete"
+                    )
                     // 记录本机实测处理速度系数（视频时长/实际耗时）
                     if let start = self.processingStartTime,
                        let videoDuration = self.selectedVideo?.duration,
@@ -409,21 +451,25 @@ final class AppState: ObservableObject {
         // 任务完成后（outputURL != nil）不再发后台通知
         guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
         sendBackgroundNotification(
-            title: "补帧处理中",
-            body: "你刚切到后台，处理将继续约30秒，点我回到App继续",
+            title: "视频处理中",
+            body: "为避免处理中断，建议保持App在前台，后台可能被系统暂停",
             identifier: "bz_bg_warning"
         )
     }
 
-    /// 后台时间即将耗尽时调用
+    /// 后台时间即将耗尽时调用（只记录日志，不发通知避免频繁打扰）
     func backgroundTimeExpiring() {
-        // 任务完成后不再发通知
         guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
-        sendBackgroundNotification(
-            title: "补帧即将暂停",
-            body: "系统马上要挂起任务，点我回来继续处理",
-            identifier: "bz_bg_expiring"
-        )
+        logger.warning("后台任务时间即将耗尽，处理可能被系统中断")
+    }
+
+    /// 应用回到前台时调用，检查处理状态
+    func applicationWillEnterForeground() {
+        // 如果处理失败（后台被系统杀死），提示用户
+        if stage == .failed {
+            showToast("后台处理被系统中断，请重新开始", style: .warning)
+            logger.warning("应用回到前台，检测到处理失败（可能后台被系统中断）")
+        }
     }
 
     private func sendBackgroundNotification(title: String, body: String, identifier: String) {

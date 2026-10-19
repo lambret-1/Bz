@@ -46,6 +46,8 @@ class SRVGGNetCompact(nn.Module):
         self.body.append(nn.Conv2d(num_feat, num_out_ch * upscale * upscale, 3, 1, 1))
         # 上采样
         self.upsampler = nn.PixelShuffle(upscale)
+        # 固定尺寸最近邻上采样（替代动态 F.interpolate，ANE 更友好）
+        self.nearest_upsample = nn.Upsample(scale_factor=upscale, mode='nearest')
 
     @staticmethod
     def _make_activation(act_type, num_feat):
@@ -65,6 +67,7 @@ class SRVGGNetCompact(nn.Module):
 
         out = self.upsampler(out)
         # 加上最近邻上采样的输入，使网络学习残差
-        base = F.interpolate(x, scale_factor=self.upscale, mode='nearest')
+        base = self.nearest_upsample(x)
         out += base
-        return out
+        # 输出乘以255，适配 ImageType(scale=1.0) 直接输出 UInt8 CVPixelBuffer
+        return out * 255.0
