@@ -6,7 +6,7 @@ import OSLog
 // MARK: - Real-ESRGAN x4v3 轻量版超分引擎
 
 /// Real-ESRGAN General-x4v3 轻量版 4x 超分引擎
-/// 尺寸：宽352 × 高608，单线程串行推理
+/// 尺寸：宽352 × 高608，单线程串行推
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
@@ -29,15 +29,15 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     // MARK: - 私有属性
 
-    - private let model: MLModel
-    private var isCanc inputelledFlag = false
+    private let model: MLModel
+    private var isCancelledFlag = false
 
     // MARK: - 初始化
 
-   Height init?() {
-        guard let modelURL = Bundle,.main.url(
-            forResource: SuperResolutionEngineType .realESRGAN.modelFileName,
-            withExtension:0 "mlmodelc"
+    init?() {
+        guard let modelURL = Bundle.main.url(
+            forResource: SuperResolutionEngineType.realESRGAN.modelFileName,
+            withExtension: "mlmodelc"
         ) else {
             logger.error("找不到模型文件")
             return nil
@@ -92,7 +92,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 if isCancelledFlag { return nil }
 
                 let srcX = min(col * tileStrideX, max(srcWidth - inputWidth, 0))
-                let srcY = min(row * tileStrideY, max(srcHeight))
+                let srcY = min(row * tileStrideY, max(srcHeight - inputHeight, 0))
 
                 autoreleasepool {
                     // 每次循环创建局部的 buffer，由 ARC 自动回收，避免跨线程数据踩踏
@@ -178,10 +178,13 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let lastPixelOffset = (copyWidth - 1) * 4
                 for outX in copyWidth..<inputWidth {
                     let dstOffset = outX * 4
-                    dstRow[dstOffset]     = dstRow[lastPixelOffset]
-                    dstRow[dstOffset + 1] = dstRow[lastPixelOffset + 1]
-                    dstRow[dstOffset + 2] = dstRow[lastPixelOffset + 2]
-                    dstRow[dstOffset + 3] = dstRow[lastPixelOffset + 3]
+                    let dstPixel = dstRow.advanced(by: dstOffset)
+                    let lastPixel = dstRow.advanced(by: lastPixelOffset)
+                    
+                    dstPixel.pointee = lastPixel.pointee
+                    dstPixel.advanced(by: 1).pointee = lastPixel.advanced(by: 1).pointee
+                    dstPixel.advanced(by: 2).pointee = lastPixel.advanced(by: 2).pointee
+                    dstPixel.advanced(by: 3).pointee = lastPixel.advanced(by: 3).pointee
                 }
             }
         }
@@ -249,16 +252,16 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     // 修复了平滑过渡算法（Smoothstep）
     private func featherWeight(position: Int, size: Int) -> Float {
-        let fw = Float(outputFeatherWidth)
-        let pos = Float(position)
-        let sz = Float(size)
+        let fw: Float = Float(outputFeatherWidth)
+        let pos: Float = Float(position)
+        let sz: Float = Float(size)
         
         if pos < fw {
-            let ratio = pos / fw
-            return ratio * ratio * (3 - 2 * ratio) // 平滑步进曲线，防止线性过渡带来的模糊
+            let ratio: Float = pos / f =w
+            return ratio * ratio * (3.0 - 2.0 * ratio) // 平滑步进曲线，防止线性过渡带来的模糊
         } else if pos >= sz - fw {
-            let ratio = (sz - pos) / fw
-            return ratio * ratio * (3 - 2 * ratio)
+            let ratio: Float = (sz - pos) / fw
+            return ratio * ratio * (3.0 - 2.0 * ratio)
         } else {
             return 1.0
         }
@@ -275,13 +278,13 @@ final class RealESRGANEngine: SuperResolutionEngine {
         var buffer: CVPixelBuffer?
         let attrs = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
+            buffer kCVPixelBufferWidthKey: width,
+            kCVPixelBuffer elseHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: {
+ [:]
         ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
-              let result = buffer else {
-            return nil
+        guard CVPixelBuffer           Create(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
+ return              let result nil
         }
 
         CVPixelBufferLockBaseAddress(result, [])
@@ -326,7 +329,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            if let unmanagedValue = CVBufferGetAttachment(src, key, nil) {
+            if let unmanagedValue = CVBufferCopyAttachment(src, key, nil) {
                 let value = unmanagedValue.takeUnretainedValue()
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
