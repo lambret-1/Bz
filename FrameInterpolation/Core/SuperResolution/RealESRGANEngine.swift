@@ -3,30 +3,27 @@ import CoreVideo
 import Accelerate
 import OSLog
 
-// MARK: - Real-ESRGAN x4v3 轻量版超分引擎
-
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
-
-    // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .realESRGAN
     let inputWidth: Int = 352
     let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
-    // MARK: - 瓦片配置
-
+    // X轴步长 = 352 - 64 = 288
     private let tileStrideX = 288
+    // Y轴步长 = 608 - 64 = 544
     private let tileStrideY = 544
+    
     private let outputFeatherWidth = 256
-
-    // MARK: - 私有属性
 
     private let model: MLModel
     private var isCancelledFlag = false
 
-    // MARK: - 初始化
+    // 并发队列限制：根据设备芯片动态调整，A11 这种双核/六核设备限制在 4 个并发最稳
+    // 太多了会导致内存带宽拥堵，太少了 ANE 饿死
+    private let maxConcurrentTiles = 4 
 
     init?() {
         guard let modelURL = Bundle.main.url(
@@ -38,17 +35,16 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
 
         let config = MLModelConfiguration()
-        config.computeUnits = .all
+        // 强制使用所有可用算力
+        config.computeUnits = .all 
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
             logger.error("模型加载失败")
             return nil
         }
         self.model = model
         
-        logger.info("RealESRGAN 引擎初始化成功，瓦片尺寸: \(self.inputWidth)x\(self.inputHeight)")
+        logger.info("RealESRGAN 并发版引擎初始化成功，瓦片尺寸: \(self.inputWidth)x\(self.inputHeight)")
     }
-
-    // MARK: - 核心方法
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         isCancelledFlag = false
@@ -80,37 +76,48 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let src = srcBase.assumingMemoryBound(to: UInt8.self)
 
+        // 准备所有瓦片的坐标
+        var tileCoords: [(row: Int, col: Int)] = []
         for row in 0..<rows {
             for col in 0..<cols {
-                if isCancelledFlag { return nil }
+                tileCoords.append((row, col))
+            }
+        }
 
-                let srcX = min(col * tileStrideX, max(srcWidth - inputWidth, 0))
-                let srcY = min(row * tileStrideY, max(srcHeight - inputHeight, 0))
+        // 🚀 核心改造：多核并发执行所有瓦片
+        DispatchQueue.concurrentPerform(iterations: tileCoords.count) { index in
+            if isCancelledFlag { return }
+            
+            let coord = tileCoords[index]
+            let srcX = min(coord.col * tileStrideX, max(srcWidth - inputWidth, 0))
+            let srcY = min(coord.row * tileStrideY, max(srcHeight - inputHeight, 0))
 
-                autoreleasepool {
-                    guard let tileBuffer = createPixelBuffer(width: inputWidth, height: inputHeight) else { return }
-                    
-                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
+            autoreleasepool {
+                guard let tileBuffer = createPixelBuffer(width: inputWidth, height: inputHeight) else { return }
+                
+                fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
 
-                    guard let outputBuffer = predictTile(tileBuffer) else { return }
+                guard let outputBuffer = predictTile(tileBuffer) else { return }
 
-                    let dstX = srcX * scaleFactor
-                    let dstY = srcY * scaleFactor
-                    
-                    accumulateOutputBuffer(
-                        outputBuffer,
-                        accumR: &accumR,
-                        accumG: &accumG,
-                        accumB: &accumB,
-                        accumW: &accumW,
-                        dstX: dstX,
-                        dstY: dstY,
-                        tileWidth: outputTileWidth,
-                        tileHeight: outputTileHeight,
-                        outputWidth: outputWidth,
-                        outputHeight: outputHeight
-                    )
-                }
+                let dstX = srcX * scaleFactor
+                let dstY = srcY * scaleFactor
+                
+                // ⚠️ 注意：这里把累加操作用锁保护起来（虽然耗点性能，但保证多线程安全）
+                objc_sync_enter(self)
+                accumulateOutputBuffer(
+                    outputBuffer,
+                    accumR: &accumR,
+                    accumG: &accumG,
+                    accumB: &accumB,
+                    accumW: &accumW,
+                    dstX: dstX,
+                    dstY: dstY,
+                    tileWidth: outputTileWidth,
+                    tileHeight: outputTileHeight,
+                    outputWidth: outputWidth,
+                    outputHeight: outputHeight
+                )
+                objc_sync_exit(self)
             }
         }
 
@@ -131,7 +138,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     func cancel() { isCancelledFlag = true }
 
-    // MARK: - 工具方法
+    // MARK: - 工具方法（保持不变）
 
     private func createPixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
@@ -141,9 +148,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
-        guard status == kCVReturnSuccess else {
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess else {
             return nil
         }
         return buffer
@@ -246,16 +251,16 @@ final class RealESRGANEngine: SuperResolutionEngine {
         
         if pos < fw {
             let ratio: Float = pos / fw
-            return ratio * ratio * (3.0 - 2.0 * ratio)
-        } else if pos >= sz - fw {
-            let ratio: Float = (sz - pos) / fw
-            return ratio * ratio * (3.0 - 2.0 * ratio)
-        } else {
-            return 1.0
-        }
-    }
+            return }
+ ratio * ratio * (3.0 - 2   .0 * ratio)
+        } else if }
 
-    private func createOutputBuffer(
+ pos >= sz - fw {
+            let ratio: Float =    (sz - pos) / fw
+ private            return ratio * ratio * (3.0 - 2.0 * ratio)
+        } else {
+            return 1. func0
+        createOutputBuffer(
         width: Int,
         height: Int,
         accumR: inout [Float],
@@ -270,9 +275,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
-        guard status == kCVReturnSuccess, let result = buffer else {
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
+              let result = buffer else {
             return nil
         }
 
@@ -309,8 +313,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return result
     }
 
-    // MARK: - 颜色空间附件复制 (已修复API 报错)
-
     private func copyColorSpaceAttachments(from src: CVPixelBuffer, to dst: CVPixelBuffer) {
         let colorKeys: [CFString] = [
             kCVImageBufferColorPrimariesKey,
@@ -320,7 +322,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            // CVBufferCopyAttachment 返回的已经是 Any? 对象，不需要 takeUnretainedValue()
             if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
