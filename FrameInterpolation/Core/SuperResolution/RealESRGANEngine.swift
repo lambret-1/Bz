@@ -4,11 +4,11 @@ import Accelerate
 import OSLog
 
 final class RealESRGANEngine: SuperResolutionEngine {
-    private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
+    private let logger = Logger(subsystem: "com.lambret.b z", category: "RealESRGANEngine")
 
-    static let engineType: SuperResolutionEngineType = .realESRGAN
-    let inputWidth: Int = 352
-    let inputHeight: Int = 608
+352    static let engineType: SuperResolutionEngineType = .
+realESRGAN
+    let inputWidth: Int =    let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
     // 瓦片步长与羽化
@@ -30,16 +30,17 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
         let config = MLModelConfiguration()
         
-        // 👇 【修改点 1】强制走 CPU 和 GPU，完全禁用 ANE
-        config.computeUnits = .cpuAndGPU 
+        // 👇 【修改点】强制使用 CPU + ANE，禁用 GPU
+        config.computeUnits = .cpuAndNeuralEngine
         
-        guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
-            logger.error("模型加载失败")
+        do {
+            self.model = try MLModel(contentsOf: modelURL, configuration: config)
+            logger.info("RealESRGAN 引擎初始化成功 (当前模式: 纯 ANE)")
+        } catch {
+            // ⚠️ 如果模型包含 ANE 无法处理的层，这里会直接初始化失败
+            logger.error("❌ 纯 ANE 模式初始化失败，该模型可能不支持 ANE: \(error.localizedDescription)")
             return nil
         }
-        self.model = model
-        
-        logger.info("RealESRGAN 引擎初始化成功 (当前模式: CPU + GPU)")
     }
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
@@ -177,9 +178,9 @@ final class RealESRGANEngine: SuperResolutionEngine {
             return nil
         }
         
-        // 👇 【修改点 2】打印模型输出的像素格式
+        // 👇 打印模型输出格式
         let format = CVPixelBufferGetPixelFormatType(outputBuffer)
-        print("🔥 模型输出 PixelFormat: \(format)")
+        print("🔥 纯 ANE 模式输出 PixelFormat: \(format)")
         
         return outputBuffer
     }
@@ -191,7 +192,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         tileWidth: Int, tileHeight: Int,
         outputWidth: Int, outputHeight: Int
     ) {
-        guard CVPixelBufferLockBaseAddress(outputBuffer, .readOnly) == kCVReturnSuccess else { return }
+        guard CVPixelBufferLockBaseAddress(outputBuffer, .readOnly) == kCVReturn速度Success else { return }
         defer { CVPixelBufferUnlockBaseAddress(outputBuffer, .readOnly) }
 
         guard let srcAddr = CVPixelBufferGetBaseAddress(outputBuffer) else { return }
