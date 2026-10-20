@@ -207,22 +207,22 @@ final class VideoPipeline {
         var outputWidth = Int(naturalSize.width) * targetScale
         var outputHeight = Int(naturalSize.height) * targetScale
 
-        // 计算目标高度（保持宽高比）
-        let targetHeight: Int?
+        // 计算目标宽度（保持宽高比）
+        let targetWidth: Int?
         switch outputResolution {
         case .auto:
-            targetHeight = nil
-        case .p720:
-            targetHeight = 720
-        case .p1080:
-            targetHeight = 1080
+            targetWidth = nil
+        case .w1280:
+            targetWidth = 1280
+        case .w1920:
+            targetWidth = 1920
         }
 
         var needsScaling = false
-        if let targetH = targetHeight, outputHeight > targetH {
-            let scale = Double(targetH) / Double(outputHeight)
-            outputWidth = Int(Double(outputWidth) * scale)
-            outputHeight = targetH
+        if let targetW = targetWidth, outputWidth > targetW {
+            let scale = Double(targetW) / Double(outputWidth)
+            outputHeight = Int(Double(outputHeight) * scale)
+            outputWidth = targetW
             // 确保宽高为偶数（H.264 编码要求）
             outputWidth = outputWidth - (outputWidth % 2)
             outputHeight = outputHeight - (outputHeight % 2)
