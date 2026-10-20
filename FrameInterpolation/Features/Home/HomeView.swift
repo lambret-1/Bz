@@ -34,7 +34,7 @@ struct HomeView: View {
                 }
 
                 // 功能入口：视频导入 + 图片超分 并排大图标
-                HStack(spacing: DesignTokens.Spacing.xxl) {
+                HStack(spacing: DesignTokens.Spacing.l) {
                     // 视频导入
                     Button {
                         showPicker = true
