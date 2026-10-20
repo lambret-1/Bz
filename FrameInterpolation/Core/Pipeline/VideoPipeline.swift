@@ -231,7 +231,6 @@ final class VideoPipeline {
                 needsScaling = true
             }
         }
-        }
 
         guard outputWidth > 0, outputHeight > 0 else {
             throw PipelineError.invalidVideoSize
