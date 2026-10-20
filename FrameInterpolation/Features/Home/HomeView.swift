@@ -33,109 +33,47 @@ struct HomeView: View {
                     }
                 }
 
-                // 1. 导入视频卡片
-                CardView {
-                    VStack(spacing: DesignTokens.Spacing.m) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                            .font(.system(size: 48))
-                            .foregroundColor(DesignTokens.Colors.accent)
-
-                        Text("导入视频开始增强")
-                            .font(.headline)
-
-                        Text("支持 AI 补帧与超分辨率，完全本地处理")
-                            .font(.subheadline)
-                            .foregroundColor(DesignTokens.Colors.textSecondary)
-                            .multilineTextAlignment(.center)
-
-                        PrimaryButton(title: "从相册选择视频") {
-                            showPicker = true
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-
-                // 2. 图片超分卡片
-                CardView {
-                    VStack(spacing: DesignTokens.Spacing.m) {
-                        if isProcessingImage {
-                            ProgressView()
-                                .scaleEffect(1.5)
-                                .padding(.vertical, 20)
-                            Text("AI 正在超分图片...")
-                                .font(.subheadline)
-                                .foregroundColor(DesignTokens.Colors.textSecondary)
-                            
-                        } else if let outputImage = outputImage {
-                            Image(uiImage: outputImage)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxHeight: 200)
-                                .cornerRadius(DesignTokens.Radius.s)
-                                .shadow(radius: 4)
-                            
-                            HStack(spacing: DesignTokens.Spacing.m) {
-                                Button {
-                                    saveImageToAlbum(outputImage)
-                                } label: {
-                                    HStack(spacing: 6) {
-                                        if isSavingImage {
-                                            ProgressView().tint(.white)
-                                        } else {
-                                            Image(systemName: "square.and.arrow.down")
-                                        }
-                                        Text(isSavingImage ? "保存中…" : "保存到相册")
-                                    }
-                                    .font(.subheadline.weight(.medium))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 44)
-                                    .background(isSavingImage ? DesignTokens.Colors.accent.opacity(0.5) : DesignTokens.Colors.accent)
-                                    .cornerRadius(DesignTokens.Radius.m)
-                                }
-                                .disabled(isSavingImage)
-                                
-                                Button {
-                                    withAnimation {
-                                        self.outputImage = nil
-                                        self.inputImage = nil
-                                        self.selectedPhotoItem = nil
-                                    }
-                                } label: {
-                                    Text("重新选择")
-                                        .font(.subheadline.weight(.medium))
-                                        .foregroundColor(DesignTokens.Colors.accent)
-                                        .frame(maxWidth: .infinity)
-                                        .frame(height: 44)
-                                        .background(DesignTokens.Colors.bgSecondary)
-                                        .cornerRadius(DesignTokens.Radius.m)
-                                }
-                            }
-                        } else {
-                            Image(systemName: "photo.badge.plus")
-                                .font(.system(size: 48))
+                // 功能入口：视频导入 + 图片超分 并排大图标
+                HStack(spacing: DesignTokens.Spacing.xxl) {
+                    // 视频导入
+                    Button {
+                        showPicker = true
+                    } label: {
+                        VStack(spacing: DesignTokens.Spacing.s) {
+                            Image(systemName: "film.stack")
+                                .font(.system(size: 44))
                                 .foregroundColor(DesignTokens.Colors.accent)
-
-                            Text("图片 AI 超分")
-                                .font(.headline)
-
-                            Text("将模糊旧图放大 4 倍并补充细节，支持人像修复")
-                                .font(.subheadline)
-                                .foregroundColor(DesignTokens.Colors.textSecondary)
-                                .multilineTextAlignment(.center)
-
-                            PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
-                                Text("从相册选择图片")
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 12)
-                                    .background(DesignTokens.Colors.accent)
-                                    .cornerRadius(DesignTokens.Radius.m)
-                            }
+                            Text("视频导入")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundColor(DesignTokens.Colors.textPrimary)
                         }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 120)
+                        .background(DesignTokens.Colors.bgSecondary)
+                        .cornerRadius(DesignTokens.Radius.l)
                     }
-                    .frame(maxWidth: .infinity)
+                    .buttonStyle(.plain)
+
+                    // 图片超分
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                        VStack(spacing: DesignTokens.Spacing.s) {
+                            if isProcessingImage {
+                                ProgressView()
+                                    .scaleEffect(1.2)
+                            } else {
+                                Image(systemName: "photo.badge.plus")
+                                    .font(.system(size: 44))
+                                    .foregroundColor(DesignTokens.Colors.accent)
+                            }
+                            Text(isProcessingImage ? "处理中…" : "图片超分")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundColor(DesignTokens.Colors.textPrimary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 120)
+                        .background(DesignTokens.Colors.bgSecondary)
+                        .cornerRadius(DesignTokens.Radius.l)
+                    }
                 }
                 .onChange(of: selectedPhotoItem) { newItem in
                     Task {
@@ -254,6 +192,17 @@ struct HomeView: View {
         .fullScreenCover(isPresented: $appState.isProcessing) {
             ProcessingView()
                 .environmentObject(appState)
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { outputImage != nil },
+            set: { if !$0 { outputImage = nil; inputImage = nil; selectedPhotoItem = nil } }
+        )) {
+            ImageSRResultView(
+                outputImage: outputImage,
+                isSaving: $isSavingImage,
+                onSave: { saveImageToAlbum(outputImage!) },
+                onClose: { outputImage = nil }
+            )
         }
     }
     
@@ -378,6 +327,49 @@ struct RecentRecordCard: View {
                 onDelete?()
             } label: {
                 Label("删除", systemImage: "trash")
+            }
+        }
+    }
+}
+
+// MARK: - 图片超分结果页（独立全屏）
+struct ImageSRResultView: View {
+    let outputImage: UIImage?
+    @Binding var isSaving: Bool
+    let onSave: () -> Void
+    let onClose: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: DesignTokens.Spacing.l) {
+                    if let image = outputImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .cornerRadius(DesignTokens.Radius.m)
+                            .padding(.horizontal, DesignTokens.Spacing.m)
+                    }
+                }
+            }
+            .background(DesignTokens.Colors.bgPrimary)
+            .navigationTitle("图片超分结果")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("完成") { onClose() }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                PrimaryButton(
+                    title: isSaving ? "保存中…" : "保存到相册",
+                    isLoading: isSaving
+                ) {
+                    onSave()
+                }
+                .padding(DesignTokens.Spacing.m)
+                .background(DesignTokens.Colors.bgPrimary)
             }
         }
     }
