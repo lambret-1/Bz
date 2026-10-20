@@ -141,8 +141,8 @@ enum FrameMultiplier: Int, CaseIterable, Identifiable {
 // MARK: - 输出分辨率
 enum OutputResolution: String, CaseIterable, Identifiable {
     case auto = "自动"
-    case w1280 = "1280宽"
-    case w1920 = "1920宽"
+    case p720 = "720p"
+    case p1080 = "1080p"
 
     var id: String { rawValue }
 }
