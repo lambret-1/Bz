@@ -1,4 +1,5 @@
 import SwiftUI
+import PhotosUI
 
 /// 首页：导入卡片 + 最近记录
 /// 选择视频后通过独立 fullScreenCover 展示参数设置页，不共用导航栈
@@ -7,12 +8,20 @@ struct HomeView: View {
     @State private var showPicker = false
     @State private var showAppSettings = false
 
+    // --- 图片超分新增状态 ---
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var inputImage: UIImage?
+    @State private var outputImage: UIImage?
+    @State private var isProcessingImage = false
+    // 实例化图片处理服务
+    private let imageSRService = ImageSuperResolutionService()
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
                 // 顶部标题
                 HStack {
-                    Text("视频增强")
+                    Text("AI 增强")
                         .font(.largeTitle.bold())
                     Spacer()
                     Button {
@@ -24,7 +33,7 @@ struct HomeView: View {
                     }
                 }
 
-                // 导入卡片
+                // 1. 导入视频卡片
                 CardView {
                     VStack(spacing: DesignTokens.Spacing.m) {
                         Image(systemName: "photo.on.rectangle.angled")
@@ -39,14 +48,88 @@ struct HomeView: View {
                             .foregroundColor(DesignTokens.Colors.textSecondary)
                             .multilineTextAlignment(.center)
 
-                        PrimaryButton(title: "从相册选择") {
+                        PrimaryButton(title: "从相册选择视频") {
                             showPicker = true
+                        }
+                    }
+                   2 .frame(maxWidth: .infinity)
+                }
+
+                // . 图片超分卡片 (新增)
+                CardView {
+                    VStack(spacing: DesignTokens.Spacing.m) {
+                        if isProcessingImage {
+                            ProgressView()
+                                .scaleEffect(1.5)
+                                .padding(.vertical, 20)
+                            Text("AI 正在超分图片...")
+                                .font(.subheadline)
+                                .foregroundColor(DesignTokens.Colors.textSecondary)
+                            
+                        } else if let outputImage = outputImage {
+                            // 处理完成展示
+                            Image(uiImage: outputImage)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxHeight: 200)
+                                .cornerRadius(DesignTokens.Radius.s)
+                                .shadow(radius: 4)
+                            
+                            HStack(spacing: DesignTokens.Spacing.m) {
+                                Button("保存到相册") {
+                                    UIImageWriteToSavedPhotosAlbum(outputImage, nil, nil, nil)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .tint(DesignTokens.Colors.accent)
+                                
+                                Button("重新选择") {
+                                    self.outputImage = nil
+                                    self.inputImage = nil
+                                    self.selectedPhotoItem = nil
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        } else {
+                            // 默认选择状态
+                            Image(systemName: "photo.badge.plus")
+                                .font(.system(size: 48))
+                                .foregroundColor(DesignTokens.Colors.accent)
+
+                            Text("图片 AI 超分")
+                                .font(.headline)
+
+                            Text("将模糊旧图放大 4 倍并补充细节，支持人像修复")
+                                .font(.subheadline)
+                                .foregroundColor(DesignTokens.Colors.textSecondary)
+                                .multilineTextAlignment(.center)
+
+                            PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                                Text("从相册选择图片")
+                                    .font(.system(size: 16, weight: .medium))
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 12)
+                                    .background(DesignTokens.Colors.accent)
+                                    .cornerRadius(DesignTokens.Radius.m)
+                            }
                         }
                     }
                     .frame(maxWidth: .infinity)
                 }
+                // 监听图片选择
+                .onChange(of: selectedPhotoItem) { newItem in
+                    Task {
+                        if let data = try? await newItem?.loadTransferable(type: Data.self),
+                           let uiImage = UIImage(data: data) {
+                            await MainActor.run {
+                                self.inputImage = uiImage
+                                startImageUpscale(uiImage)
+                            }
+                        }
+                    }
+                }
 
-                // 最近记录
+                // 3. 最近记录
                 HStack {
                     Text("最近记录")
                         .font(.headline)
@@ -156,6 +239,21 @@ struct HomeView: View {
         .fullScreenCover(isPresented: $appState.isProcessing) {
             ProcessingView()
                 .environmentObject(appState)
+        }
+    }
+    
+    // 触发图片超分的方法
+    private func startImageUpscale(_ image: UIImage) {
+        isProcessingImage = true
+        imageSRService.processImage(image) { result in
+            isProcessingImage = false
+            if let result = result {
+                self.outputImage = result
+            } else {
+                // 处理失败
+                appState.toastMessage = "图片处理失败，请重试"
+                appState.toastStyle = .error // 假设你有 error 样式
+            }
         }
     }
 }
