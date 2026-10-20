@@ -11,18 +11,13 @@ final class RealESRGANEngine: SuperResolutionEngine {
     let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
+    // 瓦片步长与羽化
     private let tileStrideX = 288
     private let tileStrideY = 544
     private let outputFeatherWidth = 256
 
     private let model: MLModel
     private var isCancelledFlag = false
-
-    // 针对 iPhone 14 优化：使用内存池
-    private var inputPool: CVPixelBufferPool?
-    
-    // 获取设备真正的物理核心数（A15/A16 通常是 6 核）
-    private let maxConcurrency = ProcessInfo.processInfo.activeProcessorCount
 
     init?() {
         guard let modelURL = Bundle.main.url(
@@ -34,7 +29,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
 
         let config = MLModelConfiguration()
-        // 针对 A15/A16，全部砸给 ANE 和 GPU
         config.computeUnits = .all 
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
             logger.error("模型加载失败")
@@ -42,21 +36,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
         self.model = model
         
-        // 初始化内存池
-        setupInputPool()
-        
-        logger.info("RealESRGAN 极限性能版初始化成功，并发线程数: \(self.maxConcurrency)")
-    }
-
-    private func setupInputPool() {
-        let poolAttributes = [kCVPixelBufferPoolMinimumBufferCountKey as String: maxConcurrency + 4] as CFDictionary
-        let bufferAttributes = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: inputWidth,
-            kCVPixelBufferHeightKey: inputHeight,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
-        ] as CFDictionary
-        CVPixelBufferPoolCreate(nil, poolAttributes, bufferAttributes, &inputPool)
+        logger.info("RealESRGAN 纯串行版初始化成功")
     }
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
@@ -69,23 +49,11 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let outputHeight = srcHeight * scaleFactor
         let pixelCount = outputWidth * outputHeight
 
-        // 使用 UnsafeMutablePointer 避免 Swift Array 的并发独占检查
-        let accumR = UnsafeMutablePointer<Float>.allocate(capacity: pixelCount)
-        let accumG = UnsafeMutablePointer<Float>.allocate(capacity: pixelCount)
-        let accumB = UnsafeMutablePointer<Float>.allocate(capacity: pixelCount)
-        let accumW = UnsafeMutablePointer<Float>.allocate(capacity: pixelCount)
-        
-        accumR.initialize(repeating: 0, count: pixelCount)
-        accumG.initialize(repeating: 0, count: pixelCount)
-        accumB.initialize(repeating: 0, count: pixelCount)
-        accumW.initialize(repeating: 0, count: pixelCount)
-        
-        defer {
-            accumR.deallocate()
-            accumG.deallocate()
-            accumB.deallocate()
-            accumW.deallocate()
-        }
+        // 退回最安全的 Swift 数组
+        var accumR = [Float](repeating: 0, count: pixelCount)
+        var accumG = [Float](repeating: 0, count: pixelCount)
+        var accumB = [Float](repeating: 0, count: pixelCount)
+        var accumW = [Float](repeating: 0, count: pixelCount)
 
         let cols = max((srcWidth - inputWidth + tileStrideX - 1) / tileStrideX + 1, 1)
         let rows = max((srcHeight - inputHeight + tileStrideY - 1) / tileStrideY + 1, 1)
@@ -93,60 +61,47 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let outputTileWidth = inputWidth * scaleFactor
         let outputTileHeight = inputHeight * scaleFactor
 
-        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return nil }
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let srcBase = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let src = srcBase.assumingMemoryBound(to: UInt8.self)
 
-        // 将任务拆分为按行并发，限制并发数，防止线程爆炸
-        let semaphore = DispatchSemaphore(value: maxConcurrency)
-        let group = DispatchGroup()
-
+        // 🚀 彻底退回单线程串行，让 ANE 满负荷无间断运转
         for row in 0..<rows {
-            group.enter()
-            semaphore.wait()
-            
-            DispatchQueue.global(qos: .userInitiated).async {
-                defer {
-                    semaphore.signal()
-                    group.leave()
-                }
+            for col in 0..<cols {
+                if isCancelledFlag { return nil }
                 
-                for col in 0..<cols {
-                    if self.isCancelledFlag { return }
+                let srcX = min(col * tileStrideX, max(srcWidth - inputWidth, 0))
+                let srcY = min(row * tileStrideY, max(srcHeight - inputHeight, 0))
+
+                autoreleasepool {
+                    guard let tileBuffer = createPixelBuffer(width: inputWidth, height: inputHeight) else { return }
                     
-                    let srcX = min(col * self.tileStrideX, max(srcWidth - self.inputWidth, 0))
-                    let srcY = min(row * self.tileStrideY, max(srcHeight - self.inputHeight, 0))
+                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
 
-                    autoreleasepool {
-                        guard let tileBuffer = self.createPixelBufferFromPool() else { return }
-                        
-                        self.fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
+                    guard let outputBuffer = predictTile(tileBuffer) else { return }
 
-                        guard let outputBuffer = self.predictTile(tileBuffer) else { return }
-
-                        let dstX = srcX * self.scaleFactor
-                        let dstY = srcY * self.scaleFactor
-                        
-                        self.accumulateOutputBuffer(
-                            outputBuffer,
-                            accumR: accumR, accumG: accumG, accumB: accumB, accumW: accumW,
-                            dstX: dstX, dstY: dstY,
-                            tileWidth: outputTileWidth, tileHeight: outputTileHeight,
-                            outputWidth: outputWidth, outputHeight: outputHeight
-                        )
-                    }
+                    let dstX = srcX * scaleFactor
+                    let dstY = srcY * scaleFactor
+                    
+                    accumulateOutputBuffer(
+                        outputBuffer,
+                        accumR: &accumR, accumG: &accumG, accumB: &accumB, accumW: &accumW,
+                        dstX: dstX, dstY: dstY,
+                        tileWidth: outputTileWidth, tileHeight: outputTileHeight,
+                        outputWidth: outputWidth, outputHeight: outputHeight
+                    )
                 }
             }
         }
 
-        group.wait()
-
         guard let outputBuffer = createOutputBuffer(
             width: outputWidth, height: outputHeight,
-            accumR: accumR, accumG: accumG, accumB: accumB, accumW: accumW
+            accumR: &accumR, accumG: &accumG, accumB: &accumB, accumW: &accumW
         ) else { return nil }
 
         copyColorSpaceAttachments(from: pixelBuffer, to: outputBuffer)
@@ -155,12 +110,19 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     func cancel() { isCancelledFlag = true }
 
-    // MARK: - 内存池与核心逻辑
+    // MARK: - 工具方法
 
-    private func createPixelBufferFromPool() -> CVPixelBuffer? {
-        guard let pool = inputPool else { return nil }
+    private func createPixelBuffer(width: Int, height: Int) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+        let attrs = [
+            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey: width,
+            kCVPixelBufferHeightKey: height,
+            kCVPixelBufferIOSurfacePropertiesKey: [:]
+        ] as CFDictionary
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess else {
+            return nil
+        }
         return buffer
     }
 
@@ -186,6 +148,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
                     let dstOffset = outX * 4
                     let dstPixel = dstRow.advanced(by: dstOffset)
                     let lastPixel = dstRow.advanced(by: lastPixelOffset)
+                    
                     dstPixel.pointee = lastPixel.pointee
                     dstPixel.advanced(by: 1).pointee = lastPixel.advanced(by: 1).pointee
                     dstPixel.advanced(by: 2).pointee = lastPixel.advanced(by: 2).pointee
@@ -214,13 +177,9 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return outputBuffer
     }
 
-    // 传入指针，完全避开 Swift 数组的安全检查
     private func accumulateOutputBuffer(
         _ outputBuffer: CVPixelBuffer,
-        accumR: UnsafeMutablePointer<Float>,
-        accumG: UnsafeMutablePointer<Float>,
-        accumB: UnsafeMutablePointer<Float>,
-        accumW: UnsafeMutablePointer<Float>,
+        accumR: inout [Float], accumG: inout [Float], accumB: inout [Float], accumW: inout [Float],
         dstX: Int, dstY: Int,
         tileWidth: Int, tileHeight: Int,
         outputWidth: Int, outputHeight: Int
@@ -272,8 +231,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     private func createOutputBuffer(
         width: Int, height: Int,
-        accumR: UnsafeMutablePointer<Float>, accumG: UnsafeMutablePointer<Float>,
-        accumB: UnsafeMutablePointer<Float>, accumW: UnsafeMutablePointer<Float>
+        accumR: inout [Float], accumG: inout [Float], accumB: inout [Float], accumW: inout [Float]
     ) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
         let attrs = [
