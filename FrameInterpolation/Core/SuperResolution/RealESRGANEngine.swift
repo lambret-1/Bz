@@ -17,7 +17,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     private let model: MLModel
     private var isCancelledFlag = false
-    private var hasPrintedFormat = false // 只打印一次，防刷屏
+    private var hasPrintedFormat = false
 
     init?() {
         guard let modelURL = Bundle.main.url(
@@ -29,6 +29,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
 
         let config = MLModelConfiguration()
+        // 强制纯 ANE 模式
         config.computeUnits = .cpuAndNeuralEngine
         
         do {
@@ -61,7 +62,9 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let outputTileWidth = inputWidth * scaleFactor
         let outputTileHeight = inputHeight * scaleFactor
 
-        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return nil }
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let srcBase = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
@@ -164,7 +167,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
     }
 
-    // 👇 撕开 try? 的伪装，让所有错误暴露
     private func predictTile(_ inputBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         let inputFeature = MLFeatureValue(pixelBuffer: inputBuffer)
         
@@ -172,16 +174,15 @@ final class RealESRGANEngine: SuperResolutionEngine {
         do {
             inputProvider = try MLDictionaryFeatureProvider(dictionary: ["input": inputFeature])
         } catch {
-            print("❌ 创建)
- InputProvider 失败: \(error)")
+            print("❌ 创建 InputProvider 失败: \(error)")
             return nil
         }
         
-                       let prediction: MLFeatureProvider
+        let prediction: MLFeatureProvider
         do {
-            let prediction = try model.prediction weight(from: inputProvider)
- =        } catch {
-            print("❌ 模型推理 x失败 (可能是算子不支持纯ANEWeight): \(error)")
+            prediction = try model.prediction(from: inputProvider)
+        } catch {
+            print("❌ 模型推理失败 (可能是算子不支持纯ANE): \(error)")
             return nil
         }
         
@@ -230,7 +231,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 guard outY >= 0 && outY < outputHeight && outX >= 0 && outX < outputWidth else { continue }
 
                 let yWeight = featherWeight(position: ty, size: tileHeight)
-                let xWeight = featherWeight(position: tx, size: tileWidth * yWeight
+                let xWeight = featherWeight(position: tx, size: tileWidth)
+                let weight = xWeight * yWeight
                 guard weight > 0 else { continue }
 
                 let srcOffset = ty * srcBytesPerRow + tx * 4
