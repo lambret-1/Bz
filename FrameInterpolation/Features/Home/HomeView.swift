@@ -194,6 +194,15 @@ struct HomeView: View {
                 .environmentObject(appState)
         }
         .fullScreenCover(isPresented: Binding(
+            get: { appState.outputURL != nil && !appState.isProcessing },
+            set: { if !$0 { appState.outputURL = nil } }
+        )) {
+            if let url = appState.outputURL {
+                ResultView(outputURL: url)
+                    .environmentObject(appState)
+            }
+        }
+        .fullScreenCover(isPresented: Binding(
             get: { outputImage != nil },
             set: { if !$0 { outputImage = nil; inputImage = nil; selectedPhotoItem = nil } }
         )) {
