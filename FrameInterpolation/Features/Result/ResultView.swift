@@ -127,6 +127,13 @@ struct ResultView: View {
                 .background(DesignTokens.Colors.bgPrimary)
             }
             .background(DesignTokens.Colors.bgPrimary)
+            .overlay(alignment: .top) {
+                if let message = appState.toastMessage {
+                    ToastView(message: message, style: appState.toastStyle)
+                        .padding(.top, DesignTokens.Spacing.s)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
             .navigationTitle("处理结果")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

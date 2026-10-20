@@ -220,10 +220,26 @@ struct HomeView: View {
 
     private func saveImageToAlbum(_ image: UIImage) {
         isSavingImage = true
-        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            isSavingImage = false
-            appState.showToast("已保存到相册")
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    isSavingImage = false
+                    appState.showToast("没有相册写入权限，请在设置中开启", style: .error)
+                }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            } completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    isSavingImage = false
+                    if success {
+                        appState.showToast("已保存到相册")
+                    } else {
+                        appState.showToast(error?.localizedDescription ?? "保存失败", style: .error)
+                    }
+                }
+            }
         }
     }
 }
@@ -339,6 +355,7 @@ struct ImageSRResultView: View {
     let onSave: () -> Void
     let onClose: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var appState: AppState
 
     var body: some View {
         NavigationStack {
@@ -354,6 +371,13 @@ struct ImageSRResultView: View {
                 }
             }
             .background(DesignTokens.Colors.bgPrimary)
+            .overlay(alignment: .top) {
+                if let message = appState.toastMessage {
+                    ToastView(message: message, style: appState.toastStyle)
+                        .padding(.top, DesignTokens.Spacing.s)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
             .navigationTitle("图片超分结果")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
