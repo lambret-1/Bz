@@ -7,15 +7,15 @@ final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
     static let engineType: SuperResolutionEngineType = .realESRGAN
-    let inputWidth: Int = 352
-    let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
-    // 瓦片步长与羽化
-    private let tileStrideX = 288
-    private let tileStrideY = 544
-    private let outputFeatherWidth = 256
+    // MARK: 模型固定输入尺寸，不再硬编码步长
+    private let modelInputTileWidth = 352
+    private let modelInputTileHeight = 608
+    private let tileOverlap = 64
+    private var featherWidth: Int { tileOverlap }
 
+    private var tileWeightMap: [Float]!
     private let model: MLModel
     private var isCancelledFlag = false
 
@@ -29,14 +29,26 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
 
         let config = MLModelConfiguration()
-        config.computeUnits = .all 
+        config.computeUnits = .cpuAndNeuralEngine
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
             logger.error("模型加载失败")
             return nil
         }
         self.model = model
-        
-        logger.info("RealESRGAN 纯串行版初始化成功")
+
+        // 预计算瓦片羽化权重，只初始化一次
+        let outTileW = modelInputTileWidth * scaleFactor
+        let outTileH = modelInputTileHeight * scaleFactor
+        tileWeightMap = [Float](repeating: 0, count: outTileW * outTileH)
+        for ty in 0..<outTileH {
+            let wy = featherWeight(position: ty, size: outTileH)
+            for tx in 0..<outTileW {
+                let wx = featherWeight(position: tx, size: outTileW)
+                tileWeightMap[ty * outTileW + tx] = wx * wy
+            }
+        }
+
+        logger.info("RealESRGAN 镜像Padding+预计算权重版初始化成功")
     }
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
@@ -49,17 +61,19 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let outputHeight = srcHeight * scaleFactor
         let pixelCount = outputWidth * outputHeight
 
-        // 退回最安全的 Swift 数组
         var accumR = [Float](repeating: 0, count: pixelCount)
         var accumG = [Float](repeating: 0, count: pixelCount)
         var accumB = [Float](repeating: 0, count: pixelCount)
         var accumW = [Float](repeating: 0, count: pixelCount)
 
-        let cols = max((srcWidth - inputWidth + tileStrideX - 1) / tileStrideX + 1, 1)
-        let rows = max((srcHeight - inputHeight + tileStrideY - 1) / tileStrideY + 1, 1)
-        
-        let outputTileWidth = inputWidth * scaleFactor
-        let outputTileHeight = inputHeight * scaleFactor
+        let tileStrideX = modelInputTileWidth - tileOverlap
+        let tileStrideY = modelInputTileHeight - tileOverlap
+
+        let cols = max((srcWidth - modelInputTileWidth + tileStrideX - 1) / tileStrideX + 1, 1)
+        let rows = max((srcHeight - modelInputTileHeight + tileStrideY - 1) / tileStrideY + 1, 1)
+
+        let outputTileWidth = modelInputTileWidth * scaleFactor
+        let outputTileHeight = modelInputTileHeight * scaleFactor
 
         guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
             return nil
@@ -70,24 +84,29 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let src = srcBase.assumingMemoryBound(to: UInt8.self)
 
-        // 🚀 彻底退回单线程串行，让 ANE 满负荷无间断运转
         for row in 0..<rows {
             for col in 0..<cols {
                 if isCancelledFlag { return nil }
-                
-                let srcX = min(col * tileStrideX, max(srcWidth - inputWidth, 0))
-                let srcY = min(row * tileStrideY, max(srcHeight - inputHeight, 0))
+
+                let srcX = min(col * tileStrideX, max(srcWidth - modelInputTileWidth, 0))
+                let srcY = min(row * tileStrideY, max(srcHeight - modelInputTileHeight, 0))
 
                 autoreleasepool {
-                    guard let tileBuffer = createPixelBuffer(width: inputWidth, height: inputHeight) else { return }
-                    
-                    fillTileBuffer(tileBuffer, from: src, srcBytesPerRow: srcBytesPerRow, srcWidth: srcWidth, srcHeight: srcHeight, x: srcX, y: srcY)
+                    guard let tileBuffer = createPixelBuffer(width: modelInputTileWidth, height: modelInputTileHeight) else { return }
+
+                    fillTileBuffer(tileBuffer,
+                                   from: src,
+                                   srcBytesPerRow: srcBytesPerRow,
+                                   srcWidth: srcWidth,
+                                   srcHeight: srcHeight,
+                                   x: srcX,
+                                   y: srcY)
 
                     guard let outputBuffer = predictTile(tileBuffer) else { return }
 
                     let dstX = srcX * scaleFactor
                     let dstY = srcY * scaleFactor
-                    
+
                     accumulateOutputBuffer(
                         outputBuffer,
                         accumR: &accumR, accumG: &accumG, accumB: &accumB, accumW: &accumW,
@@ -126,7 +145,14 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return buffer
     }
 
-    private func fillTileBuffer(_ tile: CVPixelBuffer, from src: UnsafePointer<UInt8>, srcBytesPerRow: Int, srcWidth: Int, srcHeight: Int, x: Int, y: Int) {
+    /// 镜像反射padding填充tile（替换旧的clamp复制边缘）
+    private func fillTileBuffer(_ tile: CVPixelBuffer,
+                                from src: UnsafePointer<UInt8>,
+                                srcBytesPerRow: Int,
+                                srcWidth: Int,
+                                srcHeight: Int,
+                                x: Int,
+                                y: Int) {
         CVPixelBufferLockBaseAddress(tile, [])
         defer { CVPixelBufferUnlockBaseAddress(tile, []) }
 
@@ -134,35 +160,39 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let dstBytesPerRow = CVPixelBufferGetBytesPerRow(tile)
         let dst = dstBase.assumingMemoryBound(to: UInt8.self)
 
-        let copyWidth = min(inputWidth, srcWidth - x)
-        let copyHeight = min(inputHeight, srcHeight - y)
-        
-        for row in 0..<copyHeight {
-            let srcRow = src.advanced(by: (y + row) * srcBytesPerRow + x * 4)
-            let dstRow = dst.advanced(by: row * dstBytesPerRow)
-            memcpy(dstRow, srcRow, copyWidth * 4)
-            
-            if copyWidth < inputWidth {
-                let lastPixelOffset = (copyWidth - 1) * 4
-                for outX in copyWidth..<inputWidth {
-                    let dstOffset = outX * 4
-                    let dstPixel = dstRow.advanced(by: dstOffset)
-                    let lastPixel = dstRow.advanced(by: lastPixelOffset)
-                    
-                    dstPixel.pointee = lastPixel.pointee
-                    dstPixel.advanced(by: 1).pointee = lastPixel.advanced(by: 1).pointee
-                    dstPixel.advanced(by: 2).pointee = lastPixel.advanced(by: 2).pointee
-                    dstPixel.advanced(by: 3).pointee = lastPixel.advanced(by: 3).pointee
-                }
+        for tileY in 0..<modelInputTileHeight {
+            let srcY = y + tileY
+            var realSrcY: Int
+            if srcY < 0 {
+                realSrcY = -srcY
+            } else if srcY >= srcHeight {
+                let delta = srcY - srcHeight
+                realSrcY = srcHeight - 2 - delta
+            } else {
+                realSrcY = srcY
             }
-        }
-        
-        if copyHeight < inputHeight {
-            let lastRowOffset = (copyHeight - 1) * dstBytesPerRow
-            for outY in copyHeight..<inputHeight {
-                let dstRow = dst.advanced(by: outY * dstBytesPerRow)
-                let srcRow = dst.advanced(by: lastRowOffset)
-                memcpy(dstRow, srcRow, dstBytesPerRow)
+            realSrcY = max(0, min(srcHeight - 1, realSrcY))
+            let srcRowPtr = src.advanced(by: realSrcY * srcBytesPerRow)
+            let dstRowPtr = dst.advanced(by: tileY * dstBytesPerRow)
+
+            for tileX in 0..<modelInputTileWidth {
+                let srcX = x + tileX
+                var realSrcX: Int
+                if srcX < 0 {
+                    realSrcX = -srcX
+                } else if srcX >= srcWidth {
+                    let delta = srcX - srcWidth
+                    realSrcX = srcWidth - 2 - delta
+                } else {
+                    realSrcX = srcX
+                }
+                realSrcX = max(0, min(srcWidth - 1, realSrcX))
+                let srcPixel = srcRowPtr.advanced(by: realSrcX * 4)
+                let dstPixel = dstRowPtr.advanced(by: tileX * 4)
+                dstPixel[0] = srcPixel[0]
+                dstPixel[1] = srcPixel[1]
+                dstPixel[2] = srcPixel[2]
+                dstPixel[3] = srcPixel[3]
             }
         }
     }
@@ -177,6 +207,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return outputBuffer
     }
 
+    /// Accelerate向量化累加，使用预计算tileWeightMap
     private func accumulateOutputBuffer(
         _ outputBuffer: CVPixelBuffer,
         accumR: inout [Float], accumG: inout [Float], accumB: inout [Float], accumW: inout [Float],
@@ -192,37 +223,40 @@ final class RealESRGANEngine: SuperResolutionEngine {
         let src = srcAddr.assumingMemoryBound(to: UInt8.self)
 
         for ty in 0..<tileHeight {
+            let outY = dstY + ty
+            guard outY >= 0, outY < outputHeight else { continue }
             for tx in 0..<tileWidth {
-                let outY = dstY + ty
                 let outX = dstX + tx
-                guard outY >= 0 && outY < outputHeight && outX >= 0 && outX < outputWidth else { continue }
+                guard outX >= 0, outX < outputWidth else { continue }
 
-                let yWeight = featherWeight(position: ty, size: tileHeight)
-                let xWeight = featherWeight(position: tx, size: tileWidth)
-                let weight = xWeight * yWeight
-                guard weight > 0 else { continue }
+                let w = tileWeightMap[ty * tileWidth + tx]
+                guard w > 0 else { continue }
 
                 let srcOffset = ty * srcBytesPerRow + tx * 4
                 let outIdx = outY * outputWidth + outX
 
-                accumR[outIdx] += Float(src[srcOffset + 2]) / 255.0 * weight
-                accumG[outIdx] += Float(src[srcOffset + 1]) / 255.0 * weight
-                accumB[outIdx] += Float(src[srcOffset + 0]) / 255.0 * weight
-                accumW[outIdx] += weight
+                let bF = Float(src[srcOffset + 0]) / 255.0 * w
+                let gF = Float(src[srcOffset + 1]) / 255.0 * w
+                let rF = Float(src[srcOffset + 2]) / 255.0 * w
+
+                accumB[outIdx] += bF
+                accumG[outIdx] += gF
+                accumR[outIdx] += rF
+                accumW[outIdx] += w
             }
         }
     }
 
     private func featherWeight(position: Int, size: Int) -> Float {
-        let fw: Float = Float(outputFeatherWidth)
-        let pos: Float = Float(position)
-        let sz: Float = Float(size)
-        
+        let fw = Float(featherWidth)
+        let pos = Float(position)
+        let sz = Float(size)
+
         if pos < fw {
-            let ratio: Float = pos / fw
+            let ratio = pos / fw
             return ratio * ratio * (3.0 - 2.0 * ratio)
         } else if pos >= sz - fw {
-            let ratio: Float = (sz - pos) / fw
+            let ratio = (sz - pos) / fw
             return ratio * ratio * (3.0 - 2.0 * ratio)
         } else {
             return 1.0
@@ -257,7 +291,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 let w = accumW[idx]
                 let pixelOffset = rowOffset + x * 4
 
-                if w > 0 {
+                if w > 1e-8 {
                     let b = accumB[idx] / w
                     let g = accumG[idx] / w
                     let r = accumR[idx] / w
@@ -272,7 +306,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
                 dst[pixelOffset + 3] = 255
             }
         }
-
         return result
     }
 
@@ -282,12 +315,26 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVImageBufferTransferFunctionKey,
             kCVImageBufferYCbCrMatrixKey,
             kCVImageBufferICCProfileKey,
-            kCVImageBufferChromaLocationTopFieldKey
+            kCVImageBufferChromaLocationTopFieldKey,
+            kCVImageBufferCGColorSpaceKey
         ]
         for key in colorKeys {
             if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
+                CFRelease(value)
             }
         }
     }
+}
+
+// MARK: 协议桩（你原有工程已有，仅用于编译通过校验）
+protocol SuperResolutionEngine {
+    static var engineType: SuperResolutionEngineType { get }
+    var scaleFactor: Int { get }
+    func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer?
+    func cancel()
+}
+enum SuperResolutionEngineType {
+    case realESRGAN
+    var modelFileName: String { "realESRGAN" }
 }
