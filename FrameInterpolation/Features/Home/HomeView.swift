@@ -43,7 +43,7 @@ struct HomeView: View {
                             Image(systemName: "film.stack")
                                 .font(.system(size: 44))
                                 .foregroundColor(DesignTokens.Colors.accent)
-                            Text("视频增加")
+                            Text("视频增强")
                                 .font(.subheadline.weight(.medium))
                                 .foregroundColor(DesignTokens.Colors.textPrimary)
                         }
