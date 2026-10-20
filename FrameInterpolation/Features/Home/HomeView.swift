@@ -98,7 +98,7 @@ struct HomeView: View {
                             Text("图片 AI 超分")
                                 .font(.headline)
 
-                            Text("将模糊旧图放大 4 倍并补充细节，支持人像修复")
+                            Text("将模糊旧图放大 4 倍并补充细节，支持一下人像修复")
                                 .font(.subheadline)
                                 .foregroundColor(DesignTokens.Colors.textSecondary)
                                 .multilineTextAlignment(.center)
