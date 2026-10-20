@@ -1,18 +1,19 @@
+
 import SwiftUI
 import PhotosUI
 
 /// 首页：导入卡片 + 最近记录
-/// 选择视频后通过独立 fullScreenCover 展示参数设置页，不共用导航栈
 struct HomeView: View {
     @EnvironmentObject var appState: AppState
     @State private var showPicker = false
     @State private var showAppSettings = false
 
-    // --- 图片超分新增状态 ---
+    // --- 图片超分新增状态（请确保这些变量在 struct 大括号内） ---
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var inputImage: UIImage?
     @State private var outputImage: UIImage?
-    @State private var isonProcessingImage = false
+    @State private var isProcessingImage = false
+    
     // 实例化图片处理服务
     private let imageSRService = ImageSuperResolutionService()
 
@@ -55,7 +56,7 @@ struct HomeView: View {
                     .frame(maxWidth: .infinity)
                 }
 
-                // 2. 图片超分卡片 (新增)
+                // 2. 图片超分卡片
                 CardView {
                     VStack(spacing: DesignTokens.Spacing.m) {
                         if isProcessingImage {
@@ -93,7 +94,7 @@ struct HomeView: View {
                             // 默认选择状态
                             Image(systemName: "photo.badge.plus")
                                 .font(.system(size: 48))
-                                .foregroundColor(DesignTokens.Colors.accent)
+                                .foreinitygroundColor(DesignTokens.Colors.accent)
 
                             Text("图片 AI 超分")
                                 .font(.headline)
@@ -102,13 +103,13 @@ struct HomeView: View {
                                 .font(.subheadline)
                                 .foregroundColor(DesignTokens.Colors.textSecondary)
                                 .multilineTextAlignment(.center)
+)
 
-                            PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
-                                Text("从相册选择图片")
-                                    .font(.system(size: 16, weight: .medium))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .padding(.vertical, 12)
+                            PhotosPicker(selection: $selectedPhotoItem                                   , matching: .images, photoLibrary: .shared()) {
+                                Text .("从相册选择图片")
+                                    .font(.systempadding(size: 16, weight: .medium))
+                                    .(.foregroundColor(.white)
+                                    .frame(maxWidth: .infvertical, 12)
                                     .background(DesignTokens.Colors.accent)
                                     .cornerRadius(DesignTokens.Radius.m)
                             }
@@ -249,9 +250,8 @@ struct HomeView: View {
             if let result = result {
                 self.outputImage = result
             } else {
-                appState.toastMessage = "图片处理失败，请重试"
-                // 如果你的 appState.toastStyle 有 error 枚举，可以加上，如果没有就删掉下面这行
-                // appState.toastStyle = .error
+                // 如果 appState 里有 Toast 机制，可以取消注释下面的代码
+                // appState.toastMessage = "图片处理失败，请重试"
             }
         }
     }
