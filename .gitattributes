@@ -1,3 +1,4 @@
 FrameInterpolation/Resources/**/model.mlmodel filter=lfs diff=lfs merge=lfs -text
 FrameInterpolation/Resources/**/weight.bin filter=lfs diff=lfs merge=lfs -text
 FrameInterpolation/Resources/real_esrgan_x4v3.mlpackage/** filter=lfs diff=lfs merge=lfs -text
+*.mlpackage/**/* filter=lfs diff=lfs merge=lfs -text

@@ -27,6 +27,8 @@ targets:
         CFBundleDisplayName: AI 补帧
         CFBundleShortVersionString: "0.8.8"
         CFBundleVersion: "202610201239"
+        CFBundleShortVersionString: "0.9.1"
+        CFBundleVersion: "202610201057"
         UILaunchScreen:
           UIColorName: BgPrimary
         UISupportedInterfaceOrientations:

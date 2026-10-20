@@ -15,7 +15,7 @@ final class VideoPipeline {
     private let processingQueue = DispatchQueue(label: "com.lambret.bz.pipeline", qos: .userInitiated)
 
     /// CVPixelBuffer 内存池（复用缓冲，避免循环中频繁分配释放）
-    private let bufferPool = PixelBufferPoolManager(minBufferCount: 12)
+    private let bufferPool = PixelBufferPoolManager(minBufferCount: 36)
 
     /// 原子进度保护（iOS 16+ OSAllocatedUnfairLock，开销仅为 NSLock 的几十分之一）
     private let progressLock = OSAllocatedUnfairLock(initialState: (value: 0.0, stage: ProcessingStage.decoding))
@@ -735,8 +735,8 @@ final class VideoPipeline {
         // MARK: 黄金三队列流水线
         // Reader（只读不拷）→ Inference（深拷贝+ANE+缩放）→ Encode
         // 队列容量：Reader→Inference(6)、Inference→Encode(10)
-        let readerToInference = FrameBuffer(capacity: 6)
-        let inferenceToEncode = FrameBuffer(capacity: 10)
+        let readerToInference = FrameBuffer(capacity: 18)
+        let inferenceToEncode = FrameBuffer(capacity: 30)
 
         let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
         let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)

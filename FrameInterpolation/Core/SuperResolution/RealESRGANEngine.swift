@@ -3,52 +3,47 @@ import CoreVideo
 import Accelerate
 import OSLog
 
-// MARK: - Real-ESRGAN x4v3 轻量版超分引擎
-
 final class RealESRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
-
-    // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .realESRGAN
     let inputWidth: Int = 352
     let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
-    // MARK: - 瓦片配置
-
     private let tileStrideX = 288
     private let tileStrideY = 544
     private let outputFeatherWidth = 256
 
-    // MARK: - 私有属性
-
     private let model: MLModel
     private var isCancelledFlag = false
-
-    // MARK: - 初始化
+    private var hasPrintedFormat = false
 
     init?() {
         guard let modelURL = Bundle.main.url(
             forResource: SuperResolutionEngineType.realESRGAN.modelFileName,
             withExtension: "mlmodelc"
         ) else {
-            logger.error("找不到模型文件")
+            FileLogger.shared.log("❌ 找不到模型文件")
             return nil
         }
 
         let config = MLModelConfiguration()
-        config.computeUnits = .all
-        guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
-            logger.error("模型加载失败")
+        // 这里依然保持纯 ANE 模式
+        config.computeUnits = .cpuAndNeuralEngine
+        
+        do {
+            self.model = try MLModel(contentsOf: modelURL, configuration: config)
+            FileLogger.shared.log("✅ RealESRGAN 引擎初始化成功 (当前模式: 纯 ANE)")
+            
+            // 启动后立刻在后台跑一次诊断
+            self.runFileDiagnostic()
+            
+        } catch {
+            FileLogger.shared.log("❌ 纯 ANE 模式初始化失败: \(error.localizedDescription)")
             return nil
         }
-        self.model = model
-        
-        logger.info("RealESRGAN 引擎初始化成功，瓦片尺寸: \(self.inputWidth)x\(self.inputHeight)")
     }
-
-    // MARK: - 核心方法
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         isCancelledFlag = false
@@ -83,7 +78,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         for row in 0..<rows {
             for col in 0..<cols {
                 if isCancelledFlag { return nil }
-
+                
                 let srcX = min(col * tileStrideX, max(srcWidth - inputWidth, 0))
                 let srcY = min(row * tileStrideY, max(srcHeight - inputHeight, 0))
 
@@ -99,31 +94,19 @@ final class RealESRGANEngine: SuperResolutionEngine {
                     
                     accumulateOutputBuffer(
                         outputBuffer,
-                        accumR: &accumR,
-                        accumG: &accumG,
-                        accumB: &accumB,
-                        accumW: &accumW,
-                        dstX: dstX,
-                        dstY: dstY,
-                        tileWidth: outputTileWidth,
-                        tileHeight: outputTileHeight,
-                        outputWidth: outputWidth,
-                        outputHeight: outputHeight
+                        accumR: &accumR, accumG: &accumG, accumB: &accumB, accumW: &accumW,
+                        dstX: dstX, dstY: dstY,
+                        tileWidth: outputTileWidth, tileHeight: outputTileHeight,
+                        outputWidth: outputWidth, outputHeight: outputHeight
                     )
                 }
             }
         }
 
         guard let outputBuffer = createOutputBuffer(
-            width: outputWidth,
-            height: outputHeight,
-            accumR: &accumR,
-            accumG: &accumG,
-            accumB: &accumB,
-            accumW: &accumW
-        ) else {
-            return nil
-        }
+            width: outputWidth, height: outputHeight,
+            accumR: &accumR, accumG: &accumG, accumB: &accumB, accumW: &accumW
+        ) else { return nil }
 
         copyColorSpaceAttachments(from: pixelBuffer, to: outputBuffer)
         return outputBuffer
@@ -141,9 +124,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
-        guard status == kCVReturnSuccess else {
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess else {
             return nil
         }
         return buffer
@@ -192,20 +173,50 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
     private func predictTile(_ inputBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         let inputFeature = MLFeatureValue(pixelBuffer: inputBuffer)
-        guard let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputFeature]),
-              let prediction = try? model.prediction(from: inputProvider),
-              let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
+        
+        let inputProvider: MLDictionaryFeatureProvider
+        do {
+            inputProvider = try MLDictionaryFeatureProvider(dictionary: ["input": inputFeature])
+        } catch {
+            FileLogger.shared.log("❌ 创建 InputProvider 失败: \(error)")
             return nil
         }
+        
+        let prediction: MLFeatureProvider
+        do {
+            prediction = try model.prediction(from: inputProvider)
+        } catch {
+            FileLogger.shared.log("❌ 模型推理失败 (可能是算子不支持纯ANE): \(error)")
+            return nil
+        }
+        
+        guard let outputValue = prediction.featureValue(for: "output") else {
+            FileLogger.shared.log("❌ 找不到名为 output 的特征值")
+            return nil
+        }
+        
+        guard let outputBuffer = outputValue.imageBufferValue else {
+            FileLogger.shared.log("❌ 模型的 output 不是 ImageBuffer (CVPixelBuffer)")
+            return nil
+        }
+        
+        if !hasPrintedFormat {
+            let format = CVPixelBufferGetPixelFormatType(outputBuffer)
+            FileLogger.shared.log("🔥 纯 ANE 模式输出 PixelFormat: \(format)")
+            if format == kCVPixelFormatType_32BGRA {
+                FileLogger.shared.log("✅ 格式匹配 BGRA (1111970369)")
+            } else {
+                FileLogger.shared.log("⚠️ 格式不匹配！预期 BGRA (1111970369)")
+            }
+            hasPrintedFormat = true
+        }
+        
         return outputBuffer
     }
 
     private func accumulateOutputBuffer(
         _ outputBuffer: CVPixelBuffer,
-        accumR: inout [Float],
-        accumG: inout [Float],
-        accumB: inout [Float],
-        accumW: inout [Float],
+        accumR: inout [Float], accumG: inout [Float], accumB: inout [Float], accumW: inout [Float],
         dstX: Int, dstY: Int,
         tileWidth: Int, tileHeight: Int,
         outputWidth: Int, outputHeight: Int
@@ -256,12 +267,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
     }
 
     private func createOutputBuffer(
-        width: Int,
-        height: Int,
-        accumR: inout [Float],
-        accumG: inout [Float],
-        accumB: inout [Float],
-        accumW: inout [Float]
+        width: Int, height: Int,
+        accumR: inout [Float], accumG: inout [Float], accumB: inout [Float], accumW: inout [Float]
     ) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
         let attrs = [
@@ -270,11 +277,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-        
-        let status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer)
-        guard status == kCVReturnSuccess, let result = buffer else {
-            return nil
-        }
+        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
+              let result = buffer else { return nil }
 
         CVPixelBufferLockBaseAddress(result, [])
         defer { CVPixelBufferUnlockBaseAddress(result, []) }
@@ -309,8 +313,6 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return result
     }
 
-    // MARK: - 颜色空间附件复制 (已修复API 报错)
-
     private func copyColorSpaceAttachments(from src: CVPixelBuffer, to dst: CVPixelBuffer) {
         let colorKeys: [CFString] = [
             kCVImageBufferColorPrimariesKey,
@@ -320,10 +322,59 @@ final class RealESRGANEngine: SuperResolutionEngine {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            // CVBufferCopyAttachment 返回的已经是 Any? 对象，不需要 takeUnretainedValue()
             if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
+        }
+    }
+
+    // MARK: - 自动文件诊断逻辑
+    func runFileDiagnostic() {
+        DispatchQueue.global(qos: .background).async {
+            FileLogger.shared.log("--- 开始后台文件诊断 ---")
+            
+            var testBuffer: CVPixelBuffer?
+            let attrs = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                         kCVPixelBufferWidthKey: self.inputWidth,
+                         kCVPixelBufferHeightKey: self.inputHeight] as CFDictionary
+            CVPixelBufferCreate(kCFAllocatorDefault, self.inputWidth, self.inputHeight, kCVPixelFormatType_32BGRA, attrs, &testBuffer)
+            
+            guard let inputBuf = testBuffer else { return }
+            CVPixelBufferLockBaseAddress(inputBuf, [])
+            if let base = CVPixelBufferGetBaseAddress(inputBuf) {
+                let ptr = base.assumingMemoryBound(to: UInt8.self)
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(inputBuf)
+                for y in 0..<self.inputHeight {
+                    for x in 0..<self.inputWidth {
+                        let offset = y * bytesPerRow + x * 4
+                        ptr[offset] = 128; ptr[offset + 1] = 128; ptr[offset + 2] = 128; ptr[offset + 3] = 255
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(inputBuf, [])
+            
+            guard let outputBuf = self.predictTile(inputBuf) else {
+                FileLogger.shared.log("❌ 诊断推理返回 nil")
+                return
+            }
+            
+            CVPixelBufferLockBaseAddress(outputBuf, .readOnly)
+            if let outBase = CVPixelBufferGetBaseAddress(outputBuf) {
+                let ptr = outBase.assumingMemoryBound(to: UInt8.self)
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(outputBuf)
+                let cx = self.inputWidth * 2
+                let cy = self.inputHeight * 2
+                let offset = cy * bytesPerRow + cx * 4
+                FileLogger.shared.log("📊 诊断中心像素 -> B:\(ptr[offset]) G:\(ptr[offset+1]) R:\(ptr[offset+2]) A:\(ptr[offset+3])")
+                
+                if ptr[offset] == 0 && ptr[offset+1] == 0 && ptr[offset+2] == 0 {
+                    FileLogger.shared.log("🚨 诊断结论：模型在手机上输出纯黑！请检查 Python 转换逻辑。")
+                } else {
+                    FileLogger.shared.log("✅ 诊断结论：模型输出非黑！问题在视频拼接或写入环节。")
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(outputBuf, .readOnly)
+            FileLogger.shared.log("--- 诊断结束 ---")
         }
     }
 }
