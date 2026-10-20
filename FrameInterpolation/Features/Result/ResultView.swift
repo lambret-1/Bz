@@ -232,9 +232,19 @@ struct ResultView: View {
             popover.permittedArrowDirections = []
         }
 
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let root = windowScene.keyWindow?.rootViewController {
-            root.present(activity, animated: true)
+        // 从顶层presentedViewController present，兼容fullScreenCover
+        var topVC = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first(where: { $0.isKeyWindow })?
+            .rootViewController
+
+        while let presented = topVC?.presentedViewController {
+            topVC = presented
+        }
+
+        if let topVC = topVC {
+            topVC.present(activity, animated: true)
         } else {
             isSharing = false
         }

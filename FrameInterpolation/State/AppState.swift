@@ -186,6 +186,34 @@ final class AppState: ObservableObject {
         saveRecentRecords()
     }
 
+    /// 重命名最近记录
+    func renameRecord(_ record: RecentRecord, newName: String) {
+        guard let idx = recentRecords.firstIndex(where: { $0.id == record.id }) else { return }
+        recentRecords[idx].displayName = newName
+        saveRecentRecords()
+    }
+
+    /// 用已处理视频作为输入，再次增强
+    func enhanceRecord(_ record: RecentRecord) {
+        guard let path = record.outputPath,
+              FileManager.default.fileExists(atPath: path) else {
+            showToast("原文件已被清理", style: .warning)
+            return
+        }
+        let url = URL(fileURLWithPath: path)
+        logger.info("从最近记录重新增强: \(record.fileName, privacy: .public)")
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                let info = try await MediaImporter.loadVideoInfo(from: url)
+                self.selectedVideo = info
+                self.showSettings = true
+            } catch {
+                self.showToast("无法读取视频: \(error.localizedDescription)", style: .error)
+            }
+        }
+    }
+
     /// 清空所有最近记录
     func clearAllRecentRecords() {
         recentRecords.removeAll()

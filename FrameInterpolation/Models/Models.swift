@@ -35,6 +35,8 @@ struct VideoInfo: Identifiable, Equatable {
 struct RecentRecord: Identifiable, Equatable, Codable {
     let id: UUID
     let fileName: String
+    /// 用户自定义显示名（重命名后覆盖fileName显示）
+    var displayName: String?
     let outputFPS: Double
     let createdAt: Date
     let thumbnailData: Data?
@@ -51,9 +53,15 @@ struct RecentRecord: Identifiable, Equatable, Codable {
     /// 输出文件路径（沙盒临时目录，可能已被清理）
     let outputPath: String?
 
+    /// 显示用名称：优先displayName，否则fileName
+    var displayFileName: String {
+        displayName ?? fileName
+    }
+
     init(
         id: UUID = UUID(),
         fileName: String,
+        displayName: String? = nil,
         outputFPS: Double,
         createdAt: Date = Date(),
         thumbnailData: Data? = nil,
@@ -66,6 +74,7 @@ struct RecentRecord: Identifiable, Equatable, Codable {
     ) {
         self.id = id
         self.fileName = fileName
+        self.displayName = displayName
         self.outputFPS = outputFPS
         self.createdAt = createdAt
         self.thumbnailData = thumbnailData

@@ -33,9 +33,9 @@ struct HomeView: View {
                     }
                 }
 
-                // 功能入口：视频导入 + 图片超分 并排大图标
+                // 功能入口：视频增加 + 图片超分 并排大图标
                 HStack(spacing: DesignTokens.Spacing.l) {
-                    // 视频导入
+                    // 视频增加
                     Button {
                         showPicker = true
                     } label: {
@@ -43,7 +43,7 @@ struct HomeView: View {
                             Image(systemName: "film.stack")
                                 .font(.system(size: 44))
                                 .foregroundColor(DesignTokens.Colors.accent)
-                            Text("视频导入")
+                            Text("视频增加")
                                 .font(.subheadline.weight(.medium))
                                 .foregroundColor(DesignTokens.Colors.textPrimary)
                         }
@@ -119,11 +119,13 @@ struct HomeView: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: DesignTokens.Spacing.m) {
                             ForEach(appState.recentRecords.prefix(10)) { record in
-                                RecentRecordCard(record: record, onTap: {
-                                    appState.replayRecentRecord(record)
-                                }, onDelete: {
-                                    appState.deleteRecentRecord(record)
-                                })
+                                RecentRecordCard(
+                                    record: record,
+                                    onTap: { appState.replayRecentRecord(record) },
+                                    onDelete: { appState.deleteRecentRecord(record) },
+                                    onRename: { newName in appState.renameRecord(record, newName: newName) },
+                                    onEnhance: { appState.enhanceRecord(record) }
+                                )
                             }
                         }
                     }
@@ -258,6 +260,10 @@ struct RecentRecordCard: View {
     let record: RecentRecord
     var onTap: (() -> Void)? = nil
     var onDelete: (() -> Void)? = nil
+    var onRename: ((String) -> Void)? = nil
+    var onEnhance: (() -> Void)? = nil
+    @State private var showRenameAlert = false
+    @State private var renameText = ""
 
     private var thumbnailImage: UIImage? {
         guard let data = record.thumbnailData else { return nil }
@@ -310,7 +316,7 @@ struct RecentRecordCard: View {
                 }
                 .frame(width: 180, height: 101)
 
-                Text(record.fileName)
+                Text(record.displayFileName)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DesignTokens.Colors.textPrimary)
                     .lineLimit(1)
@@ -348,11 +354,34 @@ struct RecentRecordCard: View {
         }
         .buttonStyle(.plain)
         .contextMenu {
+            Button {
+                renameText = record.displayFileName
+                showRenameAlert = true
+            } label: {
+                Label("重命名", systemImage: "pencil")
+            }
+            Button {
+                onEnhance?()
+            } label: {
+                Label("视频增强", systemImage: "sparkles")
+            }
+            Divider()
             Button(role: .destructive) {
                 onDelete?()
             } label: {
                 Label("删除", systemImage: "trash")
             }
+        }
+        .alert("重命名", isPresented: $showRenameAlert) {
+            TextField("输入新名称", text: $renameText)
+            Button("取消", role: .cancel) {}
+            Button("确定") {
+                if !renameText.isEmpty {
+                    onRename?(renameText)
+                }
+            }
+        } message: {
+            Text("输入新的显示名称")
         }
     }
 }
