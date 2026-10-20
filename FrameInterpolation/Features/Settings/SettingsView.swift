@@ -353,12 +353,12 @@ struct SettingsView: View {
         if isSuperResolutionMode {
             // 超分模式：分辨率提升，数据量增加，帧率不变
             let scaleFactor = Double(appState.superResolutionScale.rawValue)
-            let resolutionFactor: Double = appState.outputResolution == .p1080 ? 1.0 : (appState.outputResolution == .p720 ? 0.5 : scaleFactor)
+            let resolutionFactor: Double = appState.outputResolution == .w1920 ? 1.0 : (appState.outputResolution == .w1280 ? 0.5 : scaleFactor)
             return String(format: "%.0f", base * resolutionFactor * 1.5)
         } else {
             // 补帧模式：帧率提升
             let multiplier = Double(appState.frameMultiplier.rawValue) / 2.0
-            let resolutionFactor: Double = appState.outputResolution == .p1080 ? 1.5 : 1.0
+            let resolutionFactor: Double = appState.outputResolution == .w1920 ? 1.5 : 1.0
             return String(format: "%.0f", base * multiplier * resolutionFactor)
         }
     }
@@ -386,8 +386,8 @@ struct SettingsView: View {
 
             // 分辨率限制
             switch appState.outputResolution {
-            case .p720: base *= 0.7
-            case .p1080: base *= 1.2
+            case .w1280: base *= 0.7
+            case .w1920: base *= 1.2
             case .auto: break
             }
 
@@ -406,8 +406,8 @@ struct SettingsView: View {
             base *= multFactor
 
             switch appState.outputResolution {
-            case .p720: base *= 0.6
-            case .p1080: base *= 1.3
+            case .w1280: base *= 0.6
+            case .w1920: base *= 1.3
             case .auto: break
             }
 
@@ -436,21 +436,21 @@ struct SettingsView: View {
         var outWidth = video.width * scale
         var outHeight = video.height * scale
 
-        // 应用输出分辨率限制
+        // 应用输出分辨率限制（按宽度）
         switch appState.outputResolution {
         case .auto:
             break
-        case .p720:
-            if outHeight > 720 {
-                let s = 720.0 / Double(outHeight)
-                outWidth = Int(Double(outWidth) * s)
-                outHeight = 720
+        case .w1280:
+            if outWidth > 1280 {
+                let s = 1280.0 / Double(outWidth)
+                outHeight = Int(Double(outHeight) * s)
+                outWidth = 1280
             }
-        case .p1080:
-            if outHeight > 1080 {
-                let s = 1080.0 / Double(outHeight)
-                outWidth = Int(Double(outWidth) * s)
-                outHeight = 1080
+        case .w1920:
+            if outWidth > 1920 {
+                let s = 1920.0 / Double(outWidth)
+                outHeight = Int(Double(outHeight) * s)
+                outWidth = 1920
             }
         }
 
