@@ -19,7 +19,6 @@ struct AppSettingsView: View {
     @State private var crashLogs: [CrashLog] = []
     @State private var cacheSize = "计算中..."
     @State private var showClearCacheConfirm = false
-    @EnvironmentObject var appState: AppState
 
     var body: some View {
         NavigationStack {
