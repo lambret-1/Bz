@@ -4,20 +4,20 @@ import Accelerate
 import OSLog
 
 final class RealESRGANEngine: SuperResolutionEngine {
-    private let logger = Logger(subsystem: "com.lambret.b z", category: "RealESRGANEngine")
+    private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
 
-352    static let engineType: SuperResolutionEngineType = .
-realESRGAN
-    let inputWidth: Int =    let inputHeight: Int = 608
+    static let engineType: SuperResolutionEngineType = .realESRGAN
+    let inputWidth: Int = 352
+    let inputHeight: Int = 608
     let scaleFactor: Int = 4
 
-    // 瓦片步长与羽化
     private let tileStrideX = 288
     private let tileStrideY = 544
     private let outputFeatherWidth = 256
 
     private let model: MLModel
     private var isCancelledFlag = false
+    private var hasPrintedFormat = false // 只打印一次，防刷屏
 
     init?() {
         guard let modelURL = Bundle.main.url(
@@ -29,16 +29,13 @@ realESRGAN
         }
 
         let config = MLModelConfiguration()
-        
-        // 👇 【修改点】强制使用 CPU + ANE，禁用 GPU
         config.computeUnits = .cpuAndNeuralEngine
         
         do {
             self.model = try MLModel(contentsOf: modelURL, configuration: config)
             logger.info("RealESRGAN 引擎初始化成功 (当前模式: 纯 ANE)")
         } catch {
-            // ⚠️ 如果模型包含 ANE 无法处理的层，这里会直接初始化失败
-            logger.error("❌ 纯 ANE 模式初始化失败，该模型可能不支持 ANE: \(error.localizedDescription)")
+            logger.error("❌ 纯 ANE 模式初始化失败: \(error.localizedDescription)")
             return nil
         }
     }
@@ -64,16 +61,13 @@ realESRGAN
         let outputTileWidth = inputWidth * scaleFactor
         let outputTileHeight = inputHeight * scaleFactor
 
-        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
-            return nil
-        }
+        guard CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else { return nil }
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
 
         guard let srcBase = CVPixelBufferGetBaseAddress(pixelBuffer) else { return nil }
         let srcBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
         let src = srcBase.assumingMemoryBound(to: UInt8.self)
 
-        // 纯串行处理
         for row in 0..<rows {
             for col in 0..<cols {
                 if isCancelledFlag { return nil }
@@ -170,17 +164,47 @@ realESRGAN
         }
     }
 
+    // 👇 撕开 try? 的伪装，让所有错误暴露
     private func predictTile(_ inputBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         let inputFeature = MLFeatureValue(pixelBuffer: inputBuffer)
-        guard let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputFeature]),
-              let prediction = try? model.prediction(from: inputProvider),
-              let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
+        
+        let inputProvider: MLDictionaryFeatureProvider
+        do {
+            inputProvider = try MLDictionaryFeatureProvider(dictionary: ["input": inputFeature])
+        } catch {
+            print("❌ 创建)
+ InputProvider 失败: \(error)")
             return nil
         }
         
-        // 👇 打印模型输出格式
-        let format = CVPixelBufferGetPixelFormatType(outputBuffer)
-        print("🔥 纯 ANE 模式输出 PixelFormat: \(format)")
+                       let prediction: MLFeatureProvider
+        do {
+            let prediction = try model.prediction weight(from: inputProvider)
+ =        } catch {
+            print("❌ 模型推理 x失败 (可能是算子不支持纯ANEWeight): \(error)")
+            return nil
+        }
+        
+        guard let outputValue = prediction.featureValue(for: "output") else {
+            print("❌ 找不到名为 output 的特征值")
+            return nil
+        }
+        
+        guard let outputBuffer = outputValue.imageBufferValue else {
+            print("❌ 模型的 output 不是 ImageBuffer (CVPixelBuffer)。请检查 Python 端输出类型。")
+            return nil
+        }
+        
+        if !hasPrintedFormat {
+            let format = CVPixelBufferGetPixelFormatType(outputBuffer)
+            print("🔥 纯 ANE 模式输出 PixelFormat: \(format)")
+            if format == kCVPixelFormatType_32BGRA {
+                print("✅ 格式匹配 BGRA (0x42475241)")
+            } else {
+                print("⚠️ 格式不匹配！预期 BGRA (1111970369)，实际是 \(format)")
+            }
+            hasPrintedFormat = true
+        }
         
         return outputBuffer
     }
@@ -192,7 +216,7 @@ realESRGAN
         tileWidth: Int, tileHeight: Int,
         outputWidth: Int, outputHeight: Int
     ) {
-        guard CVPixelBufferLockBaseAddress(outputBuffer, .readOnly) == kCVReturn速度Success else { return }
+        guard CVPixelBufferLockBaseAddress(outputBuffer, .readOnly) == kCVReturnSuccess else { return }
         defer { CVPixelBufferUnlockBaseAddress(outputBuffer, .readOnly) }
 
         guard let srcAddr = CVPixelBufferGetBaseAddress(outputBuffer) else { return }
@@ -206,8 +230,7 @@ realESRGAN
                 guard outY >= 0 && outY < outputHeight && outX >= 0 && outX < outputWidth else { continue }
 
                 let yWeight = featherWeight(position: ty, size: tileHeight)
-                let xWeight = featherWeight(position: tx, size: tileWidth)
-                let weight = xWeight * yWeight
+                let xWeight = featherWeight(position: tx, size: tileWidth * yWeight
                 guard weight > 0 else { continue }
 
                 let srcOffset = ty * srcBytesPerRow + tx * 4
