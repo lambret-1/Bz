@@ -4,13 +4,14 @@ import UserNotifications
 /// 根视图，持有全局 AppState，承载首页导航栈
 struct ContentView: View {
     @StateObject private var appState = AppState()
+    @AppStorage("darkMode") private var darkMode = false
 
     var body: some View {
         NavigationStack {
             HomeView()
                 .environmentObject(appState)
         }
-        .preferredColorScheme(nil) // 跟随系统深色/浅色模式
+        .preferredColorScheme(darkMode ? .dark : .light)
         .onAppear {
             // 请求通知权限（用于切后台提醒）
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }

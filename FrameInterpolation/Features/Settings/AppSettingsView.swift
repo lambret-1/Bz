@@ -18,6 +18,8 @@ struct AppSettingsView: View {
     // 崩溃日志
     @State private var crashLogs: [CrashLog] = []
     @State private var cacheSize = "计算中..."
+    @State private var showClearCacheConfirm = false
+    @EnvironmentObject var appState: AppState
 
     var body: some View {
         NavigationStack {
@@ -51,7 +53,7 @@ struct AppSettingsView: View {
                             .foregroundColor(.secondary)
                     }
                     Button(role: .destructive) {
-                        clearCache()
+                        showClearCacheConfirm = true
                     } label: {
                         HStack {
                             Image(systemName: "trash")
@@ -124,6 +126,15 @@ struct AppSettingsView: View {
             .onAppear {
                 loadCrashLogs()
                 calculateCacheSize()
+            }
+            .alert("清除缓存", isPresented: $showClearCacheConfirm) {
+                Button("取消", role: .cancel) {}
+                Button("清除", role: .destructive) {
+                    clearCache()
+                    appState.showToast("缓存已清除")
+                }
+            } message: {
+                Text("将清除临时缓存文件，不影响已处理的视频。")
             }
         }
     }

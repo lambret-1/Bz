@@ -13,6 +13,7 @@ struct ResultView: View {
 
     @State private var player: AVPlayer?
     @State private var isSaving = false
+    @State private var isSharing = false
 
     var body: some View {
         NavigationStack {
@@ -104,12 +105,19 @@ struct ResultView: View {
                         Button {
                             shareVideo()
                         } label: {
-                            Image(systemName: "square.and.arrow.up")
-                                .font(.title3)
-                                .frame(width: 52, height: 52)
-                                .background(DesignTokens.Colors.bgSecondary)
-                                .cornerRadius(DesignTokens.Radius.m)
+                            Group {
+                                if isSharing {
+                                    ProgressView()
+                                } else {
+                                    Image(systemName: "square.and.arrow.up")
+                                        .font(.title3)
+                                }
+                            }
+                            .frame(width: 52, height: 52)
+                            .background(DesignTokens.Colors.bgSecondary)
+                            .cornerRadius(DesignTokens.Radius.m)
                         }
+                        .disabled(isSharing || isSaving)
                         .accessibilityLabel("分享视频")
                     }
                 }
@@ -201,10 +209,14 @@ struct ResultView: View {
 
     // MARK: - 分享
     private func shareVideo() {
+        isSharing = true
         let activity = UIActivityViewController(
             activityItems: [outputURL],
             applicationActivities: nil
         )
+        activity.completionWithItemsHandler = { _, _, _, _ in
+            isSharing = false
+        }
 
         // iPad 适配：设置弹出来源
         if let popover = activity.popoverPresentationController {
@@ -216,6 +228,8 @@ struct ResultView: View {
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
            let root = windowScene.keyWindow?.rootViewController {
             root.present(activity, animated: true)
+        } else {
+            isSharing = false
         }
     }
 }

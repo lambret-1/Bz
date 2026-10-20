@@ -13,6 +13,7 @@ struct HomeView: View {
     @State private var inputImage: UIImage?
     @State private var outputImage: UIImage?
     @State private var isProcessingImage = false
+    @State private var isSavingImage = false
     private let imageSRService = ImageSuperResolutionService()
 
     var body: some View {
@@ -74,18 +75,41 @@ struct HomeView: View {
                                 .shadow(radius: 4)
                             
                             HStack(spacing: DesignTokens.Spacing.m) {
-                                Button("保存到相册") {
-                                    UIImageWriteToSavedPhotosAlbum(outputImage, nil, nil, nil)
+                                Button {
+                                    saveImageToAlbum(outputImage)
+                                } label: {
+                                    HStack(spacing: 6) {
+                                        if isSavingImage {
+                                            ProgressView().tint(.white)
+                                        } else {
+                                            Image(systemName: "square.and.arrow.down")
+                                        }
+                                        Text(isSavingImage ? "保存中…" : "保存到相册")
+                                    }
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 44)
+                                    .background(isSavingImage ? DesignTokens.Colors.accent.opacity(0.5) : DesignTokens.Colors.accent)
+                                    .cornerRadius(DesignTokens.Radius.m)
                                 }
-                                .buttonStyle(.borderedProminent)
-                                .tint(DesignTokens.Colors.accent)
+                                .disabled(isSavingImage)
                                 
-                                Button("重新选择") {
-                                    self.outputImage = nil
-                                    self.inputImage = nil
-                                    self.selectedPhotoItem = nil
+                                Button {
+                                    withAnimation {
+                                        self.outputImage = nil
+                                        self.inputImage = nil
+                                        self.selectedPhotoItem = nil
+                                    }
+                                } label: {
+                                    Text("重新选择")
+                                        .font(.subheadline.weight(.medium))
+                                        .foregroundColor(DesignTokens.Colors.accent)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: 44)
+                                        .background(DesignTokens.Colors.bgSecondary)
+                                        .cornerRadius(DesignTokens.Radius.m)
                                 }
-                                .buttonStyle(.bordered)
                             }
                         } else {
                             Image(systemName: "photo.badge.plus")
@@ -157,9 +181,11 @@ struct HomeView: View {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: DesignTokens.Spacing.m) {
                             ForEach(appState.recentRecords.prefix(10)) { record in
-                                RecentRecordCard(record: record) {
+                                RecentRecordCard(record: record, onTap: {
                                     appState.replayRecentRecord(record)
-                                }
+                                }, onDelete: {
+                                    appState.deleteRecentRecord(record)
+                                })
                             }
                         }
                     }
@@ -237,7 +263,18 @@ struct HomeView: View {
             isProcessingImage = false
             if let result = result {
                 self.outputImage = result
+            } else {
+                appState.showToast("图片超分失败，请重试", style: .error)
             }
+        }
+    }
+
+    private func saveImageToAlbum(_ image: UIImage) {
+        isSavingImage = true
+        UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            isSavingImage = false
+            appState.showToast("已保存到相册")
         }
     }
 }
@@ -246,6 +283,7 @@ struct HomeView: View {
 struct RecentRecordCard: View {
     let record: RecentRecord
     var onTap: (() -> Void)? = nil
+    var onDelete: (() -> Void)? = nil
 
     private var thumbnailImage: UIImage? {
         guard let data = record.thumbnailData else { return nil }
@@ -337,6 +375,7 @@ struct RecentRecordCard: View {
         .buttonStyle(.plain)
         .contextMenu {
             Button(role: .destructive) {
+                onDelete?()
             } label: {
                 Label("删除", systemImage: "trash")
             }
