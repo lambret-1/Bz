@@ -9,8 +9,16 @@ import Accelerate
 final class VideoPipeline {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "VideoPipeline")
     private var isCancelled = false
-    /// 帧插值器，模型缺失时为 nil（降级为空转）
-    private let interpolator: FrameInterpolator?
+    /// 帧插值器，懒加载：首次进入补帧模式时才加载模型，避免启动时同步加载阻塞UI
+    private lazy var interpolator: FrameInterpolator? = {
+        let interp = FrameInterpolator()
+        if interp == nil {
+            logger.warning("RIFE Lite 模型未加载，补帧管线将以空转模式运行（帧率不变）")
+        } else {
+            logger.info("RIFE Lite 模型加载成功，补帧功能已启用")
+        }
+        return interp
+    }()
     /// 后台处理队列
     private let processingQueue = DispatchQueue(label: "com.lambret.bz.pipeline", qos: .userInitiated)
 
@@ -36,19 +44,14 @@ final class VideoPipeline {
     /// 音频诊断结果（供结果页展示，不依赖Xcode控制台）
     static var 音频诊断结果: String = "未执行"
 
-    /// 是否使用 AI 补帧（模型加载成功为 true，缺失为 false）
-    var isUsingAIInterpolation: Bool { interpolator != nil }
+    /// 是否使用 AI 补帧（模型文件存在即视为可用，实际加载在首次补帧时完成）
+    var isUsingAIInterpolation: Bool = true
 
     /// 当前使用的超分引擎类型（处理完成后供结果页查询）
     private(set) var currentSuperResolutionEngine: SuperResolutionEngineType?
 
     init() {
-        self.interpolator = FrameInterpolator()
-        if interpolator == nil {
-            logger.warning("RIFE Lite 模型未加载，补帧管线将以空转模式运行（帧率不变）")
-        } else {
-            logger.info("RIFE Lite 模型加载成功，补帧功能已启用")
-        }
+        // 模型懒加载，启动时不加载任何模型，避免阻塞UI
     }
 
     // MARK: - 公开方法
