@@ -24,19 +24,23 @@ final class RealESRGANEngine: SuperResolutionEngine {
             forResource: SuperResolutionEngineType.realESRGAN.modelFileName,
             withExtension: "mlmodelc"
         ) else {
-            logger.error("找不到模型文件")
+            FileLogger.shared.log("❌ 找不到模型文件")
             return nil
         }
 
         let config = MLModelConfiguration()
-        // 强制纯 ANE 模式
+        // 这里依然保持纯 ANE 模式
         config.computeUnits = .cpuAndNeuralEngine
         
         do {
             self.model = try MLModel(contentsOf: modelURL, configuration: config)
-            logger.info("RealESRGAN 引擎初始化成功 (当前模式: 纯 ANE)")
+            FileLogger.shared.log("✅ RealESRGAN 引擎初始化成功 (当前模式: 纯 ANE)")
+            
+            // 启动后立刻在后台跑一次诊断
+            self.runFileDiagnostic()
+            
         } catch {
-            logger.error("❌ 纯 ANE 模式初始化失败: \(error.localizedDescription)")
+            FileLogger.shared.log("❌ 纯 ANE 模式初始化失败: \(error.localizedDescription)")
             return nil
         }
     }
@@ -174,7 +178,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         do {
             inputProvider = try MLDictionaryFeatureProvider(dictionary: ["input": inputFeature])
         } catch {
-            print("❌ 创建 InputProvider 失败: \(error)")
+            FileLogger.shared.log("❌ 创建 InputProvider 失败: \(error)")
             return nil
         }
         
@@ -182,27 +186,27 @@ final class RealESRGANEngine: SuperResolutionEngine {
         do {
             prediction = try model.prediction(from: inputProvider)
         } catch {
-            print("❌ 模型推理失败 (可能是算子不支持纯ANE): \(error)")
+            FileLogger.shared.log("❌ 模型推理失败 (可能是算子不支持纯ANE): \(error)")
             return nil
         }
         
         guard let outputValue = prediction.featureValue(for: "output") else {
-            print("❌ 找不到名为 output 的特征值")
+            FileLogger.shared.log("❌ 找不到名为 output 的特征值")
             return nil
         }
         
         guard let outputBuffer = outputValue.imageBufferValue else {
-            print("❌ 模型的 output 不是 ImageBuffer (CVPixelBuffer)。请检查 Python 端输出类型。")
+            FileLogger.shared.log("❌ 模型的 output 不是 ImageBuffer (CVPixelBuffer)")
             return nil
         }
         
         if !hasPrintedFormat {
             let format = CVPixelBufferGetPixelFormatType(outputBuffer)
-            print("🔥 纯 ANE 模式输出 PixelFormat: \(format)")
+            FileLogger.shared.log("🔥 纯 ANE 模式输出 PixelFormat: \(format)")
             if format == kCVPixelFormatType_32BGRA {
-                print("✅ 格式匹配 BGRA (0x42475241)")
+                FileLogger.shared.log("✅ 格式匹配 BGRA (1111970369)")
             } else {
-                print("⚠️ 格式不匹配！预期 BGRA (1111970369)，实际是 \(format)")
+                FileLogger.shared.log("⚠️ 格式不匹配！预期 BGRA (1111970369)")
             }
             hasPrintedFormat = true
         }
@@ -321,6 +325,56 @@ final class RealESRGANEngine: SuperResolutionEngine {
             if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
+        }
+    }
+
+    // MARK: - 自动文件诊断逻辑
+    func runFileDiagnostic() {
+        DispatchQueue.global(qos: .background).async {
+            FileLogger.shared.log("--- 开始后台文件诊断 ---")
+            
+            var testBuffer: CVPixelBuffer?
+            let attrs = [kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                         kCVPixelBufferWidthKey: self.inputWidth,
+                         kCVPixelBufferHeightKey: self.inputHeight] as CFDictionary
+            CVPixelBufferCreate(kCFAllocatorDefault, self.inputWidth, self.inputHeight, kCVPixelFormatType_32BGRA, attrs, &testBuffer)
+            
+            guard let inputBuf = testBuffer else { return }
+            CVPixelBufferLockBaseAddress(inputBuf, [])
+            if let base = CVPixelBufferGetBaseAddress(inputBuf) {
+                let ptr = base.assumingMemoryBound(to: UInt8.self)
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(inputBuf)
+                for y in 0..<self.inputHeight {
+                    for x in 0..<self.inputWidth {
+                        let offset = y * bytesPerRow + x * 4
+                        ptr[offset] = 128; ptr[offset + 1] = 128; ptr[offset + 2] = 128; ptr[offset + 3] = 255
+                    }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(inputBuf, [])
+            
+            guard let outputBuf = self.predictTile(inputBuf) else {
+                FileLogger.shared.log("❌ 诊断推理返回 nil")
+                return
+            }
+            
+            CVPixelBufferLockBaseAddress(outputBuf, .readOnly)
+            if let outBase = CVPixelBufferGetBaseAddress(outputBuf) {
+                let ptr = outBase.assumingMemoryBound(to: UInt8.self)
+                let bytesPerRow = CVPixelBufferGetBytesPerRow(outputBuf)
+                let cx = self.inputWidth * 2
+                let cy = self.inputHeight * 2
+                let offset = cy * bytesPerRow + cx * 4
+                FileLogger.shared.log("📊 诊断中心像素 -> B:\(ptr[offset]) G:\(ptr[offset+1]) R:\(ptr[offset+2]) A:\(ptr[offset+3])")
+                
+                if ptr[offset] == 0 && ptr[offset+1] == 0 && ptr[offset+2] == 0 {
+                    FileLogger.shared.log("🚨 诊断结论：模型在手机上输出纯黑！请检查 Python 转换逻辑。")
+                } else {
+                    FileLogger.shared.log("✅ 诊断结论：模型输出非黑！问题在视频拼接或写入环节。")
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(outputBuf, .readOnly)
+            FileLogger.shared.log("--- 诊断结束 ---")
         }
     }
 }
