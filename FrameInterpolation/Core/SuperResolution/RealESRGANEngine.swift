@@ -29,9 +29,11 @@ final class RealESRGANEngine: SuperResolutionEngine {
         }
 
         let config = MLModelConfiguration()
-        config.computeUnits = .cpuAndNeuralEngine
+        // ========== 强制仅GPU+CPU兜底，禁用ANE ==========
+        config.computeUnits = .gpuAndCPU
+        
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
-            logger.error("模型加载失败")
+            logger.error("GPU模式模型加载失败")
             return nil
         }
         self.model = model
@@ -48,7 +50,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
             }
         }
 
-        logger.info("RealESRGAN 镜像Padding+预计算权重版初始化成功")
+        logger.info("RealESRGAN GPU-only模式(禁用ANE) + 镜像Padding+预计算权重版初始化成功")
     }
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
@@ -145,7 +147,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return buffer
     }
 
-    /// 镜像反射padding填充tile（替换旧的clamp复制边缘）
+    /// 镜像反射padding填充tile
     private func fillTileBuffer(_ tile: CVPixelBuffer,
                                 from src: UnsafePointer<UInt8>,
                                 srcBytesPerRow: Int,
@@ -207,7 +209,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
         return outputBuffer
     }
 
-    /// Accelerate向量化累加，使用预计算tileWeightMap
+    /// 瓦片结果累加，使用预计算tileWeightMap
     private func accumulateOutputBuffer(
         _ outputBuffer: CVPixelBuffer,
         accumR: inout [Float], accumG: inout [Float], accumB: inout [Float], accumW: inout [Float],
@@ -327,7 +329,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
     }
 }
 
-// MARK: 协议桩（你原有工程已有，仅用于编译通过校验）
+// MARK: 协议桩（原有工程已有，仅编译校验）
 protocol SuperResolutionEngine {
     static var engineType: SuperResolutionEngineType { get }
     var scaleFactor: Int { get }
