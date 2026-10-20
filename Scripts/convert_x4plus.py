@@ -80,7 +80,7 @@ def convert_to_coreml(pth_path: str) -> ct.models.MLModel:
             scale=1/255.0, 
             bias=[0, 0, 0]
         )],
-        outputs=[ct.ImageType(name="output", scale=scale=255.0)],
+        outputs=[ct.ImageType(name="output", scale=255.0)],
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS16
     )
