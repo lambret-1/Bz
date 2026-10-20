@@ -12,7 +12,7 @@ struct HomeView: View {
     @State private var selectedPhotoItem: PhotosPickerItem?
     @State private var inputImage: UIImage?
     @State private var outputImage: UIImage?
-    @State private var isProcessingImage = false
+    @State private var isonProcessingImage = false
     // 实例化图片处理服务
     private let imageSRService = ImageSuperResolutionService()
 
@@ -52,10 +52,10 @@ struct HomeView: View {
                             showPicker = true
                         }
                     }
-                   2 .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity)
                 }
 
-                // . 图片超分卡片 (新增)
+                // 2. 图片超分卡片 (新增)
                 CardView {
                     VStack(spacing: DesignTokens.Spacing.m) {
                         if isProcessingImage {
@@ -162,7 +162,6 @@ struct HomeView: View {
                         HStack(spacing: DesignTokens.Spacing.m) {
                             ForEach(appState.recentRecords.prefix(10)) { record in
                                 RecentRecordCard(record: record) {
-                                    // 点击卡片：如果输出文件仍存在则直接展示结果，否则提示重新导入
                                     appState.replayRecentRecord(record)
                                 }
                             }
@@ -185,12 +184,12 @@ struct HomeView: View {
                 }
             )
         }
-        // 参数设置页（独立全屏导航，不共用首页导航栈）
+        // 参数设置页
         .fullScreenCover(isPresented: $appState.showSettings) {
             SettingsView()
                 .environmentObject(appState)
         }
-        // 应用设置页（独立全屏导航）
+        // 应用设置页
         .fullScreenCover(isPresented: $showAppSettings) {
             AppSettingsView()
                 .environmentObject(appState)
@@ -203,7 +202,7 @@ struct HomeView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        // 处理中横幅（最小化到首页时显示）
+        // 处理中横幅
         .overlay(alignment: .top) {
             if appState.isProcessingMinimized {
                 Button {
@@ -235,14 +234,14 @@ struct HomeView: View {
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        // 处理中页（从首页横幅恢复时展示）
+        // 处理中页
         .fullScreenCover(isPresented: $appState.isProcessing) {
             ProcessingView()
                 .environmentObject(appState)
         }
     }
     
-    // 触发图片超分的方法
+    // 触发图片超分
     private func startImageUpscale(_ image: UIImage) {
         isProcessingImage = true
         imageSRService.processImage(image) { result in
@@ -250,9 +249,9 @@ struct HomeView: View {
             if let result = result {
                 self.outputImage = result
             } else {
-                // 处理失败
                 appState.toastMessage = "图片处理失败，请重试"
-                appState.toastStyle = .error // 假设你有 error 样式
+                // 如果你的 appState.toastStyle 有 error 枚举，可以加上，如果没有就删掉下面这行
+                // appState.toastStyle = .error
             }
         }
     }
@@ -271,7 +270,6 @@ struct RecentRecordCard: View {
     var body: some View {
         Button(action: { onTap?() }) {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
-                // 缩略图区域
                 ZStack(alignment: .bottomLeading) {
                     RoundedRectangle(cornerRadius: DesignTokens.Radius.s)
                         .fill(DesignTokens.Colors.bgTertiary)
@@ -290,7 +288,6 @@ struct RecentRecordCard: View {
                             .foregroundColor(DesignTokens.Colors.textSecondary)
                     }
 
-                    // 时长标签
                     if let duration = record.durationText {
                         Text(duration)
                             .font(.system(size: 10, weight: .medium))
@@ -302,7 +299,6 @@ struct RecentRecordCard: View {
                             .padding(6)
                     }
 
-                    // 处理模式标签（右上角）
                     if let mode = record.processingMode {
                         Text(mode)
                             .font(.system(size: 9, weight: .medium))
@@ -317,14 +313,12 @@ struct RecentRecordCard: View {
                 }
                 .frame(width: 180, height: 101)
 
-                // 文件名
                 Text(record.fileName)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(DesignTokens.Colors.textPrimary)
                     .lineLimit(1)
                     .frame(width: 180, alignment: .leading)
 
-                // 元信息行
                 HStack(spacing: 6) {
                     if let resolution = record.resolutionText {
                         Text(resolution)
@@ -348,7 +342,6 @@ struct RecentRecordCard: View {
                 }
                 .frame(width: 180, alignment: .leading)
 
-                // 时间
                 Text(record.formattedDate)
                     .font(.system(size: 10))
                     .foregroundColor(DesignTokens.Colors.textSecondary.opacity(0.7))
@@ -359,7 +352,6 @@ struct RecentRecordCard: View {
         .buttonStyle(.plain)
         .contextMenu {
             Button(role: .destructive) {
-                // 删除操作由父视图处理
             } label: {
                 Label("删除", systemImage: "trash")
             }
