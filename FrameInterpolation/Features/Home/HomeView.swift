@@ -81,6 +81,8 @@ struct HomeView: View {
                            let uiImage = UIImage(data: data) {
                             await MainActor.run {
                                 self.inputImage = uiImage
+                                // 立即重置selection，避免下次选同一张图时onChange不触发
+                                self.selectedPhotoItem = nil
                                 startImageUpscale(uiImage)
                             }
                         }
