@@ -97,8 +97,9 @@ struct ProcessingView: View {
                 .accessibilityLabel("取消处理")
             }
             .padding(.horizontal, DesignTokens.Spacing.m)
-            .padding(.top, 8) // 稍微留点边距，看起来更舒服
-            .background(DesignTokens.Colors.bgPrimary) // 保证导航栏背景色与全局一致
+            .padding(.top, 44) // 避开刘海/状态栏高度
+            .padding(.bottom, 8)
+            .background(DesignTokens.Colors.bgPrimary)
         }
         // 禁止手势返回，防止处理中误触
         .interactiveDismissDisabled()
