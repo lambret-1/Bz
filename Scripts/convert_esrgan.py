@@ -27,9 +27,9 @@ from esrgan_model.srvgg_net import SRVGGNetCompact
 # ==================== 配置 ====================
 # 模型权重下载地址
 MODEL_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesr-general-x4v3.pth"
-# 固定输入瓦片尺寸（注意：宽 352，高 608）
-INPUT_WIDTH = 352
-INPUT_HEIGHT = 608
+# 固定输入瓦片尺寸
+INPUT_WIDTH = 512
+INPUT_HEIGHT = 512
 # 输出路径
 OUTPUT_PACKAGE = os.path.join(SCRIPT_DIR, "real_esrgan_x4v3.mlpackage")
 
