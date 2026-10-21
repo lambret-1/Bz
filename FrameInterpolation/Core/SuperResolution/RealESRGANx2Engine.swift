@@ -13,7 +13,7 @@ private final class ReusableInput: MLFeatureProvider {
     }
 }
 
-// MARK: - RealESRGAN x2 引擎（256 tile -> 512 输出）
+// MARK: - RealESRGAN 4x 引擎（256 输入 -> 1024 输出）
 final class RealESRGANx2Engine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANx2Engine")
 
@@ -22,13 +22,13 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
     // 模型固定输入
     let inputWidth: Int = 256
     let inputHeight: Int = 256
-    // 2x 超分
-    let scaleFactor: Int = 2
+    // P0: 模型实际 4x（输出 1024 = 256 × 4）
+    let scaleFactor: Int = 4
 
-    // Tile 参数：pad 覆盖 RRDB 边界衰减，effIn=224，effOut=448
-    private let pad: Int = 16
-    private var effIn: Int { inputWidth - 2 * pad }   // 224
-    private var effOut: Int { effIn * scaleFactor }   // 448
+    // 多 Tile 路径参数（仅大图使用）
+    private let tilePad: Int = 16
+    private var tileEffIn: Int { inputWidth - 2 * tilePad }   // 224
+    private var tileEffOut: Int { tileEffIn * scaleFactor }   // 896
 
     private let model: MLModel
     private let inputArray: MLMultiArray
@@ -38,9 +38,14 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
 
     // 复用的中间 buffer
     private let tileBuf: CVPixelBuffer        // 256x256 BGRA 输入 tile
-    private let outTileBGRA: CVPixelBuffer    // 512x512 BGRA 输出 tile
+    private let outTileBGRA: CVPixelBuffer    // 1024x1024 BGRA 输出 tile
     private let modelOutW: Int
     private let modelOutH: Int
+
+    // P0: 预分配后处理临时 buffer，避免每 tile 分配 15MB
+    // 容量 = modelOutW * modelOutH * 3（1024×1024×3）
+    private let tmpFloat: UnsafeMutablePointer<Float>
+    private let tmpU8: UnsafeMutablePointer<UInt8>
 
     // 最终输出 pool
     private var outputPool: CVPixelBufferPool?
@@ -53,7 +58,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
     init?() {
         let tStart = CFAbsoluteTimeGetCurrent()
         logger.info("🚀 开始初始化 RealESRGAN x2 引擎...")
-        
+
         guard let modelURL = Bundle.main.url(
             forResource: SuperResolutionEngineType.realESRGANx2.modelFileName,
             withExtension: "mlmodelc"
@@ -64,11 +69,12 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
 
         let config = MLModelConfiguration()
         config.computeUnits = .all
-        guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
-            logger.error("❌ 模型加载失败")
+        do {
+            self.model = try MLModel(contentsOf: modelURL, configuration: config)
+        } catch {
+            logger.error("❌ 模型加载失败: \(error)")
             return nil
         }
-        self.model = model
 
         guard let inShape = model.modelDescription.inputDescriptionsByName["input"]?
                 .multiArrayConstraint?.shape.map({ $0.intValue }),
@@ -78,15 +84,17 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             logger.error("❌ 模型输入/输出格式不是 4D Tensor")
             return nil
         }
+        // P0: 第一行日志就能看出“文件名 x2 / 实际 4x”这类问题
+        logger.info("📐 模型实际 IO: in=\(inShape), out=\(outShape)")
+
         let inN = inShape[0], inC = inShape[1], inH = inShape[2], inW = inShape[3]
         let outN = outShape[0], outC = outShape[1], outH = outShape[2], outW = outShape[3]
 
-        // 验证输入输出维度符合 x2 预期
-        guard inN == 1, inW == 256, inH == 256,
+        // P0: 按 scaleFactor=4 校验
+        guard inN == 1, inW == inputWidth, inH == inputHeight,
               outN == 1, outC == 3,
-              outW == 256 * 2, outH == 256 * 2 else {
-            // 修复：使用局部变量 inH, inW, outH, outW 避免闭包捕获 self 的问题
-            logger.error("❌ 模型维度不符！期望: [1,\(inC),256,256] -> [1,3,512,512]；实际: \(inShape) -> \(outShape)")
+              outW == inputWidth * scaleFactor, outH == inputHeight * scaleFactor else {
+            logger.error("❌ 模型维度不符！期望: [1,\(inC),\(inputHeight),\(inputWidth)] -> [1,3,\(inputHeight*scaleFactor),\(inputWidth*scaleFactor)]；实际: \(inShape) -> \(outShape)")
             return nil
         }
         self.modelOutW = outW
@@ -105,7 +113,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         opts.outputBackings = ["output": outputArray]
         self.predOpts = opts
 
-        guard let tileBuf = Self.makeBGRA(width: 256, height: 256),
+        guard let tileBuf = Self.makeBGRA(width: inputWidth, height: inputHeight),
               let outTileBGRA = Self.makeBGRA(width: outW, height: outH) else {
             logger.error("❌ 复用 Tile Buffer 创建失败")
             return nil
@@ -113,31 +121,126 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         self.tileBuf = tileBuf
         self.outTileBGRA = outTileBGRA
 
+        // P0: 预分配后处理临时 buffer。放在所有 guard 之后，且 allocate 不会失败，
+        // 因此 init? 后续不会再 return nil，deinit 语义安全。
+        let planeCount = outW * outH
+        self.tmpFloat = UnsafeMutablePointer<Float>.allocate(capacity: planeCount * 3)
+        self.tmpU8 = UnsafeMutablePointer<UInt8>.allocate(capacity: planeCount * 3)
+
         let elapsed = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
-        logger.info("✅ 引擎初始化成功！耗时: \(elapsed, format: .fixed(precision: 2))ms。输入: \(inW)x\(inH) 通道:\(inC)，输出: \(outW)x\(outH)")
+        logger.info("✅ 引擎初始化成功！耗时: \(elapsed, format: .fixed(precision: 2))ms。输入: \(inW)x\(inH) 通道:\(inC)，输出: \(outW)x\(outH)，scale=\(self.scaleFactor)x")
+    }
+
+    deinit {
+        tmpFloat.deallocate()
+        tmpU8.deallocate()
+        logger.info("♻️ RealESRGANx2Engine deinit")
     }
 
     // MARK: - 公共接口
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        let tFrameStart = CFAbsoluteTimeGetCurrent()
         cancelLock.lock(); isCancelledFlag = false; cancelLock.unlock()
 
         let srcW = CVPixelBufferGetWidth(pixelBuffer)
         let srcH = CVPixelBufferGetHeight(pixelBuffer)
         guard srcW > 0, srcH > 0 else { return nil }
 
+        // P0: 源 ≤ 模型输入时走单 tile 快速路径，避免 2×2 的 4 倍推理浪费
+        if srcW <= inputWidth && srcH <= inputHeight {
+            return upscaleSingleTile(pixelBuffer)
+        }
+        return upscaleTiled(pixelBuffer)
+    }
+
+    func cancel() {
+        cancelLock.lock(); isCancelledFlag = true; cancelLock.unlock()
+        logger.info("⚠️ 触发 cancel() 信号")
+    }
+
+    // MARK: - 单 Tile 快速路径（源 ≤ 256，pad=0，一次推理直出）
+
+    private func upscaleSingleTile(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let tFrameStart = CFAbsoluteTimeGetCurrent()
+        let srcW = CVPixelBufferGetWidth(pixelBuffer)
+        let srcH = CVPixelBufferGetHeight(pixelBuffer)
         let outW = srcW * scaleFactor
         let outH = srcH * scaleFactor
+
         guard let outBuffer = makeOutputBuffer(width: outW, height: outH) else {
             logger.error("❌ 申请输出 Buffer 失败: \(outW)x\(outH)")
             return nil
         }
 
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(outBuffer, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+            CVPixelBufferUnlockBaseAddress(outBuffer, [])
+        }
+
+        // 1. 反射填充到 256×256（源=256 时 extractReflectTile 内走整行 memcpy）
+        guard extractReflectTile(from: pixelBuffer, into: tileBuf,
+                                 x: 0, y: 0, w: inputWidth, h: inputHeight) else {
+            logger.error("❌ 单 Tile 反射裁剪失败")
+            return nil
+        }
+
+        // 2. BGRA -> Tensor (FP16)
+        let tConvertStart = CFAbsoluteTimeGetCurrent()
+        guard bgraToTensor(tileBuf) else {
+            logger.error("❌ 单 Tile 格式转换失败")
+            return nil
+        }
+        let tConvertCost = (CFAbsoluteTimeGetCurrent() - tConvertStart) * 1000
+
+        // 3. 推理
+        let tPredictStart = CFAbsoluteTimeGetCurrent()
+        guard (try? model.prediction(from: inputProvider, options: predOpts)) != nil else {
+            logger.error("❌ 单 Tile 模型推理失败")
+            return nil
+        }
+        let tPredictCost = (CFAbsoluteTimeGetCurrent() - tPredictStart) * 1000
+
+        // 4. 写回：只拷贝左上 srcW*4 × srcH*4（源=256 时即全图 1024×1024）
+        let copyW = min(outW, inputWidth * scaleFactor)
+        let copyH = min(outH, inputHeight * scaleFactor)
+        let tWriteStart = CFAbsoluteTimeGetCurrent()
+        _ = writeTileBack(to: outBuffer,
+                          srcX: 0, srcY: 0,
+                          dstX: 0, dstY: 0,
+                          w: copyW, h: copyH)
+        let tWriteCost = (CFAbsoluteTimeGetCurrent() - tWriteStart) * 1000
+
+        copyColorSpaceAttachments(from: pixelBuffer, to: outBuffer)
+
+        let totalCost = (CFAbsoluteTimeGetCurrent() - tFrameStart) * 1000
+        logger.debug("✅ 单 Tile 完成！源 \(srcW)x\(srcH) -> \(outW)x\(outH)，转换 \(tConvertCost, format: .fixed(precision: 2))ms，推理 \(tPredictCost, format: .fixed(precision: 2))ms，写回 \(tWriteCost, format: .fixed(precision: 2))ms，总 \(totalCost, format: .fixed(precision: 2))ms")
+        return outBuffer
+    }
+
+    // MARK: - 多 Tile 路径（大图）
+
+    private func upscaleTiled(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let tFrameStart = CFAbsoluteTimeGetCurrent()
+        let srcW = CVPixelBufferGetWidth(pixelBuffer)
+        let srcH = CVPixelBufferGetHeight(pixelBuffer)
+        let outW = srcW * scaleFactor
+        let outH = srcH * scaleFactor
+
+        guard let outBuffer = makeOutputBuffer(width: outW, height: outH) else {
+            logger.error("❌ 申请输出 Buffer 失败: \(outW)x\(outH)")
+            return nil
+        }
+
+        let effIn = tileEffIn      // 224
+        let effOut = tileEffOut    // 896
+        let pad = tilePad          // 16
+
         let cols = max(1, (srcW + effIn - 1) / effIn)
         let rows = max(1, (srcH + effIn - 1) / effIn)
         let totalTiles = cols * rows
-        
+
         logger.debug("🎬 开始处理帧: 源图 \(srcW)x\(srcH) -> 目标 \(outW)x\(outH), Tile网格: \(cols)x\(rows) (共 \(totalTiles) 块)")
 
         CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
@@ -159,7 +262,6 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                 let srcX = tx * effIn - pad
                 let srcY = ty * effIn - pad
 
-                // 1. 反射 padding 抽取 tile
                 guard extractReflectTile(from: pixelBuffer, into: tileBuf,
                                          x: srcX, y: srcY,
                                          w: inputWidth, h: inputHeight) else {
@@ -167,7 +269,6 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                     continue
                 }
 
-                // 2. BGRA -> Tensor (FP16)
                 let tConvertStart = CFAbsoluteTimeGetCurrent()
                 guard bgraToTensor(tileBuf) else {
                     logger.error("❌ Tile[\(tx),\(ty)] 格式转换失败")
@@ -175,7 +276,6 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                 }
                 let tConvertCost = (CFAbsoluteTimeGetCurrent() - tConvertStart) * 1000
 
-                // 3. 推理
                 let tPredictStart = CFAbsoluteTimeGetCurrent()
                 guard (try? model.prediction(from: inputProvider, options: predOpts)) != nil else {
                     logger.error("❌ Tile[\(tx),\(ty)] 模型推理失败")
@@ -183,7 +283,6 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                 }
                 let tPredictCost = (CFAbsoluteTimeGetCurrent() - tPredictStart) * 1000
 
-                // 4. 裁剪写回
                 let dstX = tx * effOut
                 let dstY = ty * effOut
                 let copyW = min(effOut, outW - dstX)
@@ -197,28 +296,19 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                                   w: copyW, h: copyH)
                 let tWriteCost = (CFAbsoluteTimeGetCurrent() - tWriteStart) * 1000
 
-                let tTileEnd = CFAbsoluteTimeGetCurrent()
-                let tileCost = (tTileEnd - tTileStart) * 1000
-
+                let tileCost = (CFAbsoluteTimeGetCurrent() - tTileStart) * 1000
                 logger.debug("  🧩 Tile[\(tx),\(ty)] 耗时: \(tileCost, format: .fixed(precision: 2))ms (转换: \(tConvertCost, format: .fixed(precision: 2))ms, 推理: \(tPredictCost, format: .fixed(precision: 2))ms, 写回: \(tWriteCost, format: .fixed(precision: 2))ms)")
             }
         }
 
         copyColorSpaceAttachments(from: pixelBuffer, to: outBuffer)
-        
-        let tFrameEnd = CFAbsoluteTimeGetCurrent()
-        let totalCost = (tFrameEnd - tFrameStart) * 1000
+
+        let totalCost = (CFAbsoluteTimeGetCurrent() - tFrameStart) * 1000
         logger.debug("✅ 帧处理完成！总耗时: \(totalCost, format: .fixed(precision: 2))ms")
-        
         return outBuffer
     }
 
-    func cancel() {
-        cancelLock.lock(); isCancelledFlag = true; cancelLock.unlock()
-        logger.info("⚠️ 触发 cancel() 信号")
-    }
-
-    // MARK: - Tile 提取（反射 padding）
+    // MARK: - Tile 提取（反射 padding）—— P0 不变
     private func extractReflectTile(from src: CVPixelBuffer,
                                     into dst: CVPixelBuffer,
                                     x: Int, y: Int, w: Int, h: Int) -> Bool {
@@ -273,9 +363,9 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         return m < n ? m : period - m
     }
 
-    // MARK: - BGRA 到 Tensor (vImage 加速)
+    // MARK: - BGRA 到 Tensor (vImage 加速) —— P0 不变
     private func bgraToTensor(_ pixelBuffer: CVPixelBuffer) -> Bool {
-        let w =Flags inputWidth, h = inputHeight
+        let w = inputWidth, h = inputHeight
         let planeCount = w * h
         let channels = inputArray.shape[1].intValue
 
@@ -288,12 +378,12 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             let r8 = u8Buf.baseAddress!
             let g8 = r8.advanced(by: planeCount)
             let b8 = g8.advanced(by: planeCount)
-            
+
             var r8b = vImage_Buffer(data: r8, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
             var g8b = vImage_Buffer(data: g8, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
             var b8b = vImage_Buffer(data: b8, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
-            
-            let err1 = vImageConvert_BGRX8888ToPlanar8(&src, &b8b, &g8b, &r8b, vImage_(kvImageNoFlags))
+
+            let err1 = vImageConvert_BGRX8888ToPlanar8(&src, &b8b, &g8b, &r8b, vImage_Flags(kvImageNoFlags))
             guard err1 == kvImageNoError else {
                 logger.error("❌ vImageConvert_BGRX8888ToPlanar8 失败: \(err1)")
                 return false
@@ -303,11 +393,11 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                 let rF = fBuf.baseAddress!
                 let gF = rF.advanced(by: planeCount)
                 let bF = gF.advanced(by: planeCount)
-                
+
                 var rFb = vImage_Buffer(data: rF, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 4)
                 var gFb = vImage_Buffer(data: gF, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 4)
                 var bFb = vImage_Buffer(data: bF, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 4)
-                
+
                 vImageConvert_Planar8toPlanarF(&r8b, &rFb, 1.0 / 255.0, 0.0, vImage_Flags(kvImageNoFlags))
                 vImageConvert_Planar8toPlanarF(&g8b, &gFb, 1.0 / 255.0, 0.0, vImage_Flags(kvImageNoFlags))
                 vImageConvert_Planar8toPlanarF(&b8b, &bFb, 1.0 / 255.0, 0.0, vImage_Flags(kvImageNoFlags))
@@ -316,11 +406,11 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                     let r16 = f16Buf.baseAddress!
                     let g16 = r16.advanced(by: planeCount)
                     let b16 = g16.advanced(by: planeCount)
-                    
+
                     var rF16 = vImage_Buffer(data: r16, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 2)
                     var gF16 = vImage_Buffer(data: g16, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 2)
                     var bF16 = vImage_Buffer(data: b16, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w * 2)
-                    
+
                     vImageConvert_PlanarFtoPlanar16F(&rFb, &rF16, vImage_Flags(kvImageNoFlags))
                     vImageConvert_PlanarFtoPlanar16F(&gFb, &gF16, vImage_Flags(kvImageNoFlags))
                     vImageConvert_PlanarFtoPlanar16F(&bFb, &bF16, vImage_Flags(kvImageNoFlags))
@@ -333,6 +423,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                         memcpy(dst.advanced(by: planeCount), g16, planeBytes)
                         memcpy(dst.advanced(by: 2 * planeCount), b16, planeBytes)
                     } else if channels == 12 {
+                        // 4 份内容完全相同，一次转换后复制 3 次
                         for frame in 0..<4 {
                             let base = frame * 3 * planeCount
                             memcpy(dst.advanced(by: base), r16, planeBytes)
@@ -349,7 +440,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         }
     }
 
-    // MARK: - Tensor 转 BGRA (vImage 加速 + 手动合并)
+    // MARK: - Tensor 转 BGRA（P0: 预分配 buffer + vImage 一次性组装）
+    // 注意：tmpFloat / tmpU8 是实例级复用 buffer，本方法不可并发调用。
     private func float16PlanarToBGRA(_ array: MLMultiArray, into buffer: CVPixelBuffer) -> Bool {
         let width = modelOutW, height = modelOutH
         let planeCount = width * height
@@ -360,62 +452,52 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
 
         let src = array.dataPointer.assumingMemoryBound(to: Float16.self)
 
-        return withUnsafeTemporaryAllocation(of: Float.self, capacity: planeCount * 3) { fBuf in
-            withUnsafeTemporaryAllocation(of: UInt8.self, capacity: planeCount * 3) { u8Buf in
-                let rF = fBuf.baseAddress!
-                let gF = rF.advanced(by: planeCount)
-                let bF = gF.advanced(by: planeCount)
+        let rF = tmpFloat
+        let gF = rF.advanced(by: planeCount)
+        let bF = gF.advanced(by: planeCount)
 
-                let r8 = u8Buf.baseAddress!
-                let g8 = r8.advanced(by: planeCount)
-                let b8 = g8.advanced(by: planeCount)
+        let r8 = tmpU8
+        let g8 = r8.advanced(by: planeCount)
+        let b8 = g8.advanced(by: planeCount)
 
-                var r16 = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src),
-                                        height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 2)
-                var g16 = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.advanced(by: planeCount)),
-                                        height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 2)
-                var b16 = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.advanced(by: 2 * planeCount)),
-                                        height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 2)
+        var r16 = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src),
+                                height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 2)
+        var g16 = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.advanced(by: planeCount)),
+                                height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 2)
+        var b16 = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src.advanced(by: 2 * planeCount)),
+                                height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 2)
 
-                var rFb = vImage_Buffer(data: rF, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
-                var gFb = vImage_Buffer(data: gF, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
-                var bFb = vImage_Buffer(data: bF, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
+        var rFb = vImage_Buffer(data: rF, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
+        var gFb = vImage_Buffer(data: gF, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
+        var bFb = vImage_Buffer(data: bF, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width * 4)
 
-                vImageConvert_Planar16FtoPlanarF(&r16, &rFb, vImage_Flags(kvImageNoFlags))
-                vImageConvert_Planar16FtoPlanarF(&g16, &gFb, vImage_Flags(kvImageNoFlags))
-                vImageConvert_Planar16FtoPlanarF(&b16, &bFb, vImage_Flags(kvImageNoFlags))
+        vImageConvert_Planar16FtoPlanarF(&r16, &rFb, vImage_Flags(kvImageNoFlags))
+        vImageConvert_Planar16FtoPlanarF(&g16, &gFb, vImage_Flags(kvImageNoFlags))
+        vImageConvert_Planar16FtoPlanarF(&b16, &bFb, vImage_Flags(kvImageNoFlags))
 
-                var r8b = vImage_Buffer(data: r8, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
-                var g8b = vImage_Buffer(data: g8, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
-                var b8b = vImage_Buffer(data: b8, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
+        var r8b = vImage_Buffer(data: r8, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
+        var g8b = vImage_Buffer(data: g8, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
+        var b8b = vImage_Buffer(data: b8, height: vImagePixelCount(height), width: vImagePixelCount(width), rowBytes: width)
 
-                vImageConvert_PlanarFtoPlanar8(&rFb, &r8b, 255.0, 0.0, vImage_Flags(kvImageNoFlags))
-                vImageConvert_PlanarFtoPlanar8(&gFb, &g8b, 255.0, 0.0, vImage_Flags(kvImageNoFlags))
-                vImageConvert_PlanarFtoPlanar8(&bFb, &b8b, 255.0, 0.0, vImage_Flags(kvImageNoFlags))
+        vImageConvert_PlanarFtoPlanar8(&rFb, &r8b, 255.0, 0.0, vImage_Flags(kvImageNoFlags))
+        vImageConvert_PlanarFtoPlanar8(&gFb, &g8b, 255.0, 0.0, vImage_Flags(kvImageNoFlags))
+        vImageConvert_PlanarFtoPlanar8(&bFb, &b8b, 255.0, 0.0, vImage_Flags(kvImageNoFlags))
 
-                // 手工组装 BGRA，规避 Xcode 16 中宏签名不兼容的问题 (512x512 耗时仅 < 1ms)
-                let dstPtr = base.assumingMemoryBound(to: UInt8.self)
-                let dstBytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-                
-                for y in 0..<height {
-                    let srcRowOffset = y * width
-                    let dstRowOffset = y * dstBytesPerRow
-                    for x in 0..<width {
-                        let srcIdx = srcRowOffset + x
-                        let dstIdx = dstRowOffset + x * 4
-                        dstPtr[dstIdx + 0] = b8[srcIdx]
-                        dstPtr[dstIdx + 1] = g8[srcIdx]
-                        dstPtr[dstIdx + 2] = r8[srcIdx]
-                        dstPtr[dstIdx + 3] = 255
-                    }
-                }
-                
-                return true
-            }
+        // P0: 用 vImage 一次性组装 BGRA，替换 1024×1024 逐像素循环
+        var dstBuf = vImage_Buffer(
+            data: base,
+            height: vImagePixelCount(height),
+            width: vImagePixelCount(width),
+            rowBytes: CVPixelBufferGetBytesPerRow(buffer))
+        let err = vImageConvert_Planar8toBGRX8888(&b8b, &g8b, &r8b, 255, &dstBuf, vImage_Flags(kvImageNoFlags))
+        if err != kvImageNoError {
+            logger.error("❌ vImageConvert_Planar8toBGRX8888 失败: \(err)")
+            return false
         }
+        return true
     }
 
-    // MARK: - Tile 写回
+    // MARK: - Tile 写回 —— P0 不变
     private func writeTileBack(to outBuffer: CVPixelBuffer,
                                srcX: Int, srcY: Int,
                                dstX: Int, dstY: Int,
