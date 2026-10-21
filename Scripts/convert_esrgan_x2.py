@@ -23,8 +23,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ==================== 配置 ====================
 MODEL_PTH_URL = "https://huggingface.co/ai-forever/Real-ESRGAN/resolve/main/RealESRGAN_x2.pth"
-INPUT_WIDTH = 512
-INPUT_HEIGHT = 512
+INPUT_WIDTH = 256
+INPUT_HEIGHT = 256
 OUTPUT_PACKAGE = os.path.join(SCRIPT_DIR, "real_esrgan_x2.mlpackage")
 
 
