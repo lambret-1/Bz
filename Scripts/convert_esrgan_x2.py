@@ -70,28 +70,24 @@ class RRDBNet(nn.Module):
         self.body = nn.Sequential(*[RRDB(nf, gc) for _ in range(nb)])
         self.conv_body = nn.Conv2d(nf, nf, 3, 1, 1)
 
-        if scale == 2:
-            self.conv_up1 = nn.Conv2d(nf, nf * 4, 3, 1, 1)
-            self.pixel_shuffle = nn.PixelShuffle(2)
-        elif scale == 4:
-            self.conv_up1 = nn.Conv2d(nf, nf * 4, 3, 1, 1)
-            self.conv_up2 = nn.Conv2d(nf, nf * 4, 3, 1, 1)
-            self.pixel_shuffle = nn.PixelShuffle(2)
+        # 上采样：用 Upsample + Conv（不是 PixelShuffle）
+        self.conv_up1 = nn.Conv2d(nf, nf, 3, 1, 1)
+        if scale == 4:
+            self.conv_up2 = nn.Conv2d(nf, nf, 3, 1, 1)
 
         self.conv_hr = nn.Conv2d(nf, nf, 3, 1, 1)
         self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1)
         self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
 
     def forward(self, x):
         feat = self.conv_first(x)
         trunk = self.conv_body(self.body(feat))
         feat = feat + trunk
 
-        if self.scale == 2:
-            feat = self.lrelu(self.pixel_shuffle(self.conv_up1(feat)))
-        elif self.scale == 4:
-            feat = self.lrelu(self.pixel_shuffle(self.conv_up1(feat)))
-            feat = self.lrelu(self.pixel_shuffle(self.conv_up2(feat)))
+        feat = self.lrelu(self.conv_up1(self.upsample(feat)))
+        if self.scale == 4:
+            feat = self.lrelu(self.conv_up2(self.upsample(feat)))
 
         out = self.conv_last(self.lrelu(self.conv_hr(feat)))
         return out
@@ -112,7 +108,7 @@ def download_model_weights() -> str:
 # ==================== 加载模型 ====================
 def load_model(pth_path: str) -> RRDBNet:
     print("🔧 加载模型...")
-    model = RRDBNet(in_nc=12, out_nc=3, nf=64, nb=23, gc=32, scale=2)
+    model = RRDBNet(in_nc=12, out_nc=3, nf=64, nb=23, gc=32, scale=4)
     checkpoint = torch.load(pth_path, map_location='cpu', weights_only=False)
     if 'params' in checkpoint:
         state_dict = checkpoint['params']
