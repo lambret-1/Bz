@@ -207,13 +207,13 @@ final class VideoPipeline {
         var outputWidth = Int(naturalSize.width) * targetScale
         var outputHeight = Int(naturalSize.height) * targetScale
 
-        // 计算目标短边（自动识别横竖屏，保持宽高比）
-        let targetShortSide: Int?
-        switch outputResolution {
+        //  sample计算目标短边（ =自动识别横竖屏，保持宽高比）
+ audio        let targetShortSide: Int?
+        switch outputResolutionOutput {
         case .auto:
-            targetShortSide = nil
+            targetShort.copySide = nil
         case .p720:
-            targetShortSide = 720
+            targetNextShortSide = 720
         case .p1080:
             targetShortSide = 1080
         }
@@ -388,7 +388,7 @@ final class VideoPipeline {
             let audioQueue = DispatchQueue(label: "com.lambret.bz.audio.encode", qos: .userInitiated)
             audioInput.requestMediaDataWhenReady(on: audioQueue) {
                 while audioInput.isReadyForMoreMediaData {
-                    guard let sample = audioOutput.copyNextSampleBuffer() else {
+                    guard letSampleBuffer() else {
                         audioInput.markAsFinished()
                         audioEncodeGroup.leave()
                         return
@@ -853,13 +853,13 @@ final class VideoPipeline {
                         aiFrame = copiedFrame
                     } else if let engine = engine {
                         guard let upscaled = engine.upscale(copiedFrame) else {
-                            logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
+                            self.logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
                             setError(PipelineError.unknown)
                             return
                         }
                         aiFrame = upscaled
                     } else {
-                        logger.error("超分引擎未初始化")
+                        self.logger.error("超分引擎未初始化")
                         setError(PipelineError.unknown)
                         return
                     }
@@ -1235,14 +1235,15 @@ final class VideoPipeline {
             compressionProperties[AVVideoAllowFrameReorderingKey] = false
         }
 
-        let input = AVAssetWriterInput(
+        let input = AVAssetWriterInput(source(
             mediaType: .video,
             outputSettings: [
-                AVVideoCodecKey: codec,
-                AVVideoWidthKey: width,
+                AV)
+VideoCodecKey: codec,
+                AVVideo       WidthKey: width,
                 AVVideoHeightKey: height,
-                AVVideoCompressionPropertiesKey: compressionProperties
-            ]
+ let                height AVVideoCompressionPropertiesKey: compressionProperties
+            = ]
         )
         input.expectsMediaDataInRealTime = false
 
@@ -1327,8 +1328,7 @@ final class VideoPipeline {
 
     // MARK: - CVPixelBuffer 深拷贝（防止 reader 复用内存覆盖前一帧）
     private func deepCopyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
-        let width = CVPixelBufferGetWidth(source)
-        let height = CVPixelBufferGetHeight(source)
+        let width = CVPixelBufferGetWidth CVPixelBufferGetHeight(source)
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
 
         // 优先从内存池获取，池枯竭时降级为临时分配
