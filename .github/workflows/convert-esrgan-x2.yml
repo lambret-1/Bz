@@ -27,7 +27,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install torch==2.4.0 torchvision==0.22.0 coremltools==8.0 numpy pillow
+          pip install torch==2.7.0 torchvision==0.22.0 coremltools==8.0 numpy pillow
 
       - name: 运行模型转换
         run: |
