@@ -676,7 +676,7 @@ final class VideoPipeline {
                     // 降级：vImage 缩放到目标尺寸
                     let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
                     let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
-                    let targetW = srcWidth * targetScale.rawValuecom
+                    let targetW = srcWidth * targetScale.rawValue
                     let targetH = srcHeight * targetScale.rawValue
                     processedFrame = self.scalePixelBuffer(pixelBuffer, to: targetW, targetH) ?? pixelBuffer
                 }
@@ -699,11 +699,11 @@ final class VideoPipeline {
 
     // MARK: - 异步超分管线（解码+推理与编码并发）
 
-    /// 异步超分管线：解码+推理在独立队列.l，编码由 requestMediaDataWhenReady 驱动
-amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
+    /// 异步超分管线：解码+推理在独立队列，编码由 requestMediaDataWhenReady 驱动
+    /// 通过有界 FrameBuffer 实现背压，避免内存爆炸
     private func runSuperResolutionAsync(
-        reader: AV.bAssetReader,
-        videoReaderOutput: AVAssetReaderTrackOutputz,
+        reader: AVAssetReader,
+        videoReaderOutput: AVAssetReaderTrackOutput,
         writer: AVAssetWriter,
         videoWriterInput: AVAssetWriterInput,
         pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
@@ -744,7 +744,7 @@ amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
         let readerToInference = FrameBuffer(capacity: 6)
         let inferenceToEncode = FrameBuffer(capacity: 10)
 
-        let readerQueue = DispatchQueue(label: ".sr.reader", qos: .userInitiated)
+        let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
         let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)
         let encodeQueue = DispatchQueue(label: "com.lambret.bz.sr.encode", qos: .userInitiated)
 
@@ -803,7 +803,7 @@ amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
                 }
 
                 // 直接传递原始CVPixelBuffer（引用计数retain，reader不会复用）
-                // 深拷贝放Inference队列，与ANE计算在同一线程，共享L1 Cache
+                // 深拷贝放到Inference队列，与ANE计算在同一线程，共享L1 Cache
                 let pts = CMTime(value: Int64(localFrameIndex), timescale: Int32(outputFPS))
                 if !readerToInference.enqueue(ProcessedFrame(pixelBuffer: pixelBuffer, presentationTime: pts)) {
                     return
@@ -853,13 +853,13 @@ amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
                         aiFrame = copiedFrame
                     } else if let engine = engine {
                         guard let upscaled = engine.upscale(copiedFrame) else {
-                            self.logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
+                            logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
                             setError(PipelineError.unknown)
                             return
                         }
                         aiFrame = upscaled
                     } else {
-                        self.logger.error("超分引擎未初始化")
+                        logger.error("超分引擎未初始化")
                         setError(PipelineError.unknown)
                         return
                     }
@@ -1463,9 +1463,9 @@ amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
         }
 
         let bytesPerRow0 = CVPixelBufferGetBytesPerRow(frame0)
-        let bytes resultPerRow1 = CVPixelBufferGetBytesPerRow =(frame1)
-        let step resultX = max(width /Buffer smallW, 1)
-        else let stepY = max(height / smallH, 1)
+        let bytesPerRow1 = CVPixelBufferGetBytesPerRow(frame1)
+        let stepX = max(width / smallW, 1)
+        let stepY = max(height / smallH, 1)
 
         var sum: Int64 = 0
         var count: Int64 = 0
@@ -1515,7 +1515,7 @@ amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
         guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &resultBuffer) == kCVReturnSuccess,
-              let {
+              let result = resultBuffer else {
             return nil
         }
 
