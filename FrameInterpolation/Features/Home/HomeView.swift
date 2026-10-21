@@ -406,39 +406,46 @@ struct ImageSRResultView: View {
                 VStack(spacing: DesignTokens.Spacing.l) {
                     if let output = outputImage, let input = inputImage {
                         // 对比滑块
-                        ZStack(alignment: .top) {
-                            Image(uiImage: output)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxWidth: .infinity)
+                        GeometryReader { geo in
+                            ZStack(alignment: .topLeading) {
+                                // 超分结果（底层全显示）
+                                Image(uiImage: output)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: geo.size.width, height: geo.size.height)
+                                    .clipped()
 
-                            GeometryReader { geo in
-                                ZStack(alignment: .topLeading) {
-                                    Image(uiImage: input)
-                                        .resizable()
-                                        .scaledToFit()
-                                        .frame(width: geo.size.width * splitProgress)
-                                        .clipped()
+                                // 原图（上层，按splitProgress裁剪左侧）
+                                Image(uiImage: input)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: geo.size.width, height: geo.size.height)
+                                    .clipped()
+                                    .frame(width: geo.size.width * splitProgress)
+                                    .clipped()
 
-                                    Rectangle()
-                                        .fill(Color.white)
-                                        .frame(width: 2, height: geo.size.height)
-                                        .offset(x: geo.size.width * splitProgress - 1)
+                                // 分割线
+                                Rectangle()
+                                    .fill(Color.white)
+                                    .frame(width: 2, height: geo.size.height)
+                                    .offset(x: geo.size.width * splitProgress - 1)
 
-                                    Image(systemName: "arrow.left.and.right.circle.fill")
-                                        .font(.system(size: 24))
-                                        .foregroundColor(.white)
-                                        .shadow(radius: 4)
-                                        .offset(x: geo.size.width * splitProgress - 12, y: geo.size.height / 2 - 12)
-                                }
-                                .gesture(
-                                    DragGesture()
-                                        .onChanged { value in
-                                            splitProgress = min(max(value.location.x / geo.size.width, 0), 1)
-                                        }
-                                )
+                                // 拖拽手柄
+                                Image(systemName: "arrow.left.and.right.circle.fill")
+                                    .font(.system(size: 24))
+                                    .foregroundColor(.white)
+                                    .shadow(radius: 4)
+                                    .offset(x: geo.size.width * splitProgress - 12, y: geo.size.height / 2 - 12)
                             }
+                            .contentShape(Rectangle())
+                            .gesture(
+                                DragGesture()
+                                    .onChanged { value in
+                                        splitProgress = min(max(value.location.x / geo.size.width, 0), 1)
+                                    }
+                            )
                         }
+                        .aspectRatio(output.size, contentMode: .fit)
                         .cornerRadius(DesignTokens.Radius.m)
                         .padding(.horizontal, DesignTokens.Spacing.m)
 
