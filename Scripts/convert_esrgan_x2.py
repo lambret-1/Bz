@@ -124,7 +124,7 @@ def load_model(pth_path: str) -> RRDBNet:
 # ==================== 转换 ====================
 def convert_to_coreml(model: RRDBNet) -> ct.models.MLModel:
     print(f"🔄 转换为 Core ML ({INPUT_WIDTH}x{INPUT_HEIGHT})...")
-    example_input = torch.rand(1, 3, INPUT_HEIGHT, INPUT_WIDTH)
+    example_input = torch.rand(1, 12, INPUT_HEIGHT, INPUT_WIDTH)
     traced = torch.jit.trace(model, example_input)
     mlmodel = ct.convert(
         traced,
