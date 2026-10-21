@@ -183,9 +183,9 @@ final class FastSRGANEngine: SuperResolutionEngine {
     // MARK: - 单瓦片推理（ImageType 输入）
 
     private func processTile(_ tileBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        guard let provider = try? MLDictionaryFeatureProvider(dictionary: ["image": tileBuffer]),
+        guard let provider = try? MLDictionaryFeatureProvider(dictionary: ["input_image": tileBuffer]),
               let prediction = try? model.prediction(from: provider),
-              let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
+              let outputBuffer = prediction.featureValue(for: "output_image")?.imageBufferValue else {
             return nil
         }
         return outputBuffer
