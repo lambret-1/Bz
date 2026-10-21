@@ -73,17 +73,16 @@ final class FrameBuffer {
         return frame
     }
 
-    /// 关闭队列，唤醒所有等待的线程（cancel 时调用）
+    /// 关闭队列，唤醒所有等待的线程（正常结束时调用，不丢弃已入队的帧）
     func close() {
         os_unfair_lock_lock(&lock)
         isClosed = true
-        let count = frames.count
-        frames.removeAll()
         os_unfair_lock_unlock(&lock)
 
-        // 广播唤醒：让所有阻塞的 enqueue 和 dequeue 全部醒来退出
+        // 唤醒所有在等 notFull 的生产者：它们会看到 isClosed 后退出
         for _ in 0..<capacity { notFull.signal() }
-        for _ in 0..<max(count, capacity) { notEmpty.signal() }
+        // 多唤醒一次 notEmpty，让消费者消费完剩余帧后醒来发现队列已空再退出
+        for _ in 0..<(capacity + 1) { notEmpty.signal() }
     }
 
     /// 当前队列中的帧数
