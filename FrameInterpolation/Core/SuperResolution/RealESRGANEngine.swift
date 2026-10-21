@@ -14,9 +14,8 @@ final class RealESRGANEngine: SuperResolutionEngine {
     let scaleFactor: Int = 4 // 模型输出是 2048x2048
 
     private let model: MLModel
-    private let ciContext = CIContext()
-    private var isCancelledFlag = false
     private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
+    private var isCancelledFlag = false
 
     init?() {
         // 注意：如果你使用的是代码里的 load 逻辑，把这里改成相应的 URL 获取
