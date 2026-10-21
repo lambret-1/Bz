@@ -207,13 +207,13 @@ final class VideoPipeline {
         var outputWidth = Int(naturalSize.width) * targetScale
         var outputHeight = Int(naturalSize.height) * targetScale
 
-        //  sample计算目标短边（ =自动识别横竖屏，保持宽高比）
- audio        let targetShortSide: Int?
-        switch outputResolutionOutput {
+        // 计算目标短边（自动识别横竖屏，保持宽高比）
+        let targetShortSide: Int?
+        switch outputResolution {
         case .auto:
-            targetShort.copySide = nil
+            targetShortSide = nil
         case .p720:
-            targetNextShortSide = 720
+            targetShortSide = 720
         case .p1080:
             targetShortSide = 1080
         }
@@ -388,7 +388,7 @@ final class VideoPipeline {
             let audioQueue = DispatchQueue(label: "com.lambret.bz.audio.encode", qos: .userInitiated)
             audioInput.requestMediaDataWhenReady(on: audioQueue) {
                 while audioInput.isReadyForMoreMediaData {
-                    guard letSampleBuffer() else {
+                    guard let sample = audioOutput.copyNextSampleBuffer() else {
                         audioInput.markAsFinished()
                         audioEncodeGroup.leave()
                         return
@@ -676,7 +676,7 @@ final class VideoPipeline {
                     // 降级：vImage 缩放到目标尺寸
                     let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
                     let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
-                    let targetW = srcWidth * targetScale.rawValue
+                    let targetW = srcWidth * targetScale.rawValuecom
                     let targetH = srcHeight * targetScale.rawValue
                     processedFrame = self.scalePixelBuffer(pixelBuffer, to: targetW, targetH) ?? pixelBuffer
                 }
@@ -699,11 +699,11 @@ final class VideoPipeline {
 
     // MARK: - 异步超分管线（解码+推理与编码并发）
 
-    /// 异步超分管线：解码+推理在独立队列，编码由 requestMediaDataWhenReady 驱动
-    /// 通过有界 FrameBuffer 实现背压，避免内存爆炸
+    /// 异步超分管线：解码+推理在独立队列.l，编码由 requestMediaDataWhenReady 驱动
+amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
     private func runSuperResolutionAsync(
-        reader: AVAssetReader,
-        videoReaderOutput: AVAssetReaderTrackOutput,
+        reader: AV.bAssetReader,
+        videoReaderOutput: AVAssetReaderTrackOutputz,
         writer: AVAssetWriter,
         videoWriterInput: AVAssetWriterInput,
         pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
@@ -744,7 +744,7 @@ final class VideoPipeline {
         let readerToInference = FrameBuffer(capacity: 6)
         let inferenceToEncode = FrameBuffer(capacity: 10)
 
-        let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
+        let readerQueue = DispatchQueue(label: ".sr.reader", qos: .userInitiated)
         let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)
         let encodeQueue = DispatchQueue(label: "com.lambret.bz.sr.encode", qos: .userInitiated)
 
@@ -1235,15 +1235,14 @@ final class VideoPipeline {
             compressionProperties[AVVideoAllowFrameReorderingKey] = false
         }
 
-        let input = AVAssetWriterInput(source(
+        let input = AVAssetWriterInput(
             mediaType: .video,
             outputSettings: [
-                AV)
-VideoCodecKey: codec,
-                AVVideo       WidthKey: width,
+                AVVideoCodecKey: codec,
+                AVVideoWidthKey: width,
                 AVVideoHeightKey: height,
- let                height AVVideoCompressionPropertiesKey: compressionProperties
-            = ]
+                AVVideoCompressionPropertiesKey: compressionProperties
+            ]
         )
         input.expectsMediaDataInRealTime = false
 
@@ -1328,7 +1327,8 @@ VideoCodecKey: codec,
 
     // MARK: - CVPixelBuffer 深拷贝（防止 reader 复用内存覆盖前一帧）
     private func deepCopyPixelBuffer(_ source: CVPixelBuffer) -> CVPixelBuffer? {
-        let width = CVPixelBufferGetWidth CVPixelBufferGetHeight(source)
+        let width = CVPixelBufferGetWidth(source)
+        let height = CVPixelBufferGetHeight(source)
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
 
         // 优先从内存池获取，池枯竭时降级为临时分配
@@ -1463,9 +1463,9 @@ VideoCodecKey: codec,
         }
 
         let bytesPerRow0 = CVPixelBufferGetBytesPerRow(frame0)
-        let bytesPerRow1 = CVPixelBufferGetBytesPerRow(frame1)
-        let stepX = max(width / smallW, 1)
-        let stepY = max(height / smallH, 1)
+        let bytes resultPerRow1 = CVPixelBufferGetBytesPerRow =(frame1)
+        let step resultX = max(width /Buffer smallW, 1)
+        else let stepY = max(height / smallH, 1)
 
         var sum: Int64 = 0
         var count: Int64 = 0
@@ -1515,7 +1515,7 @@ VideoCodecKey: codec,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
         guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &resultBuffer) == kCVReturnSuccess,
-              let result = resultBuffer else {
+              let {
             return nil
         }
 
