@@ -4,7 +4,7 @@ RealESRGAN_x2 → Core ML 模型转换脚本（P2 版）
 P2 改动：
     1. 12 通道 → 3 通道权重迁移（等效权重 = 4 份权重之和，带数值验证）
     2. 可选：Upsample(nearest, 2) + Conv3x3 → Conv3x3 + PixelShuffle(2)（带数值验证）
-    3. 修正输入 shape 笔误、显式指定输出 shape
+    3. 修正输入 shape 笔误、outputs 不指定 shape（coremltools 约束）
     4. 每个阶段都做数值等价性验证，验证失败直接中止
 
 使用方式：
@@ -14,6 +14,8 @@ P2 改动：
 
 import os
 import sys
+import copy
+import types
 import argparse
 import urllib.request
 import torch
@@ -32,7 +34,7 @@ OUTPUT_PACKAGE = os.path.join(SCRIPT_DIR, "real_esrgan_x2_p2.mlpackage")
 SCALE = 4
 
 
-# ==================== 模型定义（与原脚本一致） ====================
+# ==================== 模型定义 ====================
 class ResidualDenseBlock(nn.Module):
     def __init__(self, nf=64, gc=32):
         super().__init__()
@@ -111,7 +113,6 @@ def migrate_12ch_to_3ch(model: RRDBNet) -> RRDBNet:
 
     with torch.no_grad():
         w = old_conv.weight  # [64, 12, 3, 3]
-        # 12 通道 = 4 份 RGB（frame0 RGB, frame1 RGB, frame2 RGB, frame3 RGB）
         new_w = w[:, 0:3] + w[:, 3:6] + w[:, 6:9] + w[:, 9:12]
         new_conv.weight.copy_(new_w)
         if old_conv.bias is not None:
@@ -119,7 +120,7 @@ def migrate_12ch_to_3ch(model: RRDBNet) -> RRDBNet:
 
     model.conv_first = new_conv
     model.in_nc = 3
-    print(f"  ✅ conv_first: 12ch -> 3ch，权重求和迁移完成")
+    print("  ✅ conv_first: 12ch -> 3ch，权重求和迁移完成")
     return model
 
 
@@ -129,8 +130,8 @@ def verify_12to3(model_12: RRDBNet, model_3: RRDBNet, device='cpu'):
     model_3.eval()
 
     torch.manual_seed(42)
-    x3 = torch.rand(1, 3, 64, 64, device=device)  # 小尺寸验证足够，无需 256
-    x12 = x3.repeat(1, 4, 1, 1)  # [R,G,B,R,G,B,R,G,B,R,G,B]
+    x3 = torch.rand(1, 3, 64, 64, device=device)   # 小尺寸验证
+    x12 = x3.repeat(1, 4, 1, 1)                    # [R,G,B,R,G,B,R,G,B,R,G,B]
 
     with torch.no_grad():
         y12 = model_12(x12)
@@ -182,8 +183,6 @@ def upsample_conv_to_pixelshuffle(conv: nn.Conv2d, r: int = 2) -> nn.Conv2d:
                     for dj in range(-pad, pad + 1):
                         di_p = (p + di) // r
                         dj_q = (q + dj) // r
-                        # 原始 3x3 卷积在 upsample 后空间上的有效范围，映射回原图后
-                        # 一定落在 [-pad, pad] 内
                         assert -pad <= di_p <= pad and -pad <= dj_q <= pad, \
                             f"越界: p={p}, di={di} -> di_p={di_p}"
                         W_sub[:, :, di_p + pad, dj_q + pad] += conv.weight[:, :, di + pad, dj + pad]
@@ -215,8 +214,8 @@ def apply_pixelshuffle(model: RRDBNet) -> RRDBNet:
         trunk = self.conv_body(self.body(feat))
         feat = feat + trunk
 
-        feat = self.conv_up1(feat)            # Conv3x3 (nf -> nf*4)
-        feat = F.pixel_shuffle(feat, 2)       # -> [B, nf, 2H, 2W]
+        feat = self.conv_up1(feat)          # Conv3x3 (nf -> nf*4)
+        feat = F.pixel_shuffle(feat, 2)     # -> [B, nf, 2H, 2W]
         feat = self.lrelu(feat)
 
         if scale == 4:
@@ -227,7 +226,6 @@ def apply_pixelshuffle(model: RRDBNet) -> RRDBNet:
         out = self.conv_last(self.lrelu(self.conv_hr(feat)))
         return out
 
-    import types
     model.forward = types.MethodType(new_forward, model)
     print("  ✅ Upsample+Conv -> Conv+PixelShuffle 替换完成")
     return model
@@ -239,7 +237,7 @@ def verify_pixelshuffle(model_old: RRDBNet, model_new: RRDBNet, in_ch: int, devi
     model_new.eval()
 
     torch.manual_seed(0)
-    x = torch.rand(1, in_ch, 32, 32, device=device)  # 小尺寸验证
+    x = torch.rand(1, in_ch, 32, 32, device=device)
 
     with torch.no_grad():
         y_old = model_old(x)
@@ -274,7 +272,6 @@ def load_model_12ch(pth_path: str) -> RRDBNet:
     checkpoint = torch.load(pth_path, map_location='cpu', weights_only=False)
     state_dict = checkpoint.get('params', checkpoint)
 
-    # 校验第一层 shape
     first_key = [k for k in state_dict.keys() if k.endswith('conv_first.weight')][0]
     first_shape = state_dict[first_key].shape
     print(f"  📐 conv_first.weight shape: {first_shape}")
@@ -295,22 +292,16 @@ def convert_to_coreml(model: RRDBNet, in_channels: int) -> ct.models.MLModel:
     example_input = torch.rand(1, in_channels, INPUT_HEIGHT, INPUT_WIDTH)
     traced = torch.jit.trace(model, example_input, strict=False)
 
-    out_h = INPUT_HEIGHT * SCALE
-    out_w = INPUT_WIDTH * SCALE
-
     mlmodel = ct.convert(
         traced,
         convert_to="mlprogram",
         inputs=[ct.TensorType(
             name="input",
-            shape=(1, in_channels, INPUT_HEIGHT, INPUT_WIDTH),   # 修正：W 不是 H
+            shape=(1, in_channels, INPUT_HEIGHT, INPUT_WIDTH),
             dtype=np.float32
         )],
-        outputs=[ct.TensorType(
-            name="output",
-            shape=(1, 3, out_h, out_w),                           # 显式指定
-            dtype=np.float32
-        )],
+        # 修复：outputs 不能指定 shape（coremltools 自动推断）
+        outputs=[ct.TensorType(name="output")],
         compute_precision=ct.precision.FLOAT16,
         minimum_deployment_target=ct.target.iOS16
     )
@@ -340,7 +331,6 @@ def main():
 
     # ---- 2. 12 → 3 迁移 + 验证 ----
     print("\n[1/4] 12 通道 → 3 通道迁移")
-    import copy
     model_3 = copy.deepcopy(model_12)
     migrate_12ch_to_3ch(model_3)
     verify_12to3(model_12, model_3)
@@ -370,7 +360,7 @@ def main():
     print(f"✅ 完成，大小: {total / 1024 / 1024:.1f} MB")
 
     print("\n" + "=" * 60)
-    print("后续：Swift 侧需要把输入通道从 12 改成 3")
+    print("后续：Swift 侧输入通道从 12 改成 3")
     print("  - bgraToTensor 的 channels==12 分支可以删掉")
     print("  - inputArray shape 由模型自动决定，无需手动改")
     print("=" * 60)
