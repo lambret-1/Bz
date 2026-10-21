@@ -24,6 +24,11 @@ struct HomeView: View {
                     Text("AI 增强")
                         .font(.largeTitle.bold())
                     Spacer()
+                    NavigationLink(destination: LogViewerView()) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.title2)
+                            .foregroundColor(DesignTokens.Colors.textPrimary)
+                    }
                     Button {
                         showAppSettings = true
                     } label: {
