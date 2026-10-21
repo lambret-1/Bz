@@ -12,12 +12,15 @@ jobs:
   convert:
     runs-on: macos-15
     timeout-minutes: 60
+    permissions:
+      contents: write
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           lfs: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 设置 Python
         uses: actions/setup-python@v5
