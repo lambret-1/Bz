@@ -851,11 +851,17 @@ final class VideoPipeline {
                     let aiFrame: CVPixelBuffer
                     if !needsAI {
                         aiFrame = copiedFrame
-                    } else if let engine = engine,
-                              let upscaled = engine.upscale(copiedFrame) {
+                    } else if let engine = engine {
+                        guard let upscaled = engine.upscale(copiedFrame) else {
+                            logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
+                            self.pipelineError = .unknown
+                            return
+                        }
                         aiFrame = upscaled
                     } else {
-                        aiFrame = copiedFrame
+                        logger.error("超分引擎未初始化")
+                        self.pipelineError = .unknown
+                        return
                     }
                     let t3 = CACurrentMediaTime()
 

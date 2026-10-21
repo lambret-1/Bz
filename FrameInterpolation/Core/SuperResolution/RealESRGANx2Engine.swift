@@ -205,8 +205,10 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         let tConvertCost = (CFAbsoluteTimeGetCurrent() - tConvertStart) * 1000
 
         let tPredictStart = CFAbsoluteTimeGetCurrent()
-        guard (try? model.prediction(from: inputProvider, options: predOpts)) != nil else {
-            logger.error("❌ 单 Tile 模型推理失败")
+        do {
+            _ = try model.prediction(from: inputProvider, options: predOpts)
+        } catch {
+            logger.error("❌ 单 Tile 模型推理失败: \(error.localizedDescription)")
             return nil
         }
         let tPredictCost = (CFAbsoluteTimeGetCurrent() - tPredictStart) * 1000
@@ -296,8 +298,10 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                 let tConvertCost = (CFAbsoluteTimeGetCurrent() - tConvertStart) * 1000
 
                 let tPredictStart = CFAbsoluteTimeGetCurrent()
-                guard (try? model.prediction(from: inputProvider, options: predOpts)) != nil else {
-                    logger.error("❌ Tile[\(tx),\(ty)] 模型推理失败")
+                do {
+                    _ = try model.prediction(from: inputProvider, options: predOpts)
+                } catch {
+                    logger.error("❌ Tile[\(tx),\(ty)] 模型推理失败: \(error.localizedDescription)")
                     continue
                 }
                 let tPredictCost = (CFAbsoluteTimeGetCurrent() - tPredictStart) * 1000
