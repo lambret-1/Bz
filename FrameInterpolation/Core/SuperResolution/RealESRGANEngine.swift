@@ -11,15 +11,15 @@ final class RealESRGANEngine: SuperResolutionEngine {
     // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .realESRGAN
-    let inputWidth: Int = 352
-    let inputHeight: Int = 608
+    let inputWidth: Int = 512
+    let inputHeight: Int = 512
     let scaleFactor: Int = 4
 
     // MARK: - 瓦片配置
 
-    private let tileStrideX = 288
-    private let tileStrideY = 544
-    private let outputFeatherWidth = 256
+    private let tileStrideX = 448
+    private let tileStrideY = 448
+    private let outputFeatherWidth = 32
 
     // MARK: - 私有属性
 
