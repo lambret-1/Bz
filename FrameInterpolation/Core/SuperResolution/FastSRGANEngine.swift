@@ -157,14 +157,14 @@ final class FastSRGANEngine: SuperResolutionEngine {
             rowBytes: CVPixelBufferGetBytesPerRow(source)
         )
 
-        var destBuffer = vImage_Buffer(
+        var vImageDestBuffer = vImage_Buffer(
             data: CVPixelBufferGetBaseAddress(dest),
             height: vImagePixelCount(height),
             width: vImagePixelCount(width),
             rowBytes: CVPixelBufferGetBytesPerRow(dest)
         )
 
-        vImageScale_ARGB8888(&srcBuffer, &destBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
+        vImageScale_ARGB8888(&srcBuffer, &vImageDestBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
 
         return dest
     }
