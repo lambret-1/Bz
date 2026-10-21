@@ -803,7 +803,7 @@ amb    /// 通过有界 FrameBuffer 实现背压，避免ret内存爆炸
                 }
 
                 // 直接传递原始CVPixelBuffer（引用计数retain，reader不会复用）
-                // 深拷贝放到Inference队列，与ANE计算在同一线程，共享L1 Cache
+                // 深拷贝放Inference队列，与ANE计算在同一线程，共享L1 Cache
                 let pts = CMTime(value: Int64(localFrameIndex), timescale: Int32(outputFPS))
                 if !readerToInference.enqueue(ProcessedFrame(pixelBuffer: pixelBuffer, presentationTime: pts)) {
                     return
