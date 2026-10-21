@@ -211,6 +211,7 @@ struct HomeView: View {
             set: { if !$0 { outputImage = nil; inputImage = nil; selectedPhotoItem = nil } }
         )) {
             ImageSRResultView(
+                inputImage: inputImage,
                 outputImage: outputImage,
                 isSaving: $isSavingImage,
                 onSave: { saveImageToAlbum(outputImage!) },
@@ -390,18 +391,61 @@ struct RecentRecordCard: View {
 
 // MARK: - 图片超分结果页（独立全屏）
 struct ImageSRResultView: View {
+    let inputImage: UIImage?
     let outputImage: UIImage?
     @Binding var isSaving: Bool
     let onSave: () -> Void
     let onClose: () -> Void
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var appState: AppState
+    @State private var splitProgress: CGFloat = 0.5
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: DesignTokens.Spacing.l) {
-                    if let image = outputImage {
+                    if let output = outputImage, let input = inputImage {
+                        // 对比滑块
+                        ZStack(alignment: .top) {
+                            Image(uiImage: output)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxWidth: .infinity)
+
+                            GeometryReader { geo in
+                                ZStack(alignment: .topLeading) {
+                                    Image(uiImage: input)
+                                        .resizable()
+                                        .scaledToFit()
+                                        .frame(width: geo.size.width * splitProgress)
+                                        .clipped()
+
+                                    Rectangle()
+                                        .fill(Color.white)
+                                        .frame(width: 2, height: geo.size.height)
+                                        .offset(x: geo.size.width * splitProgress - 1)
+
+                                    Image(systemName: "arrow.left.and.right.circle.fill")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(.white)
+                                        .shadow(radius: 4)
+                                        .offset(x: geo.size.width * splitProgress - 12, y: geo.size.height / 2 - 12)
+                                }
+                                .gesture(
+                                    DragGesture()
+                                        .onChanged { value in
+                                            splitProgress = min(max(value.location.x / geo.size.width, 0), 1)
+                                        }
+                                )
+                            }
+                        }
+                        .cornerRadius(DesignTokens.Radius.m)
+                        .padding(.horizontal, DesignTokens.Spacing.m)
+
+                        Text("拖动滑块对比原图与超分效果")
+                            .font(.caption)
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    } else if let image = outputImage {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFit()
