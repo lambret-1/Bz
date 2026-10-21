@@ -14,6 +14,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
     let scaleFactor: Int = 4 // 模型输出是 2048x2048
 
     private let model: MLModel
+    private let ciContext = CIContext()
     private var isCancelledFlag = false
     private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])
 
@@ -52,10 +53,9 @@ final class RealESRGANEngine: SuperResolutionEngine {
         if isCancelledFlag { return nil }
 
         // 2. 推理
-        // 注意：代码里写的 feature name 是 "input" 和 "activation_out"
         guard let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": MLFeatureValue(pixelBuffer: resized512)]),
               let prediction = try? model.prediction(from: inputProvider),
-              let outputBuffer = prediction.featureValue(for: "activation_out")?.imageBufferValue else {
+              let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
             logger.error("推理失败")
             return nil
         }
