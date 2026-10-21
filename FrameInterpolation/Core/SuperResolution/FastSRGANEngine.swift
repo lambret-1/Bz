@@ -201,9 +201,9 @@ final class FastSRGANEngine: SuperResolutionEngine {
                 let b = Float(src[2 * planeSize + idx]) * 255.0
 
                 let pixelOffset = y * dstBytesPerRow + x * 4
-                dst[pixelOffset + 0] = UInt8(max(0, min(255, Int(b)))
-                dst[pixelOffset + 1] = UInt8(max(0, min(255, Int(g)))
-                dst[pixelOffset + 2] = UInt8(max(0, min(255, Int(r)))
+                dst[pixelOffset + 0] = UInt8(max(0, min(255, Int(b))))
+                dst[pixelOffset + 1] = UInt8(max(0, min(255, Int(g))))
+                dst[pixelOffset + 2] = UInt8(max(0, min(255, Int(r))))
                 dst[pixelOffset + 3] = 255
             }
         }
