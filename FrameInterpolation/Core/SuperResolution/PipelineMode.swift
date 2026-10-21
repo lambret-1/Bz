@@ -70,6 +70,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     case fastSRGAN = "PiperSR"
     /// Real-ESRGAN x4v3：4x 超分，128×128 瓦片拼接，适合极低清素材
     case realESRGAN = "Real-ESRGAN"
+    /// Real-ESRGAN x2：4x 输出，256×256 全帧，12通道时序模型
+    case realESRGANx2 = "Real-ESRGAN-x2"
 
     var id: String { rawValue }
 
@@ -78,6 +80,7 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
         switch self {
         case .fastSRGAN: return "PiperSR"
         case .realESRGAN: return "Real-ESRGAN"
+        case .realESRGANx2: return "ESRGAN-x2"
         }
     }
 
@@ -88,6 +91,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
             return "PiperSR（原生2x）"
         case .realESRGAN:
             return "Real-ESRGAN（原生4x）"
+        case .realESRGANx2:
+            return "ESRGAN x2（原生4x）"
         }
     }
 
@@ -96,6 +101,7 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
         switch self {
         case .fastSRGAN: return 2
         case .realESRGAN: return 4
+        case .realESRGANx2: return 4
         }
     }
 
@@ -106,6 +112,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
             return "ANE 原生，全帧推理，速度快"
         case .realESRGAN:
             return "细节恢复强，适合极低清素材（速度较慢）"
+        case .realESRGANx2:
+            return "12通道时序模型，256×256全帧，细节丰富"
         }
     }
 
@@ -116,6 +124,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
             return 360
         case .realESRGAN:
             return 480
+        case .realESRGANx2:
+            return 256
         }
     }
 
@@ -126,6 +136,8 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
             return "PiperSR_2x_video_720p"
         case .realESRGAN:
             return "real_esrgan_x4v3"
+        case .realESRGANx2:
+            return "RealESRGAN_x2"
         }
     }
 }

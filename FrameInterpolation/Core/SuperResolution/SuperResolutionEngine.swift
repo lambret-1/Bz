@@ -40,6 +40,8 @@ enum SuperResolutionEngineFactory {
             return FastSRGANEngine()
         case .realESRGAN:
             return RealESRGANEngine()
+        case .realESRGANx2:
+            return RealESRGANx2Engine()
         }
     }
 }
