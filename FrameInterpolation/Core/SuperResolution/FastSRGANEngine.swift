@@ -22,7 +22,7 @@ final class FastSRGANEngine: SuperResolutionEngine {
     // MARK: - 瓦片配置
 
     /// 瓦片步长（输入空间），重叠 = tileSize - tileStride
-    private let tileStride = 96
+    private let tileStride = 112
     /// 边缘羽化宽度（输出空间），用于瓦片拼接时平滑过渡
     private let featherWidth = 16
 
