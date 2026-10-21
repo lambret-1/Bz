@@ -854,13 +854,13 @@ final class VideoPipeline {
                     } else if let engine = engine {
                         guard let upscaled = engine.upscale(copiedFrame) else {
                             logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
-                            self.pipelineError = .unknown
+                            setError(PipelineError.unknown)
                             return
                         }
                         aiFrame = upscaled
                     } else {
                         logger.error("超分引擎未初始化")
-                        self.pipelineError = .unknown
+                        setError(PipelineError.unknown)
                         return
                     }
                     let t3 = CACurrentMediaTime()
