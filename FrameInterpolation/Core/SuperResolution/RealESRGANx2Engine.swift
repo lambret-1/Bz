@@ -82,10 +82,11 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         let outN = outShape[0], outC = outShape[1], outH = outShape[2], outW = outShape[3]
 
         // 验证输入输出维度符合 x2 预期
-        guard inN == 1, inW == inputWidth, inH == inputHeight,
+        guard inN == 1, inW == 256, inH == 256,
               outN == 1, outC == 3,
-              outW == inputWidth * scaleFactor, outH == inputHeight * scaleFactor else {
-            logger.error("❌ 模型维度不符！期望: [1,\(inC),\(inputHeight),\(inputWidth)] -> [1,3,\(inputHeight*2),\(inputWidth*2)]；实际: \(inShape) -> \(outShape)")
+              outW == 256 * 2, outH == 256 * 2 else {
+            // 修复：使用局部变量 inH, inW, outH, outW 避免闭包捕获 self 的问题
+            logger.error("❌ 模型维度不符！期望: [1,\(inC),256,256] -> [1,3,512,512]；实际: \(inShape) -> \(outShape)")
             return nil
         }
         self.modelOutW = outW
@@ -104,7 +105,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         opts.outputBackings = ["output": outputArray]
         self.predOpts = opts
 
-        guard let tileBuf = Self.makeBGRA(width: inputWidth, height: inputHeight),
+        guard let tileBuf = Self.makeBGRA(width: 256, height: 256),
               let outTileBGRA = Self.makeBGRA(width: outW, height: outH) else {
             logger.error("❌ 复用 Tile Buffer 创建失败")
             return nil
@@ -274,7 +275,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
 
     // MARK: - BGRA 到 Tensor (vImage 加速)
     private func bgraToTensor(_ pixelBuffer: CVPixelBuffer) -> Bool {
-        let w = inputWidth, h = inputHeight
+        let w =Flags inputWidth, h = inputHeight
         let planeCount = w * h
         let channels = inputArray.shape[1].intValue
 
@@ -292,7 +293,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             var g8b = vImage_Buffer(data: g8, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
             var b8b = vImage_Buffer(data: b8, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
             
-            let err1 = vImageConvert_BGRX8888ToPlanar8(&src, &b8b, &g8b, &r8b, vImage_Flags(kvImageNoFlags))
+            let err1 = vImageConvert_BGRX8888ToPlanar8(&src, &b8b, &g8b, &r8b, vImage_(kvImageNoFlags))
             guard err1 == kvImageNoError else {
                 logger.error("❌ vImageConvert_BGRX8888ToPlanar8 失败: \(err1)")
                 return false
