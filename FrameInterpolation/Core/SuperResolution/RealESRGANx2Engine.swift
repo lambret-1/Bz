@@ -14,7 +14,6 @@ private final class ReusableInput: MLFeatureProvider {
 }
 
 // MARK: - RealESRGAN x2 引擎（256 tile → 512 输出）
-
 final class RealESRGANx2Engine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANx2Engine")
 
@@ -188,8 +187,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         let dstPtr = dstBase.assumingMemoryBound(to: UInt8.self)
 
         // 列方向分三段：左反射 / 中间直拷 / 右反射
-        let leftEnd    = min(w, max(0, -x))                  // x+tx < 0 的区域
-        let rightStart = min(w, max(leftEnd, srcW - x))      // x+tx >= srcW 的区域
+        let leftEnd    = min(w, max(0, -x))
+        let rightStart = min(w, max(leftEnd, srcW - x))
 
         for ty in 0..<h {
             let sy = Self.reflect(y + ty, srcH)
@@ -245,7 +244,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             data: base, height: vImagePixelCount(h), width: vImagePixelCount(w),
             rowBytes: CVPixelBufferGetBytesPerRow(pixelBuffer))
 
-        // 第一步：BGRA8888 -> Planar8 (分离 RGB)
+        // 第一步：BGRA8888 -> Planar8 (使用 BGRX8888ToPlanar8 丢弃 Alpha 通道)
         return withUnsafeTemporaryAllocation(of: UInt8.self, capacity: planeCount * 3) { u8Buf in
             let r8 = u8Buf.baseAddress!, g8 = r8.advanced(by: planeCount), b8 = g8.advanced(by: planeCount)
             
@@ -253,8 +252,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             var g8b = vImage_Buffer(data: g8, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
             var b8b = vImage_Buffer(data: b8, height: vImagePixelCount(h), width: vImagePixelCount(w), rowBytes: w)
             
-            // 注意：第5个参数为 alpha buffer，传 nil 即可；使用明确类型强转防止 CI 编译报错
-            let err1 = vImageConvert_BGRA8888toPlanar8(&src, &r8b, &g8b, &b8b, nil as UnsafeMutablePointer<vImage_Buffer>?, vImage_Flags(kvImageNoFlags))
+            // 注意：BGRX8888ToPlanar8 的参数顺序依次为 Source, Blue, Green, Red, Flags
+            let err1 = vImageConvert_BGRX8888ToPlanar8(&src, &b8b, &g8b, &r8b, vImage_Flags(kvImageNoFlags))
             guard err1 == kvImageNoError else { return false }
 
             // 第二步：Planar8 -> PlanarF (归一化到 0-1)
@@ -351,9 +350,13 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                 var dst = vImage_Buffer(data: base, height: vImagePixelCount(height), width: vImagePixelCount(width),
                                         rowBytes: CVPixelBufferGetBytesPerRow(buffer))
                 
-                // 合并到 ARGB8888（在内存小端序下就是 BGRA）
-                vImageConvert_Planar8toARGB8888(&b8b, &g8b, &r8b, nil, &dst, vImage_Flags(kvImageNoFlags))
-                return true
+                // 合并到 BGRA8888（传入 nil 作为 alpha 源，并指定常量 alphaValue 为 255）
+                let err = vImageConvert_RGB888toBGRA8888(&r8b, &g8b, &b8b,
+                                                         nil as UnsafePointer<vImage_Buffer>?,
+                                                         255,
+                                                         &dst,
+                                                         vImage_Flags(kvImageNoFlags))
+                return err == kvImageNoError
             }
         }
     }
@@ -364,10 +367,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                                srcX: Int, srcY: Int,
                                dstX: Int, dstY: Int,
                                w: Int, h: Int) -> Bool {
-        // 1. 将 Tensor 转成 512x512 的 BGRA 放到复用的 outTileBGRA 中
         guard float16PlanarToBGRA(outputArray, into: outTileBGRA) else { return false }
 
-        // 2. 裁剪出有效区拷贝到最终大图
         CVPixelBufferLockBaseAddress(outTileBGRA, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(outTileBGRA, .readOnly) }
 
