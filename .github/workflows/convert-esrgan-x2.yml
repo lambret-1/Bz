@@ -50,3 +50,17 @@ jobs:
           name: real_esrgan_x2
           path: Scripts/real_esrgan_x2.mlpackage
           retention-days: 90
+
+      - name: 部署到 Resources 目录
+        run: |
+          rm -rf FrameInterpolation/Resources/RealESRGAN_x2.mlpackage
+          cp -r Scripts/real_esrgan_x2.mlpackage FrameInterpolation/Resources/RealESRGAN_x2.mlpackage
+          echo "✅ 模型已复制到 Resources/RealESRGAN_x2.mlpackage"
+
+      - name: 提交并推送模型
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add FrameInterpolation/Resources/RealESRGAN_x2.mlpackage
+          git diff --staged --quiet || git commit -m "chore: 更新 RealESRGAN_x2.mlpackage 模型文件 [skip ci]"
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git testping
