@@ -854,13 +854,13 @@ final class VideoPipeline {
                     } else if let engine = engine {
                         guard let upscaled = engine.upscale(copiedFrame) else {
                             self.logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
-                            self.setError(PipelineError.unknown)
+                            setError(PipelineError.unknown)
                             return
                         }
                         aiFrame = upscaled
                     } else {
                         self.logger.error("超分引擎未初始化")
-                        self.setError(PipelineError.unknown)
+                        setError(PipelineError.unknown)
                         return
                     }
                     let t3 = CACurrentMediaTime()
@@ -921,7 +921,7 @@ final class VideoPipeline {
                 }
 
                 if self.isCancelled {
-                    self.setError(PipelineError.cancelled)
+                    setError(PipelineError.cancelled)
                     finishEncode()
                     return
                 }
@@ -930,7 +930,7 @@ final class VideoPipeline {
                 let appended = pixelBufferAdaptor.append(frame.pixelBuffer, withPresentationTime: frame.presentationTime)
                 if !appended {
                     if writer.status == .failed {
-                        self.setError(writer.error ?? PipelineError.writerFailed)
+                        setError(writer.error ?? PipelineError.writerFailed)
                     }
                     finishEncode()
                     return
@@ -1154,7 +1154,7 @@ final class VideoPipeline {
                 }
 
                 if self.isCancelled {
-                    self.setError(PipelineError.cancelled)
+                    setError(PipelineError.cancelled)
                     finishEncode()
                     return
                 }
@@ -1162,7 +1162,7 @@ final class VideoPipeline {
                 let appended = pixelBufferAdaptor.append(frame.pixelBuffer, withPresentationTime: frame.presentationTime)
                 if !appended {
                     if writer.status == .failed {
-                        self.setError(writer.error ?? PipelineError.writerFailed)
+                        setError(writer.error ?? PipelineError.writerFailed)
                     }
                     finishEncode()
                     return
