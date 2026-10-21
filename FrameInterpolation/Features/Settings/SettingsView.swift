@@ -43,6 +43,23 @@ struct SettingsView: View {
                     // 预估信息
                     estimatedInfoCard
 
+                    // 日志查看入口
+                    NavigationLink(destination: LogViewerView()) {
+                        HStack {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .foregroundColor(DesignTokens.Colors.accent)
+                            Text("查看运行日志")
+                                .foregroundColor(DesignTokens.Colors.textPrimary)
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.caption)
+                                .foregroundColor(DesignTokens.Colors.textSecondary)
+                        }
+                        .padding(DesignTokens.Spacing.m)
+                        .background(DesignTokens.Colors.bgSecondary)
+                        .cornerRadius(DesignTokens.Radius.s)
+                    }
+
                     Spacer(minLength: DesignTokens.Spacing.xl)
                 }
                 .padding(DesignTokens.Spacing.m)

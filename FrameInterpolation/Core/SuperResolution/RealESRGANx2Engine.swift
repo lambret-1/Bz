@@ -66,25 +66,30 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             return nil
         }
 
+        logger.info("📂 模型路径: \(modelURL.path, privacy: .public)")
+
         let config = MLModelConfiguration()
         config.computeUnits = .all
         do {
             self.model = try MLModel(contentsOf: modelURL, configuration: config)
         } catch {
-            logger.error("❌ 模型加载失败: \(error)")
+            logger.error("❌ 模型加载失败: \(error.localizedDescription, privacy: .public)")
             return nil
         }
+
+        logger.info("📋 输入 keys: \(self.model.modelDescription.inputDescriptionsByName.keys.sorted(), privacy: .public)")
+        logger.info("📋 输出 keys: \(self.model.modelDescription.outputDescriptionsByName.keys.sorted(), privacy: .public)")
 
         guard let inShape = model.modelDescription.inputDescriptionsByName["input"]?
                 .multiArrayConstraint?.shape.map({ $0.intValue }),
               let outShape = model.modelDescription.outputDescriptionsByName["output"]?
                 .multiArrayConstraint?.shape.map({ $0.intValue }),
               inShape.count == 4, outShape.count == 4 else {
-            logger.error("❌ 模型输入/输出格式不是 4D Tensor")
+            logger.error("❌ 模型输入/输出格式不是 4D Tensor", privacy: .public)
             return nil
         }
 
-        logger.info("📐 模型实际 IO: in=\(inShape), out=\(outShape)")
+        logger.info("📐 模型实际 IO: in=\(inShape, privacy: .public), out=\(outShape, privacy: .public)")
 
         let inN = inShape[0], inC = inShape[1], inH = inShape[2], inW = inShape[3]
         let outN = outShape[0], outC = outShape[1], outH = outShape[2], outW = outShape[3]
@@ -97,7 +102,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         guard inN == 1, inW == expectedInW, inH == expectedInH,
               outN == 1, outC == 3,
               outW == expectedOutW, outH == expectedOutH else {
-            logger.error("❌ 模型维度不符！期望: [1,\(inC),\(expectedInH),\(expectedInW)] -> [1,3,\(expectedOutH),\(expectedOutW)]；实际: \(inShape) -> \(outShape)")
+            logger.error("❌ 模型维度不符！期望: [1,\(inC, privacy: .public),\(expectedInH, privacy: .public),\(expectedInW, privacy: .public)] -> [1,3,\(expectedOutH, privacy: .public),\(expectedOutW, privacy: .public)]；实际: \(inShape, privacy: .public) -> \(outShape, privacy: .public)")
             return nil
         }
         self.modelOutW = outW
@@ -129,7 +134,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         self.tmpU8 = UnsafeMutablePointer<UInt8>.allocate(capacity: planeCount * 3)
 
         let elapsed = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
-        logger.info("✅ 引擎初始化成功！耗时: \(elapsed, format: .fixed(precision: 2))ms。输入: \(inW)x\(inH) 通道:\(inC)，输出: \(outW)x\(outH)，scale=\(self.scaleFactor)x")
+        logger.info("✅ 引擎初始化成功！耗时: \(elapsed, privacy: .public, format: .fixed(precision: 2))ms。输入: \(inW, privacy: .public)x\(inH, privacy: .public) 通道:\(inC, privacy: .public)，输出: \(outW, privacy: .public)x\(outH, privacy: .public)，scale=\(self.scaleFactor, privacy: .public)x")
     }
 
     deinit {
@@ -208,7 +213,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         do {
             _ = try model.prediction(from: inputProvider, options: predOpts)
         } catch {
-            logger.error("❌ 单 Tile 模型推理失败: \(error.localizedDescription)")
+            logger.error("❌ 单 Tile 模型推理失败: \(error.localizedDescription, privacy: .public)")
             return nil
         }
         let tPredictCost = (CFAbsoluteTimeGetCurrent() - tPredictStart) * 1000
