@@ -2,6 +2,11 @@ name: Convert RealESRGAN x2 to Core ML
 
 on:
   workflow_dispatch:
+  push:
+    branches: [testping]
+    paths:
+      - 'Scripts/convert_esrgan_x2.py'
+      - '.github/workflows/convert-esrgan-x2.yml'
 
 jobs:
   convert:
