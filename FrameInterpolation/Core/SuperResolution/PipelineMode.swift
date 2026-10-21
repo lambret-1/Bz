@@ -123,7 +123,7 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     var modelFileName: String {
         switch self {
         case .fastSRGAN:
-            return "PiperSR_2x_video_720p"
+            return "PiperSR_2x"
         case .realESRGAN:
             return "real_esrgan_x4v3"
         }

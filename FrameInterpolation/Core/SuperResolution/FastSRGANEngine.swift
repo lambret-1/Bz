@@ -5,8 +5,9 @@ import OSLog
 
 // MARK: - PiperSR 超分引擎
 
-/// PiperSR 2x 超分引擎
-/// 640×360 全帧推理，ANE 原生，2x 放大输出 1280×720
+/// PiperSR 2x 超分引擎（ANE 原生）
+/// 128×128 瓦片拼接（带羽化融合），2x 放大
+/// ImageType 输入，直接传 CVPixelBuffer，CoreML 自动处理颜色转换
 /// 模型文件缺失时 init 返回 nil，VideoPipeline 自动降级为 vImage 缩放
 final class FastSRGANEngine: SuperResolutionEngine {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "PiperSREngine")
@@ -14,17 +15,20 @@ final class FastSRGANEngine: SuperResolutionEngine {
     // MARK: - 超分引擎协议
 
     static let engineType: SuperResolutionEngineType = .fastSRGAN
-    let inputWidth: Int = 640
-    let inputHeight: Int = 360
+    let inputWidth: Int = 128
+    let inputHeight: Int = 128
     let scaleFactor: Int = 2
+
+    // MARK: - 瓦片配置
+
+    /// 瓦片步长（输入空间），重叠 = tileSize - tileStride
+    private let tileStride = 96
+    /// 边缘羽化宽度（输出空间），用于瓦片拼接时平滑过渡
+    private let featherWidth = 16
 
     // MARK: - 私有属性
 
     private let model: MLModel
-    /// 模型输入数据类型（float16 或 float32）
-    private let inputDataType: MLMultiArrayDataType
-    /// 模型输出数据类型
-    private let outputDataType: MLMultiArrayDataType
 
     /// 取消标志
     private var isCancelledFlag = false
@@ -47,28 +51,12 @@ final class FastSRGANEngine: SuperResolutionEngine {
         }
         self.model = model
 
-        // 2. 读取输入输出数据类型
-        let inputDesc = model.modelDescription.inputDescriptionsByName["input"]
-        let outputDesc = model.modelDescription.outputDescriptionsByName["output"]
-
-        if let descDataType = inputDesc?.multiArrayConstraint?.dataType {
-            inputDataType = descDataType
-        } else {
-            inputDataType = .float16
-        }
-
-        if let descDataType = outputDesc?.multiArrayConstraint?.dataType {
-            outputDataType = descDataType
-        } else {
-            outputDataType = .float16
-        }
-
-        logger.info("PiperSR 引擎初始化成功，输入: \(self.inputWidth)x\(self.inputHeight)，放大: \(self.scaleFactor)x，输入类型: \(self.inputDataType.rawValue)，输出类型: \(self.outputDataType.rawValue)")
+        logger.info("PiperSR 引擎初始化成功，瓦片: \(self.inputWidth)x\(self.inputHeight)，步长: \(self.tileStride)，放大: \(self.scaleFactor)x")
     }
 
     // MARK: - 公开方法
 
-    /// 对单帧执行 2x 超分（全帧推理）
+    /// 对单帧执行 2x 超分（128×128 瓦片拼接）
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         isCancelledFlag = false
         let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
@@ -77,59 +65,82 @@ final class FastSRGANEngine: SuperResolutionEngine {
 
         let outputWidth = srcWidth * scaleFactor
         let outputHeight = srcHeight * scaleFactor
+        let pixelCount = outputWidth * outputHeight
 
-        // 1. 将输入帧缩放到模型要求的 640×360
-        guard let resizedInput = resizePixelBuffer(pixelBuffer, width: inputWidth, height: inputHeight) else {
-            logger.error("输入缩放失败")
-            return nil
+        // 1. Float 累加器（3通道 + 权重）
+        var accumR = [Float](repeating: 0, count: pixelCount)
+        var accumG = [Float](repeating: 0, count: pixelCount)
+        var accumB = [Float](repeating: 0, count: pixelCount)
+        var accumW = [Float](repeating: 0, count: pixelCount)
+
+        // 2. 计算瓦片网格
+        let cols = max((srcWidth - inputWidth + tileStride - 1) / tileStride + 1, 1)
+        let rows = max((srcHeight - inputHeight + tileStride - 1) / tileStride + 1, 1)
+        let outputTileSize = inputWidth * scaleFactor
+
+        // 3. 逐瓦片推理并累加
+        for row in 0..<rows {
+            for col in 0..<cols {
+                if isCancelledFlag { return nil }
+
+                let srcX = min(col * tileStride, max(srcWidth - inputWidth, 0))
+                let srcY = min(row * tileStride, max(srcHeight - inputHeight, 0))
+
+                // 裁剪瓦片
+                guard let tileBuffer = cropPixelBuffer(pixelBuffer, x: srcX, y: srcY, width: inputWidth, height: inputHeight) else {
+                    logger.error("瓦片裁剪失败 (\(col),\(row))")
+                    continue
+                }
+
+                // 推理瓦片
+                guard let outputBuffer = processTile(tileBuffer) else {
+                    logger.error("瓦片推理失败 (\(col),\(row))")
+                    continue
+                }
+
+                // 累加到 Float 缓冲区（带羽化权重）
+                let dstX = srcX * scaleFactor
+                let dstY = srcY * scaleFactor
+                accumulateTile(
+                    outputBuffer,
+                    accumR: &accumR,
+                    accumG: &accumG,
+                    accumB: &accumB,
+                    accumW: &accumW,
+                    dstX: dstX,
+                    dstY: dstY,
+                    tileSize: outputTileSize,
+                    outputWidth: outputWidth,
+                    outputHeight: outputHeight
+                )
+            }
         }
 
-        // 2. 填充输入 MLMultiArray
-        guard let inputArray = try? MLMultiArray(
-            shape: [1, 3, NSNumber(value: inputHeight), NSNumber(value: inputWidth)],
-            dataType: inputDataType
+        // 4. 归一化并创建输出 CVPixelBuffer
+        guard let outputBuffer = createOutputBuffer(
+            width: outputWidth,
+            height: outputHeight,
+            accumR: &accumR,
+            accumG: &accumG,
+            accumB: &accumB,
+            accumW: &accumW
         ) else {
-            logger.error("创建输入数组失败")
-            return nil
-        }
-
-        guard fillInputArray(inputArray, from: resizedInput) else {
-            logger.error("填充输入数组失败")
-            return nil
-        }
-
-        // 3. 模型推理
-        guard let featureProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": inputArray]),
-              let prediction = try? model.prediction(from: featureProvider),
-              let outputArray = prediction.featureValue(for: "output")?.multiArrayValue else {
-            logger.error("CoreML 推理失败")
-            return nil
-        }
-
-        // 4. 输出 MLMultiArray → CVPixelBuffer（1280×720）
-        guard let modelOutput = createOutputBuffer(from: outputArray, width: inputWidth * scaleFactor, height: inputHeight * scaleFactor) else {
             logger.error("创建输出缓冲区失败")
             return nil
         }
 
-        // 5. 输出缩放到目标尺寸（srcWidth*2 × srcHeight*2）
-        guard let finalOutput = resizePixelBuffer(modelOutput, width: outputWidth, height: outputHeight) else {
-            logger.error("输出缩放失败")
-            return nil
-        }
+        // 5. 复制颜色空间附件
+        copyColorSpaceAttachments(from: pixelBuffer, to: outputBuffer)
 
-        // 6. 复制颜色空间附件
-        copyColorSpaceAttachments(from: pixelBuffer, to: finalOutput)
-
-        return finalOutput
+        return outputBuffer
     }
 
     /// 取消处理
     func cancel() { isCancelledFlag = true }
 
-    // MARK: - 像素缓冲缩放（vImage）
+    // MARK: - 瓦片裁剪
 
-    private func resizePixelBuffer(_ source: CVPixelBuffer, width: Int, height: Int) -> CVPixelBuffer? {
+    private func cropPixelBuffer(_ source: CVPixelBuffer, x: Int, y: Int, width: Int, height: Int) -> CVPixelBuffer? {
         var destBuffer: CVPixelBuffer?
         let attrs = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
@@ -150,72 +161,100 @@ final class FastSRGANEngine: SuperResolutionEngine {
             CVPixelBufferUnlockBaseAddress(dest, [])
         }
 
-        var srcBuffer = vImage_Buffer(
-            data: CVPixelBufferGetBaseAddress(source),
-            height: vImagePixelCount(CVPixelBufferGetHeight(source)),
-            width: vImagePixelCount(CVPixelBufferGetWidth(source)),
-            rowBytes: CVPixelBufferGetBytesPerRow(source)
-        )
+        guard let srcBase = CVPixelBufferGetBaseAddress(source),
+              let dstBase = CVPixelBufferGetBaseAddress(dest) else {
+            return nil
+        }
 
-        var vImageDestBuffer = vImage_Buffer(
-            data: CVPixelBufferGetBaseAddress(dest),
-            height: vImagePixelCount(height),
-            width: vImagePixelCount(width),
-            rowBytes: CVPixelBufferGetBytesPerRow(dest)
-        )
+        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+        let dstBytesPerRow = CVPixelBufferGetBytesPerRow(dest)
+        let src = srcBase.assumingMemoryBound(to: UInt8.self)
+        let dst = dstBase.assumingMemoryBound(to: UInt8.self)
 
-        vImageScale_ARGB8888(&srcBuffer, &vImageDestBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
+        for row in 0..<height {
+            let srcOffset = (y + row) * srcBytesPerRow + x * 4
+            let dstOffset = row * dstBytesPerRow
+            memcpy(dst.advanced(by: dstOffset), src.advanced(by: srcOffset), width * 4)
+        }
 
         return dest
     }
 
-    // MARK: - 输入填充（BGRA → NCHW MLMultiArray）
+    // MARK: - 单瓦片推理（ImageType 输入）
 
-    private func fillInputArray(_ array: MLMultiArray, from source: CVPixelBuffer) -> Bool {
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
-
-        guard let srcBase = CVPixelBufferGetBaseAddress(source) else { return false }
-        let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
-        let src = srcBase.assumingMemoryBound(to: UInt8.self)
-
-        let plane = inputWidth * inputHeight
-
-        switch inputDataType {
-        case .float16:
-            let dst = array.dataPointer.assumingMemoryBound(to: Float16.self)
-            for y in 0..<inputHeight {
-                for x in 0..<inputWidth {
-                    let srcOffset = y * srcBytesPerRow + x * 4
-                    let idx = y * inputWidth + x
-                    // BGRA → RGB，归一化到 [0,1]
-                    dst[0 * plane + idx] = Float16(Float(src[srcOffset + 2]) / 255.0) // R
-                    dst[1 * plane + idx] = Float16(Float(src[srcOffset + 1]) / 255.0) // G
-                    dst[2 * plane + idx] = Float16(Float(src[srcOffset + 0]) / 255.0) // B
-                }
-            }
-        case .float32:
-            let dst = array.dataPointer.assumingMemoryBound(to: Float32.self)
-            for y in 0..<inputHeight {
-                for x in 0..<inputWidth {
-                    let srcOffset = y * srcBytesPerRow + x * 4
-                    let idx = y * inputWidth + x
-                    dst[0 * plane + idx] = Float(src[srcOffset + 2]) / 255.0 // R
-                    dst[1 * plane + idx] = Float(src[srcOffset + 1]) / 255.0 // G
-                    dst[2 * plane + idx] = Float(src[srcOffset + 0]) / 255.0 // B
-                }
-            }
-        default:
-            logger.error("不支持的输入数据类型: \(self.inputDataType.rawValue)")
-            return false
+    private func processTile(_ tileBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        guard let provider = try? MLDictionaryFeatureProvider(dictionary: ["image": tileBuffer]),
+              let prediction = try? model.prediction(from: provider),
+              let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
+            return nil
         }
-
-        return true
+        return outputBuffer
     }
 
-    // MARK: - 输出 MLMultiArray → CVPixelBuffer
+    // MARK: - 瓦片累加（Float 累加器，带羽化权重）
 
-    private func createOutputBuffer(from array: MLMultiArray, width: Int, height: Int) -> CVPixelBuffer? {
+    private func accumulateTile(
+        _ tileOutput: CVPixelBuffer,
+        accumR: inout [Float],
+        accumG: inout [Float],
+        accumB: inout [Float],
+        accumW: inout [Float],
+        dstX: Int,
+        dstY: Int,
+        tileSize: Int,
+        outputWidth: Int,
+        outputHeight: Int
+    ) {
+        CVPixelBufferLockBaseAddress(tileOutput, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(tileOutput, .readOnly) }
+
+        guard let base = CVPixelBufferGetBaseAddress(tileOutput) else { return }
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(tileOutput)
+        let src = base.assumingMemoryBound(to: UInt8.self)
+
+        for ty in 0..<tileSize {
+            for tx in 0..<tileSize {
+                let outY = dstY + ty
+                let outX = dstX + tx
+                guard outY >= 0 && outY < outputHeight && outX >= 0 && outX < outputWidth else { continue }
+
+                let yWeight = featherWeight(position: ty, size: tileSize)
+                let xWeight = featherWeight(position: tx, size: tileSize)
+                let weight = xWeight * yWeight
+                guard weight > 0 else { continue }
+
+                let pixelOffset = ty * bytesPerRow + tx * 4
+                let outIdx = outY * outputWidth + outX
+                accumR[outIdx] += Float(src[pixelOffset + 2]) * weight
+                accumG[outIdx] += Float(src[pixelOffset + 1]) * weight
+                accumB[outIdx] += Float(src[pixelOffset + 0]) * weight
+                accumW[outIdx] += weight
+            }
+        }
+    }
+
+    /// 计算边缘羽化权重（0~1），中心区域为1，边缘线性衰减
+    private func featherWeight(position: Int, size: Int) -> Float {
+        let fw = featherWidth
+        if position < fw {
+            return Float(position + 1) / Float(fw + 1)
+        } else if position >= size - fw {
+            return Float(size - position) / Float(fw + 1)
+        } else {
+            return 1.0
+        }
+    }
+
+    // MARK: - 创建输出缓冲区（归一化 Float 累加器 → BGRA）
+
+    private func createOutputBuffer(
+        width: Int,
+        height: Int,
+        accumR: inout [Float],
+        accumG: inout [Float],
+        accumB: inout [Float],
+        accumW: inout [Float]
+    ) -> CVPixelBuffer? {
         var buffer: CVPixelBuffer?
         let attrs = [
             kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
@@ -223,7 +262,6 @@ final class FastSRGANEngine: SuperResolutionEngine {
             kCVPixelBufferHeightKey: height,
             kCVPixelBufferIOSurfacePropertiesKey: [:]
         ] as CFDictionary
-
         guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &buffer) == kCVReturnSuccess,
               let result = buffer else {
             return nil
@@ -236,42 +274,27 @@ final class FastSRGANEngine: SuperResolutionEngine {
         let dstBytesPerRow = CVPixelBufferGetBytesPerRow(result)
         let dst = dstBase.assumingMemoryBound(to: UInt8.self)
 
-        let plane = width * height
+        for y in 0..<height {
+            let rowOffset = y * dstBytesPerRow
+            for x in 0..<width {
+                let idx = y * width + x
+                let w = accumW[idx]
+                let pixelOffset = rowOffset + x * 4
 
-        switch array.dataType {
-        case .float16:
-            let src = array.dataPointer.assumingMemoryBound(to: Float16.self)
-            for y in 0..<height {
-                for x in 0..<width {
-                    let idx = y * width + x
-                    let pixelOffset = y * dstBytesPerRow + x * 4
-                    let r = Float(src[0 * plane + idx])
-                    let g = Float(src[1 * plane + idx])
-                    let b = Float(src[2 * plane + idx])
-                    dst[pixelOffset + 0] = UInt8(max(0, min(255, Int((b * 255).rounded()))))
-                    dst[pixelOffset + 1] = UInt8(max(0, min(255, Int((g * 255).rounded()))))
-                    dst[pixelOffset + 2] = UInt8(max(0, min(255, Int((r * 255).rounded()))))
-                    dst[pixelOffset + 3] = 255
+                if w > 0 {
+                    let b = accumB[idx] / w
+                    let g = accumG[idx] / w
+                    let r = accumR[idx] / w
+                    dst[pixelOffset + 0] = UInt8(max(0, min(255, Int(b))))
+                    dst[pixelOffset + 1] = UInt8(max(0, min(255, Int(g))))
+                    dst[pixelOffset + 2] = UInt8(max(0, min(255, Int(r))))
+                } else {
+                    dst[pixelOffset + 0] = 0
+                    dst[pixelOffset + 1] = 0
+                    dst[pixelOffset + 2] = 0
                 }
+                dst[pixelOffset + 3] = 255
             }
-        case .float32:
-            let src = array.dataPointer.assumingMemoryBound(to: Float32.self)
-            for y in 0..<height {
-                for x in 0..<width {
-                    let idx = y * width + x
-                    let pixelOffset = y * dstBytesPerRow + x * 4
-                    let r = src[0 * plane + idx]
-                    let g = src[1 * plane + idx]
-                    let b = src[2 * plane + idx]
-                    dst[pixelOffset + 0] = UInt8(max(0, min(255, Int((b * 255).rounded()))))
-                    dst[pixelOffset + 1] = UInt8(max(0, min(255, Int((g * 255).rounded()))))
-                    dst[pixelOffset + 2] = UInt8(max(0, min(255, Int((r * 255).rounded()))))
-                    dst[pixelOffset + 3] = 255
-                }
-            }
-        default:
-            logger.error("不支持的输出数据类型: \(array.dataType.rawValue)")
-            return nil
         }
 
         return result
