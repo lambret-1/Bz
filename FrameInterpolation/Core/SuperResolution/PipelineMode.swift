@@ -66,8 +66,8 @@ enum SuperResolutionScale: Int, CaseIterable, Identifiable {
 
 /// 超分引擎类型枚举
 enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
-    /// Fast-SRGAN：4x 超分，128×128 瓦片，轻量快速，适合通用场景
-    case fastSRGAN = "Fast-SRGAN"
+    /// PiperSR 2x：2x 超分，640×360 全帧推理，ANE 原生，速度快
+    case fastSRGAN = "PiperSR"
     /// Real-ESRGAN x4v3：4x 超分，128×128 瓦片拼接，适合极低清素材
     case realESRGAN = "Real-ESRGAN"
 
@@ -76,7 +76,7 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     /// 短名称（用于显示）
     var shortName: String {
         switch self {
-        case .fastSRGAN: return "Fast-SRGAN"
+        case .fastSRGAN: return "PiperSR"
         case .realESRGAN: return "Real-ESRGAN"
         }
     }
@@ -85,20 +85,25 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     var displayName: String {
         switch self {
         case .fastSRGAN:
-            return "Fast-SRGAN（原生4x）"
+            return "PiperSR（原生2x）"
         case .realESRGAN:
             return "Real-ESRGAN（原生4x）"
         }
     }
 
     /// 模型原生放大倍数
-    var nativeScaleFactor: Int { 4 }
+    var nativeScaleFactor: Int {
+        switch self {
+        case .fastSRGAN: return 2
+        case .realESRGAN: return 4
+        }
+    }
 
     /// 引擎描述
     var engineDescription: String {
         switch self {
         case .fastSRGAN:
-            return "轻量快速，适合通用低清视频"
+            return "ANE 原生，全帧推理，速度快"
         case .realESRGAN:
             return "细节恢复强，适合极低清素材（速度较慢）"
         }
@@ -108,7 +113,7 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     var recommendedInputMaxHeight: Int {
         switch self {
         case .fastSRGAN:
-            return 540
+            return 360
         case .realESRGAN:
             return 480
         }
@@ -118,7 +123,7 @@ enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     var modelFileName: String {
         switch self {
         case .fastSRGAN:
-            return "fast_srgan"
+            return "PiperSR_2x_video_720p"
         case .realESRGAN:
             return "real_esrgan_x4v3"
         }
