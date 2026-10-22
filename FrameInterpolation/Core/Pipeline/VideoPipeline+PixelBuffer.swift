@@ -262,5 +262,3 @@ extension VideoPipeline {
         }
     }
 }
-
-}
