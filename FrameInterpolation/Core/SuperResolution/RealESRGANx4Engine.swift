@@ -23,18 +23,19 @@ final class RealESRGANx4Engine: SuperResolutionEngine {
             forResource: "RealESRGAN_x4",
             withExtension: "mlmodelc"
         ) else {
-            logger.error("找不到 RealESRGAN_x4 模型文件")
+            logger.error("初始化失败: 找不到 RealESRGAN_x4.mlmodelc")
             return nil
         }
+        logger.info("模型路径: \(modelURL.path)")
 
         let config = MLModelConfiguration()
         config.computeUnits = .all
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
-            logger.error("模型加载失败")
+            logger.error("初始化失败: MLModel 加载异常")
             return nil
         }
         self.model = model
-        logger.info("RealESRGAN x4 引擎初始化成功")
+        logger.info("初始化成功: 输入 \(inputWidth)x\(inputHeight), 输出 \(inputWidth*scaleFactor)x\(inputHeight*scaleFactor)")
     }
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
@@ -42,35 +43,64 @@ final class RealESRGANx4Engine: SuperResolutionEngine {
 
         let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
         let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
-        guard srcWidth > 0, srcHeight > 0 else { return nil }
+        guard srcWidth > 0, srcHeight > 0 else {
+            logger.error("跳过: 输入尺寸非法 \(srcWidth)x\(srcHeight)")
+            return nil
+        }
+        logger.info("输入帧: \(srcWidth)x\(srcHeight)")
 
         // 1. 预处理：缩放到 512x512
         guard let resized512 = resizePixelBuffer(pixelBuffer, targetWidth: 512, targetHeight: 512) else {
+            logger.error("预处理失败: 缩放到512x512失败")
             return nil
         }
+        let resizedW = CVPixelBufferGetWidth(resized512)
+        let resizedH = CVPixelBufferGetHeight(resized512)
+        logger.info("预处理完成: \(resizedW)x\(resizedH)")
 
         if isCancelledFlag { return nil }
 
         // 2. 推理（输出特征名 activation_out）
-        guard let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": MLFeatureValue(pixelBuffer: resized512)]),
-              let prediction = try? model.prediction(from: inputProvider),
-              let outputBuffer = prediction.featureValue(for: "activation_out")?.imageBufferValue else {
-            logger.error("推理失败")
+        let startTime = CFAbsoluteTimeGetCurrent()
+        do {
+            let inputProvider = try MLDictionaryFeatureProvider(dictionary: [
+                "input": MLFeatureValue(pixelBuffer: resized512)
+            ])
+            let prediction = try model.prediction(from: inputProvider)
+            logger.info("可用输出特征: \(prediction.featureNames)")
+
+            guard let outputBuffer = prediction.featureValue(for: "activation_out")?.imageBufferValue else {
+                logger.error("推理输出为空: activation_out/imageBufferValue 为 nil")
+                return nil
+            }
+
+            let outW = CVPixelBufferGetWidth(outputBuffer)
+            let outH = CVPixelBufferGetHeight(outputBuffer)
+            let elapsed = CFAbsoluteTimeGetCurrent() - startTime
+            logger.info("推理完成: 输出 \(outW)x\(outH), 耗时 \(String(format: "%.3f", elapsed))s")
+
+            if isCancelledFlag { return nil }
+
+            // 3. 后处理：缩放到目标尺寸 src×2
+            let targetOutWidth = srcWidth * 2
+            let targetOutHeight = srcHeight * 2
+            logger.info("后处理: \(outW)x\(outH) → \(targetOutWidth)x\(targetOutHeight)")
+
+            guard let finalOutput = resizePixelBuffer(outputBuffer, targetWidth: targetOutWidth, targetHeight: targetOutHeight) else {
+                logger.error("后处理失败: 缩放到目标尺寸失败")
+                return nil
+            }
+
+            copyColorSpaceAttachments(from: pixelBuffer, to: finalOutput)
+            let finalW = CVPixelBufferGetWidth(finalOutput)
+            let finalH = CVPixelBufferGetHeight(finalOutput)
+            logger.info("输出帧: \(finalW)x\(finalH)")
+            return finalOutput
+
+        } catch {
+            logger.error("推理异常: \(error.localizedDescription)")
             return nil
         }
-
-        if isCancelledFlag { return nil }
-
-        // 3. 后处理：缩放到目标尺寸 src×2
-        let targetOutWidth = srcWidth * 2
-        let targetOutHeight = srcHeight * 2
-
-        guard let finalOutput = resizePixelBuffer(outputBuffer, targetWidth: targetOutWidth, targetHeight: targetOutHeight) else {
-            return nil
-        }
-
-        copyColorSpaceAttachments(from: pixelBuffer, to: finalOutput)
-        return finalOutput
     }
 
     func cancel() { isCancelledFlag = true }
