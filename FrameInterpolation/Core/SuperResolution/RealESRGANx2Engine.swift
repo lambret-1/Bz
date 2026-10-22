@@ -6,10 +6,14 @@ import OSLog
 
 private final class ReusableInput: MLFeatureProvider {
     let input: MLMultiArray
-    init(input: MLMultiArray) { self.input = input }
-    var featureNames: Set<String> { ["input"] }
-    func featureValue(for featureName: String) -> MLFeatureValue? {
-        featureName == "input" ? MLFeatureValue(multiArray: input) : nil
+    let featureName: String
+    init(input: MLMultiArray, featureName: String) {
+        self.input = input
+        self.featureName = featureName
+    }
+    var featureNames: Set<String> { [featureName] }
+    func featureValue(for name: String) -> MLFeatureValue? {
+        name == featureName ? MLFeatureValue(multiArray: input) : nil
     }
 }
 
@@ -74,9 +78,12 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             return nil
         }
 
-        guard let inShape = model.modelDescription.inputDescriptionsByName["input"]?
+        let inputName = model.modelDescription.inputDescriptionsByName.keys.first ?? "input"
+        let outputName = model.modelDescription.outputDescriptionsByName.keys.first ?? "output"
+
+        guard let inShape = model.modelDescription.inputDescriptionsByName[inputName]?
                 .multiArrayConstraint?.shape.map({ $0.intValue }),
-              let outShape = model.modelDescription.outputDescriptionsByName["output"]?
+              let outShape = model.modelDescription.outputDescriptionsByName[outputName]?
                 .multiArrayConstraint?.shape.map({ $0.intValue }),
               inShape.count == 4, outShape.count == 4 else {
             logger.error("❌ 模型 IO 不是 4D")
@@ -103,10 +110,10 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         }
         self.inputArray = inputArray
         self.outputArray = outputArray
-        self.inputProvider = ReusableInput(input: inputArray)
+        self.inputProvider = ReusableInput(input: inputArray, featureName: inputName)
 
         let opts = MLPredictionOptions()
-        opts.outputBackings = ["output": outputArray]
+        opts.outputBackings = [outputName: outputArray]
         self.predOpts = opts
 
         guard let tileBuf = Self.makeBGRA(width: inputWidth, height: inputHeight),
