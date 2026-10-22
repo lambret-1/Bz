@@ -75,15 +75,6 @@ extension VideoPipeline {
                 } else if let engine = engine,
                           let aiFrame = engine.upscale(pixelBuffer) {
                     // AI 超分：RealESRGANx2引擎已内部缩放到目标倍数，其他引擎需再缩放
-                    if engineType == .realESRGANx4 {
-                        processedFrame = aiFrame
-                    } else if targetScale.rawValue < nativeScale {
-                        let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
-                        let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
-                        let targetW = srcWidth * targetScale.rawValue
-                        let targetH = srcHeight * targetScale.rawValue
-                        processedFrame = self.scalePixelBuffer(aiFrame, to: targetW, targetH) ?? aiFrame
-                    } else {
                         processedFrame = aiFrame
                     }
                 } else {
