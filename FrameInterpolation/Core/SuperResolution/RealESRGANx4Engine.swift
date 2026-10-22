@@ -30,7 +30,7 @@ final class RealESRGANx4Engine: SuperResolutionEngine {
         logger.info("[帧?] 模型路径: \(modelURL.path)")
 
         let config = MLModelConfiguration()
-        config.computeUnits = .all
+        config.computeUnits = .cpuOnly
         let loadStart = CFAbsoluteTimeGetCurrent()
         guard let model = try? MLModel(contentsOf: modelURL, configuration: config) else {
             logger.error("[帧?] 初始化失败: MLModel 加载异常")
