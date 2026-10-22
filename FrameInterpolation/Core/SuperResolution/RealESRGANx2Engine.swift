@@ -19,12 +19,11 @@ final class RealESRGANEngine: SuperResolutionEngine {
     private var isCancelledFlag = false
 
     init?() {
-        // 注意：如果你使用的是代码里的 load 逻辑，把这里改成相应的 URL 获取
         guard let modelURL = Bundle.main.url(
-            forResource: SuperResolutionEngineType.realESRGAN.modelFileName,
-            withExtension: "mlmodelc" // 建议编译后使用 mlmodelc
+            forResource: "RealESRGAN_x2",
+            withExtension: "mlpackage"
         ) else {
-            logger.error("找不到模型文件")
+            logger.error("找不到 RealESRGAN_x2 模型文件")
             return nil
         }
 
@@ -52,20 +51,19 @@ final class RealESRGANEngine: SuperResolutionEngine {
 
         if isCancelledFlag { return nil }
 
-        // 2. 推理
+        // 2. 推理（输出特征名是 activation_out，不是 output）
         guard let inputProvider = try? MLDictionaryFeatureProvider(dictionary: ["input": MLFeatureValue(pixelBuffer: resized512)]),
               let prediction = try? model.prediction(from: inputProvider),
-              let outputBuffer = prediction.featureValue(for: "output")?.imageBufferValue else {
+              let outputBuffer = prediction.featureValue(for: "activation_out")?.imageBufferValue else {
             logger.error("推理失败")
             return nil
         }
 
         if isCancelledFlag { return nil }
 
-        // 3. 后处理：模型输出是 2048x2048，我们缩放到目标分辨率
-        // 如果你要保持原视频比例，将其放大到原来的目标尺寸
-        let targetOutWidth = srcWidth * 2 // 假设最终要 2x 输出，可以自己改
-        let targetOutHeight = srcHeight * 2
+        // 3. 后处理：模型输出 2048×2048，缩放到目标尺寸（src尺寸 × targetScale）
+        let targetOutWidth = srcWidth * targetScale
+        let targetOutHeight = srcHeight * targetScale
         
         guard let finalOutput = resizePixelBuffer(outputBuffer, targetWidth: targetOutWidth, targetHeight: targetOutHeight) else {
             return nil
