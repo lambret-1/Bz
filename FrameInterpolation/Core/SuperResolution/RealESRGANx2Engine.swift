@@ -151,6 +151,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         }
 
         // 2. BGRA → Tensor
+        CVPixelBufferLockBaseAddress(resizedInput, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(resizedInput, .readOnly) }
         guard bgraToTensor(resizedInput) else {
             logger.error("❌ BGRA转Tensor失败")
             return nil
