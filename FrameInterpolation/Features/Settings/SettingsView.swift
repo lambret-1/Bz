@@ -33,7 +33,6 @@ struct SettingsView: View {
 
                     // 超分模式专属参数
                     if isSuperResolutionMode {
-                        superResolutionScaleSection
                         superResolutionEngineSection
                     }
 
@@ -223,23 +222,6 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundColor(DesignTokens.Colors.warning)
             }
-        }
-    }
-
-    // MARK: - 超分放大倍数
-
-    private var superResolutionScaleSection: some View {
-        VStack(alignment: .leading, spacing: DesignTokens.Spacing.s) {
-            Text("放大倍数")
-                .font(.headline)
-            SegmentedPicker(
-                items: SuperResolutionScale.allCases,
-                selection: $appState.superResolutionScale,
-                label: { $0.label }
-            )
-            Text(appState.superResolutionScale == .x1 ? "1x 不执行 AI 推理，仅复制帧（用于对比基准）" : "模型原生 4x，\(appState.superResolutionScale.label) 通过 4x 超分后缩放实现")
-                .font(.caption)
-                .foregroundColor(DesignTokens.Colors.textSecondary)
         }
     }
 
