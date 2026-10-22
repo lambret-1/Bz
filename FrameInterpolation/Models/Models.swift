@@ -89,7 +89,6 @@ struct RecentRecord: Identifiable, Equatable, Codable {
     /// 格式化的创建时间（如 "今天 14:30"、"昨天 09:15"、"10月15日"）
     var formattedDate: String {
         let calendar = Calendar.current
-        let now = Date()
         if calendar.isDateInToday(createdAt) {
             let formatter = DateFormatter()
             formatter.dateFormat = "HH:mm"
