@@ -49,6 +49,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
 
     private var isCancelledFlag = false
     private let cancelLock = NSLock()
+    private var frameCount: Int = 0
 
     init?() {
         let tStart = CFAbsoluteTimeGetCurrent()
@@ -183,7 +184,11 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         }
 
         let totalMs = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
-        logger.info("✅ \(srcW, privacy: .public)x\(srcH, privacy: .public)→\(targetW, privacy: .public)x\(targetH, privacy: .public) 推理\(predMs, privacy: .public)ms 总\(totalMs, privacy: .public)ms")
+        // 每10帧打一次日志，避免刷屏
+        self.frameCount += 1
+        if self.frameCount % 10 == 1 || self.frameCount <= 3 {
+            logger.info("✅ [原生4x] \(srcW, privacy: .public)x\(srcH, privacy: .public)→\(targetW, privacy: .public)x\(targetH, privacy: .public) 推理\(predMs, privacy: .public)ms 总\(totalMs, privacy: .public)ms 帧\(self.frameCount, privacy: .public)")
+        }
 
         return finalOutput
     }
