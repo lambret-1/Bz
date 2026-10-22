@@ -1,6 +1,10 @@
 name: SwiftLint
 
 on:
+  # 允许在 GitHub Actions 页面手动点击 "Run workflow" 触发
+  workflow_dispatch:
+  
+  # 当向 main 或 testping 分支发起 PR，且修改了指定文件时触发
   pull_request:
     branches: [main, testping]
     paths:
@@ -30,6 +34,8 @@ jobs:
       - name: 运行 SwiftLint
         uses: SchmiedmayerLab/action-swiftlint@v4
         env:
+          # 如果是 PR 触发，这里会是 main 或 testping；
+          # 如果是手动触发，这里为空，Action 会自动扫描全部 Swift 文件。
           DIFF_BASE: ${{ github.base_ref }}
         with:
           args: --strict
