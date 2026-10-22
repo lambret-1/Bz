@@ -117,7 +117,7 @@ final class VideoPipeline {
             modeDescription = "超分\(engineType.shortName)\(scale.label)"
         }
 
-        logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 模式:\(modeDescription), 快速模式:\(fastMode), 分辨率:\(outputResolution.rawValue)")
+        logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 模式:\(modeDescription, privacy: .public), 快速模式:\(fastMode, privacy: .public), 分辨率:\(outputResolution.rawValue, privacy: .public)")
 
         processingQueue.async { [weak self] in
             guard let self = self else { return }

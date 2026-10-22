@@ -1,15 +1,18 @@
 import UIKit
 
 class ImageSuperResolutionService {
-    private let engine: RealESRGANEngine?
+    private var engine: RealESRGANEngine?
     
     init() {
-        // 初始化引擎（复用你刚才写好的那个）
-        self.engine = RealESRGANEngine()
+        // 懒加载：不在这里初始化引擎，第一次处理图片时才加载
     }
     
     /// 处理图片（在后台线程执行，完成后切回主线程）
     func processImage(_ inputImage: UIImage, completion: @escaping (UIImage?) -> Void) {
+        // 懒加载引擎
+        if engine == nil {
+            engine = RealESRGANEngine()
+        }
         guard let engine = engine else {
             completion(nil)
             return
