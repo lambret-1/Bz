@@ -96,9 +96,8 @@ jobs:
       - name: 下载 RealESRGAN_x2 模型文件
         run: |
           mkdir -p FrameInterpolation/Resources/RealESRGAN_x2.mlpackage/Data/com.apple.CoreML
-          curl -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -o FrameInterpolation/Resources/RealESRGAN_x2.mlpackage/Data/com.apple.CoreML/model.mlmodel \
-            "https://github.com/lambret-1/esrgan-convert/releases/download/v1.0/model.mlmodel"
+          curl -L -o FrameInterpolation/Resources/RealESRGAN_x2.mlpackage/Data/com.apple.CoreML/model.mlmodel \
+            "https://github.com/lambret-1/Bz/releases/download/model-realesrgan-x2/model.mlmodel"
           echo "模型大小: $(du -h FrameInterpolation/Resources/RealESRGAN_x2.mlpackage/Data/com.apple.CoreML/model.mlmodel | cut -f1)"
 
       - name: 生成 Xcode 工程
