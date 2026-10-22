@@ -121,21 +121,23 @@ final class VideoPipeline {
 
         processingQueue.async { [weak self] in
             guard let self = self else { return }
-            do {
-                try self.runPipeline(
-                    inputURL: inputURL,
-                    outputURL: outputURL,
-                    mode: mode,
-                    multiplier: effectiveMultiplier,
-                    fastMode: fastMode,
-                    outputResolution: outputResolution,
-                    progress: progress,
-                    completion: completion
-                )
-            } catch {
-                self.logger.error("管线处理失败: \(error.localizedDescription, privacy: .public)")
-                Task { @MainActor in
-                    completion(.failure(error))
+            Task {
+                do {
+                    try await self.runPipeline(
+                        inputURL: inputURL,
+                        outputURL: outputURL,
+                        mode: mode,
+                        multiplier: effectiveMultiplier,
+                        fastMode: fastMode,
+                        outputResolution: outputResolution,
+                        progress: progress,
+                        completion: completion
+                    )
+                } catch {
+                    self.logger.error("管线处理失败: \(error.localizedDescription, privacy: .public)")
+                    await MainActor.run {
+                        completion(.failure(error))
+                    }
                 }
             }
         }
@@ -158,25 +160,29 @@ final class VideoPipeline {
         outputResolution: OutputResolution,
         progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
         completion: @escaping @MainActor (Result<URL, Error>) -> Void
-    ) throws {
+    ) async throws {
         let asset = AVURLAsset(url: inputURL)
 
-        // 同步加载轨道（iOS 16 中 tracks(withMediaType:) 会阻塞等待元数据加载，比异步 loadTracks 更可靠）
-        let loadedVideoTrack = asset.tracks(withMediaType: .video).first
-        let loadedAudioTrack = asset.tracks(withMediaType: .audio).first
+        // 异步加载轨道
+        let videoTracks = try await asset.loadTracks(withMediaType: .video)
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let loadedVideoTrack = videoTracks.first else {
+            throw PipelineError.noVideoTrack
+        }
+        let loadedAudioTrack = audioTracks.first
 
         print("[Bz音频诊断] 视频轨道: \(loadedVideoTrack != nil ? "有" : "无"), 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
         if let audioTrack = loadedAudioTrack {
-            print("[Bz音频诊断] 音频格式: \(audioTrack.formatDescriptions), 估计码率: \(audioTrack.estimatedDataRate)bps")
+            let formatDesc = try? await audioTrack.load(.formatDescriptions)
+            let dataRate = try? await audioTrack.load(.estimatedDataRate)
+            print("[Bz音频诊断] 音频格式: \(String(describing: formatDesc)), 估计码率: \(String(describing: dataRate))bps")
         }
 
-        // 获取视频轨道
-        guard let videoTrack = loadedVideoTrack else {
-            throw PipelineError.noVideoTrack
-        }
+        let videoTrack = loadedVideoTrack
 
         // 帧率与帧数计算
-        let inputFPS = Double(videoTrack.nominalFrameRate)
+        let nominalFPS = try await videoTrack.load(.nominalFrameRate)
+        let inputFPS = Double(nominalFPS)
         guard inputFPS > 0 else {
             throw PipelineError.invalidFrameRate
         }
@@ -198,12 +204,13 @@ final class VideoPipeline {
             nativeScale = engineType.nativeScaleFactor
         }
 
-        let durationSeconds = CMTimeGetSeconds(asset.duration)
+        let duration = try await asset.load(.duration)
+        let durationSeconds = CMTimeGetSeconds(duration)
         let totalInputFrames = max(Int(durationSeconds * inputFPS), 1)
 
         // 输出尺寸（按用户选择的放大倍数计算）
-        let naturalSize = videoTrack.naturalSize
-        let transform = videoTrack.preferredTransform
+        let naturalSize = try await videoTrack.load(.naturalSize)
+        let transform = try await videoTrack.load(.preferredTransform)
         var outputWidth = Int(naturalSize.width) * targetScale
         var outputHeight = Int(naturalSize.height) * targetScale
 
@@ -291,7 +298,8 @@ final class VideoPipeline {
         let pixelScaleRatio = Double(outputPixelCount) / Double(inputPixelCount)
 
         // 输入视频原始码率（estimatedDataRate 单位 bps）
-        let inputBitRate = Double(videoTrack.estimatedDataRate)
+        let inputDataRate = (try? await videoTrack.load(.estimatedDataRate)) ?? 0
+        let inputBitRate = Double(inputDataRate)
         // 基础码率：输入码率 × 像素数放大比例；输入码率无效时按分辨率兜底
         let baseBitRate: Double
         if inputBitRate > 100_000 {
@@ -346,7 +354,7 @@ final class VideoPipeline {
         var audioWriterInput: AVAssetWriterInput?
         if audioReaderOutput != nil {
             // 从音频轨道获取声道数和采样率，用于 AAC 编码配置
-            let audioFormatDesc = loadedAudioTrack?.formatDescriptions.first.map { $0 as! CMFormatDescription }
+            let audioFormatDesc = (try? await loadedAudioTrack?.load(.formatDescriptions))?.first
             let audioChannels = audioFormatDesc.flatMap { desc -> Int? in
                 let basicDesc = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
                 return Int(basicDesc?.pointee.mChannelsPerFrame ?? 2)
@@ -616,7 +624,7 @@ final class VideoPipeline {
     ) throws {
         // 1x 模式或模型缺失时跳过 AI 超分，直接复制/缩放帧
         let needsAI = targetScale.needsAISuperResolution
-        var engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
+        let engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
         // 设置引擎目标放大倍数（RealESRGANx2引擎内部直接输出目标尺寸）
         engine?.targetScale = targetScale.rawValue
         let usingAI = engine != nil
@@ -1258,7 +1266,7 @@ final class VideoPipeline {
     }
 
     // MARK: - 合成音频（AVMutableComposition + AVAssetExportSession）
-    private func muxAudio(videoURL: URL, sourceAsset: AVAsset, outputURL: URL) throws {
+    private func muxAudio(videoURL: URL, sourceAsset: AVAsset, outputURL: URL) async throws {
         let videoAsset = AVURLAsset(url: videoURL)
         let composition = AVMutableComposition()
 
@@ -1270,19 +1278,23 @@ final class VideoPipeline {
             Self.音频诊断结果 = "合成失败：无法创建视频轨道"
             throw PipelineError.writerConfigurationFailed
         }
-        guard let sourceVideoTrack = videoAsset.tracks(withMediaType: .video).first else {
+        let videoTracks = try await videoAsset.loadTracks(withMediaType: .video)
+        guard let sourceVideoTrack = videoTracks.first else {
             Self.音频诊断结果 = "合成失败：临时视频无视频轨道"
             throw PipelineError.noVideoTrack
         }
+        let videoDuration = try await videoAsset.load(.duration)
+        let videoTransform = try await sourceVideoTrack.load(.preferredTransform)
         try videoTrack.insertTimeRange(
-            CMTimeRange(start: .zero, duration: videoAsset.duration),
+            CMTimeRange(start: .zero, duration: videoDuration),
             of: sourceVideoTrack,
             at: .zero
         )
-        videoTrack.preferredTransform = sourceVideoTrack.preferredTransform
+        videoTrack.preferredTransform = videoTransform
 
         // 音频轨道（从原视频复制）
-        guard let sourceAudioTrack = sourceAsset.tracks(withMediaType: .audio).first else {
+        let audioTracks = try await sourceAsset.loadTracks(withMediaType: .audio)
+        guard let sourceAudioTrack = audioTracks.first else {
             Self.音频诊断结果 = "合成失败：原视频无音频轨道"
             throw PipelineError.writerConfigurationFailed
         }
@@ -1293,8 +1305,9 @@ final class VideoPipeline {
             Self.音频诊断结果 = "合成失败：无法创建音频轨道"
             throw PipelineError.writerConfigurationFailed
         }
+        let sourceDuration = try await sourceAsset.load(.duration)
         try audioTrack.insertTimeRange(
-            CMTimeRange(start: .zero, duration: sourceAsset.duration),
+            CMTimeRange(start: .zero, duration: sourceDuration),
             of: sourceAudioTrack,
             at: .zero
         )
