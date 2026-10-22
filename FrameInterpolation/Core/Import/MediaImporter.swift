@@ -42,11 +42,14 @@ enum MediaImporter {
         let width = Int(abs(displaySize.width))
         let height = Int(abs(displaySize.height))
 
-        // 视频码率（Mbps），track 已通过 loadTracks 加载，直接读属性
-        let bitRateMbps = Double(track.estimatedDataRate) / 1_000_000
+        // 视频码率（Mbps）
+        async let dataRate = track.load(.estimatedDataRate)
+        async let formatDescs = track.load(.formatDescriptions)
+        let (resolvedDataRate, resolvedFormatDescs) = try await (dataRate, formatDescs)
+        let bitRateMbps = Double(resolvedDataRate) / 1_000_000
 
         // 视频编码格式（从 formatDescriptions 解析 codecType）
-        let codecFormat = Self.parseCodecFormat(track: track)
+        let codecFormat = Self.parseCodecFormat(descriptions: resolvedFormatDescs)
 
         // 文件大小
         let fileSize: Int64
@@ -79,9 +82,9 @@ enum MediaImporter {
         )
     }
 
-    /// 从 AVAssetTrack 的 formatDescriptions 解析视频编码格式
-    private static func parseCodecFormat(track: AVAssetTrack) -> String {
-        guard let descriptions = track.formatDescriptions as? [CMFormatDescription],
+    /// 从 formatDescriptions 解析视频编码格式
+    private static func parseCodecFormat(descriptions: [CMFormatDescription]?) -> String {
+        guard let descriptions = descriptions,
               let first = descriptions.first else {
             return "未知"
         }
