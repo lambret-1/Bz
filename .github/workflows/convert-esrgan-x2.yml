@@ -66,4 +66,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add FrameInterpolation/Resources/RealESRGAN_x2.mlpackage
           git diff --staged --quiet || git commit -m "chore: 更新 RealESRGAN_x2.mlpackage 模型文件 [skip ci]"
-          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git testping
+          
+          # 显式切换到 testping 分支（覆盖本地可能不存在的情况）
+          git checkout -B testping
+          
+          # 直接使用 origin 推送（actions/checkout 已经自动配置好了鉴权，不需要手写 token url）
+          git push origin testping
