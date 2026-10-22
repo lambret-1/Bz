@@ -14,7 +14,6 @@ struct HomeView: View {
     @State private var outputImage: UIImage?
     @State private var isProcessingImage = false
     @State private var isSavingImage = false
-    private let imageSRService = ImageSuperResolutionService()
 
     var body: some View {
         ScrollView {
@@ -227,7 +226,7 @@ struct HomeView: View {
     
     private func startImageUpscale(_ image: UIImage) {
         isProcessingImage = true
-        imageSRService.processImage(image) { result in
+        appState.imageSRService.processImage(image) { result in
             isProcessingImage = false
             if let result = result {
                 self.outputImage = result

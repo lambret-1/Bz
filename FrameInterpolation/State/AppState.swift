@@ -12,6 +12,8 @@ final class AppState: ObservableObject {
     private let recentRecordsKey = "BzRecentRecords"
     /// 性能监控器（处理中页面显示 CPU/内存）
     let performanceMonitor = PerformanceMonitor()
+    /// 图片超分服务（全局单例，避免SwiftUI body重算时反复加载模型）
+    let imageSRService = ImageSuperResolutionService()
 
     // MARK: - 后台任务管理（统一在AppState，避免ProcessingView dismiss后丢失保护）
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
