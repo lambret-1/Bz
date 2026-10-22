@@ -189,7 +189,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         // 每10帧打一次日志，避免刷屏
         self.frameCount += 1
         if self.frameCount % 10 == 1 || self.frameCount <= 3 {
-            logger.info("✅ [目标\(self.targetScale)x] 帧\(self.frameCount, privacy: .public) \(srcW, privacy: .public)x\(srcH, privacy: .public)→\(targetW, privacy: .public)x\(targetH, privacy: .public) 推理\(predMs, privacy: .public)ms 总\(totalMs, privacy: .public)ms")
+            logger.info("✅ [目标\(self.targetScale, privacy: .public)x] 帧\(self.frameCount, privacy: .public) \(srcW, privacy: .public)x\(srcH, privacy: .public)→\(targetW, privacy: .public)x\(targetH, privacy: .public) 推理\(predMs, privacy: .public)ms 总\(totalMs, privacy: .public)ms")
         }
 
         return finalOutput

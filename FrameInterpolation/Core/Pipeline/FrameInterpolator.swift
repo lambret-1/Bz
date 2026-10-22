@@ -98,7 +98,7 @@ final class FrameInterpolator {
             self.rgbaToBgraPipeline = try helper.device.makeComputePipelineState(function: rgb2bgra)
             self.upsampleFlowMaskPipeline = try helper.device.makeComputePipelineState(function: upsample)
         } catch {
-            logger.error("Metal 管线创建失败: \(error.localizedDescription)")
+            logger.error("Metal 管线创建失败: \(error.localizedDescription, privacy: .public)")
             return nil
         }
 
@@ -123,7 +123,7 @@ final class FrameInterpolator {
         // 4. 配置输出 PixelBufferPool
         pool.configure(width: modelInputWidth, height: modelInputHeight, format: kCVPixelFormatType_32BGRA)
 
-        logger.info("FrameInterpolator 初始化成功，模型输入: \(self.modelInputWidth)x\(self.modelInputHeight)，Metal 后处理已启用")
+        logger.info("FrameInterpolator 初始化成功，模型输入: \(self.modelInputWidth, privacy: .public)x\(self.modelInputHeight, privacy: .public)，Metal 后处理已启用")
     }
 
     // MARK: - 公开方法
@@ -478,7 +478,7 @@ final class FrameInterpolator {
                 dst[i] = Float16(src[i])
             }
         } else {
-            logger.error("不支持的 MLMultiArray 数据类型: \(multiArray.dataType.rawValue)")
+            logger.error("不支持的 MLMultiArray 数据类型: \(multiArray.dataType.rawValue, privacy: .public)")
         }
     }
 
@@ -567,7 +567,7 @@ final class FrameInterpolator {
 
         let scaleError = vImageScale_ARGB8888(&srcBuffer, &dstBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
         if scaleError != kvImageNoError {
-            logger.error("vImage 缩放失败，错误码: \(scaleError)")
+            logger.error("vImage 缩放失败，错误码: \(scaleError, privacy: .public)")
             return nil
         }
 

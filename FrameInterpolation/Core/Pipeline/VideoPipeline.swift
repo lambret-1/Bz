@@ -306,7 +306,7 @@ final class VideoPipeline {
         // 码率上下限：最低 2Mbps，最高 60Mbps（避免超大文件）
         let targetBitRate = max(2_000_000, min(60_000_000, Int(baseBitRate * hevcEfficiencyFactor)))
 
-        logger.info("编码配置: HEVC, 输入码率 \(inputBitRate/1_000_000)Mbps, 像素放大 \(String(format: "%.2f", pixelScaleRatio))x, 输出码率 \(Double(targetBitRate)/1_000_000)Mbps")
+        logger.info("编码配置: HEVC, 输入码率 \(inputBitRate/1_000_000, privacy: .public)Mbps, 像素放大 \(String(format: "%.2f", pixelScaleRatio, privacy: .public))x, 输出码率 \(Double(targetBitRate, privacy: .public)/1_000_000)Mbps")
 
         // 优先使用 HEVC，不支持时降级为 H.264（码率相应提高，因为 H.264 效率较低）
         let videoWriterInput: AVAssetWriterInput
@@ -328,7 +328,7 @@ final class VideoPipeline {
                 bitRate: h264BitRate,
                 writer: writer
             )!
-            logger.warning("HEVC 不可用，降级为 H.264 编码，码率 \(Double(h264BitRate)/1_000_000)Mbps")
+            logger.warning("HEVC 不可用，降级为 H.264 编码，码率 \(Double(h264BitRate, privacy: .public)/1_000_000)Mbps")
         }
         videoWriterInput.transform = transform
 
@@ -621,7 +621,7 @@ final class VideoPipeline {
         engine?.targetScale = targetScale.rawValue
         let usingAI = engine != nil
         if needsAI && engine == nil {
-            logger.warning("\(engineType.displayName) 模型未加载，超分模式降级为 vImage 缩放")
+            logger.warning("\(engineType.displayName, privacy: .public) 模型未加载，超分模式降级为 vImage 缩放")
         }
         if !needsAI {
             logger.info("超分倍数 1x，跳过 AI 推理，直接透传帧")
@@ -728,7 +728,7 @@ final class VideoPipeline {
         let engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
         let usingAI = engine != nil
         if needsAI && engine == nil {
-            logger.warning("\(engineType.displayName) 模型未加载，超分模式降级为 vImage 缩放")
+            logger.warning("\(engineType.displayName, privacy: .public) 模型未加载，超分模式降级为 vImage 缩放")
         }
 
         // 立即报告初始进度
@@ -857,7 +857,7 @@ final class VideoPipeline {
                         aiFrame = copiedFrame
                     } else if let engine = engine {
                         guard let upscaled = engine.upscale(copiedFrame) else {
-                            self.logger.error("第\(frameIndex)帧超分推理失败，引擎返回nil")
+                            self.logger.error("第\(frameIndex, privacy: .public)帧超分推理失败，引擎返回nil")
                             setError(PipelineError.unknown)
                             return
                         }
@@ -892,7 +892,7 @@ final class VideoPipeline {
                     // 诊断日志（每10帧打印一次，同时写入文件）
                     if frameIndex % 10 == 0 {
                         let logLine = "帧\(frameIndex) 等待出队:\(String(format: "%.3f", t1-t0))s 深拷:\(String(format: "%.3f", t2-t1))s 推理:\(String(format: "%.3f", t3-t2))s 缩放:\(String(format: "%.3f", t4-t3))s 入队:\(String(format: "%.3f", t5-t4))s"
-                        self.logger.info("\(logLine)")
+                        self.logger.info("\(logLine, privacy: .public)")
                         DiagnosticLogger.shared.writeLine(logLine)
                     }
                     frameIndex += 1
@@ -989,7 +989,7 @@ final class VideoPipeline {
         // 输出帧数 = Inference队列的入队数
         let finalFrameCount = inferenceToEncode.totalEnqueued
         outputFrameIndex = finalFrameCount
-        logger.info("黄金三队列超分管线完成，输出帧数: \(finalFrameCount)")
+        logger.info("黄金三队列超分管线完成，输出帧数: \(finalFrameCount, privacy: .public)")
 
         // 结束诊断日志会话
         DiagnosticLogger.shared.writeLine("----------------------------------------")
@@ -1214,7 +1214,7 @@ final class VideoPipeline {
 
         outputFrameIndex = localOutputFrameCount
         let finalFrameCount = localOutputFrameCount
-        logger.info("异步补帧管线完成，输出帧数: \(finalFrameCount)")
+        logger.info("异步补帧管线完成，输出帧数: \(finalFrameCount, privacy: .public)")
     }
 
     // MARK: - 创建视频写入输入（支持 HEVC/H.264，自动检测兼容性）
@@ -1561,7 +1561,7 @@ final class VideoPipeline {
             Thread.sleep(forTimeInterval: 0.005)
             waitCount += 1
             if waitCount > 200 { // 超过 1 秒未就绪
-                logger.warning("Writer 超过 1 秒未就绪，等待次数: \(waitCount)")
+                logger.warning("Writer 超过 1 秒未就绪，等待次数: \(waitCount, privacy: .public)")
                 break
             }
         }

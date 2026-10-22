@@ -40,7 +40,7 @@ final class DiagnosticLogger {
         writeLine("管线诊断日志")
         writeLine("开始时间: \(Date())")
         writeLine("========================================")
-        logger.info("诊断日志已创建: \(fileName)")
+        logger.info("诊断日志已创建: \(fileName, privacy: .public)")
     }
 
     /// 写入一行日志
@@ -51,7 +51,7 @@ final class DiagnosticLogger {
             try handle.seekToEnd()
             try handle.write(contentsOf: data)
         } catch {
-            logger.error("写入诊断日志失败: \(error.localizedDescription)")
+            logger.error("写入诊断日志失败: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -63,7 +63,7 @@ final class DiagnosticLogger {
         try? fileHandle?.close()
         fileHandle = nil
         if let path = logFilePath {
-            logger.info("诊断日志已保存: \(path.lastPathComponent)")
+            logger.info("诊断日志已保存: \(path.lastPathComponent, privacy: .public)")
         }
     }
 

@@ -107,9 +107,9 @@ final class AppState: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: recentRecordsKey) else { return }
         do {
             recentRecords = try JSONDecoder().decode([RecentRecord].self, from: data)
-            logger.info("加载最近记录: \(self.recentRecords.count) 条")
+            logger.info("加载最近记录: \(self.recentRecords.count, privacy: .public) 条")
         } catch {
-            logger.error("加载最近记录失败: \(error.localizedDescription)")
+            logger.error("加载最近记录失败: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -118,7 +118,7 @@ final class AppState: ObservableObject {
             let data = try JSONEncoder().encode(recentRecords)
             UserDefaults.standard.set(data, forKey: recentRecordsKey)
         } catch {
-            logger.error("保存最近记录失败: \(error.localizedDescription)")
+            logger.error("保存最近记录失败: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -133,7 +133,7 @@ final class AppState: ObservableObject {
             let uiImage = UIImage(cgImage: cgImage)
             return uiImage.jpegData(compressionQuality: 0.6)
         } catch {
-            logger.error("生成缩略图失败: \(error.localizedDescription)")
+            logger.error("生成缩略图失败: \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }
@@ -236,7 +236,7 @@ final class AppState: ObservableObject {
                 self.selectedVideo = info
                 self.showSettings = true
                 self.stage = .idle
-                logger.info("视频导入成功: \(info.fileName, privacy: .public), \(info.width)x\(info.height), \(info.originalFPS)fps")
+                logger.info("视频导入成功: \(info.fileName, privacy: .public), \(info.width, privacy: .public)x\(info.height, privacy: .public), \(info.originalFPS, privacy: .public)fps")
             } catch {
                 self.stage = .idle
                 self.showToast(error.localizedDescription, style: .error)
@@ -263,7 +263,7 @@ final class AppState: ObservableObject {
             mode = .superResolution(superResolutionEngine, superResolutionScale)
         }
 
-        logger.info("开始处理: \(video.fileName, privacy: .public), 模式:\(mode.displayName)")
+        logger.info("开始处理: \(video.fileName, privacy: .public), 模式:\(mode.displayName, privacy: .public)")
 
         isProcessing = true
         progress = 0
@@ -393,7 +393,7 @@ final class AppState: ObservableObject {
                             let averaged = self.measuredSpeedFactor.map { ($0 * 0.7) + (speedFactor * 0.3) } ?? speedFactor
                             self.measuredSpeedFactor = averaged
                             UserDefaults.standard.set(averaged, forKey: self.processingSpeedKey)
-                            self.logger.info("实测速度系数: \(String(format: "%.2f", speedFactor)), 滑动平均: \(String(format: "%.2f", averaged))")
+                            self.logger.info("实测速度系数: \(String(format: "%.2f", speedFactor, privacy: .public)), 滑动平均: \(String(format: "%.2f", averaged, privacy: .public))")
                         }
                     }
                     // 处理完成，结束后台任务

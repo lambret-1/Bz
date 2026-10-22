@@ -45,9 +45,9 @@ final class PixelBufferPool {
 
         if status == kCVReturnSuccess, let newPool = newPool {
             self.pool = newPool
-            logger.info("PixelBufferPool 创建成功: \(width)x\(height), 最小\(minBufferCount)个缓冲区")
+            logger.info("PixelBufferPool 创建成功: \(width, privacy: .public)x\(height, privacy: .public), 最小\(minBufferCount, privacy: .public)个缓冲区")
         } else {
-            logger.error("PixelBufferPool 创建失败，状态码: \(status)")
+            logger.error("PixelBufferPool 创建失败，状态码: \(status, privacy: .public)")
         }
     }
 
@@ -63,7 +63,7 @@ final class PixelBufferPool {
         let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
 
         if status != kCVReturnSuccess {
-            logger.error("从池中获取缓冲区失败，状态码: \(status)")
+            logger.error("从池中获取缓冲区失败，状态码: \(status, privacy: .public)")
             return nil
         }
 

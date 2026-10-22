@@ -43,7 +43,7 @@ final class FastSRGANEngine: SuperResolutionEngine {
         }
         self.model = model
 
-        logger.info("PiperSR 全帧引擎初始化成功，输入: \(self.inputWidth)x\(self.inputHeight)，输出: \(self.inputWidth * 2)x\(self.inputHeight * 2)")
+        logger.info("PiperSR 全帧引擎初始化成功，输入: \(self.inputWidth, privacy: .public)x\(self.inputHeight, privacy: .public)，输出: \(self.inputWidth * 2, privacy: .public)x\(self.inputHeight * 2, privacy: .public)")
     }
 
     // MARK: - 公开方法

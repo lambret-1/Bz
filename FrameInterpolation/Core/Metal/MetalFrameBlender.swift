@@ -87,7 +87,7 @@ final class MetalFrameBlender {
 
         // 关键：检查 GPU 执行状态，失败返回 nil（调用方回退CPU），不返回黑帧
         guard commandBuffer.status == .completed, commandBuffer.error == nil else {
-            logger.error("Metal blend GPU执行失败: \(commandBuffer.error?.localizedDescription ?? "unknown"), status: \(commandBuffer.status.rawValue)")
+            logger.error("Metal blend GPU执行失败: \(commandBuffer.error?.localizedDescription ?? "unknown", privacy: .public), status: \(commandBuffer.status.rawValue, privacy: .public)")
             return nil
         }
 

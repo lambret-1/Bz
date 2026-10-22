@@ -35,7 +35,7 @@ final class MetalComputeHelper {
         if status == kCVReturnSuccess {
             self.textureCache = cache
         }
-        logger.info("MetalComputeHelper 初始化成功，设备: \(device.name)")
+        logger.info("MetalComputeHelper 初始化成功，设备: \(device.name, privacy: .public)")
     }
 
     /// 从 CVPixelBuffer 的 IOSurface 创建 MTLTexture（零拷贝，推荐用于输入/输出帧）
