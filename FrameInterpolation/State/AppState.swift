@@ -10,6 +10,10 @@ final class AppState: ObservableObject {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "AppState")
     private let pipeline = VideoPipeline()
     private let recentRecordsKey = "BzRecentRecords"
+    /// 性能监控器（处理中页面显示 CPU/内存）
+    let performanceMonitor = PerformanceMonitor()
+    /// 图片超分服务（全局单例，避免SwiftUI body重算时反复加载模型）
+    let imageSRService = ImageSuperResolutionService()
 
     // MARK: - 后台任务管理（统一在AppState，避免ProcessingView dismiss后丢失保护）
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
@@ -36,6 +40,12 @@ final class AppState: ObservableObject {
     @Published var frameMultiplier: FrameMultiplier = .x2
     @Published var outputResolution: OutputResolution = .auto
     @Published var fastMode: Bool = false
+    /// 处理模式：补帧或超分（二者互斥）
+    @Published var selectedMode: PipelineMode = .interpolation(.x2)
+    /// 超分引擎类型（仅超分模式生效）
+    @Published var superResolutionEngine: SuperResolutionEngineType = .fastSRGAN
+    /// 超分放大倍数（1-4x 可调，仅超分模式生效）
+    @Published var superResolutionScale: SuperResolutionScale = .x4
 
     // MARK: - 处理中
     @Published var progress: Double = 0
@@ -44,6 +54,8 @@ final class AppState: ObservableObject {
     @Published var stage: ProcessingStage = .idle
     /// 预计剩余时间（秒），基于已用时间和进度估算
     @Published var estimatedRemaining: TimeInterval = 0
+    /// 进度轮询定时器（每 0.5s 从 pipeline 读取原子进度，避免高频主线程回调）
+    private var progressTimer: Timer?
 
     // MARK: - 结果
     /// 输出视频 URL，非空时展示结果页
@@ -54,6 +66,18 @@ final class AppState: ObservableObject {
     @Published var debugInfo: String = ""
     /// 是否使用AI插值（模型加载成功）
     var isUsingAI: Bool { pipeline.isUsingAIInterpolation }
+
+    // MARK: - 处理统计（结果页展示）
+    /// 总耗时（秒）
+    @Published var totalElapsedSeconds: Double = 0
+    /// CPU 平均使用率（%）
+    @Published var cpuAverage: Double = 0
+    /// CPU 峰值使用率（%）
+    @Published var cpuPeak: Double = 0
+    /// 内存平均占用（MB）
+    @Published var memoryAverageMB: Double = 0
+    /// 内存峰值占用（MB）
+    @Published var memoryPeakMB: Double = 0
 
     // MARK: - Toast
     @Published var toastMessage: String?
@@ -73,7 +97,9 @@ final class AppState: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] note in
-            self?.debugInfo = note.object as? String ?? ""
+            Task { @MainActor in
+                self?.debugInfo = note.object as? String ?? ""
+            }
         }
     }
 
@@ -83,9 +109,9 @@ final class AppState: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: recentRecordsKey) else { return }
         do {
             recentRecords = try JSONDecoder().decode([RecentRecord].self, from: data)
-            logger.info("加载最近记录: \(self.recentRecords.count) 条")
+            logger.info("加载最近记录: \(self.recentRecords.count, privacy: .public) 条")
         } catch {
-            logger.error("加载最近记录失败: \(error.localizedDescription)")
+            logger.error("加载最近记录失败: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -94,7 +120,7 @@ final class AppState: ObservableObject {
             let data = try JSONEncoder().encode(recentRecords)
             UserDefaults.standard.set(data, forKey: recentRecordsKey)
         } catch {
-            logger.error("保存最近记录失败: \(error.localizedDescription)")
+            logger.error("保存最近记录失败: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -109,24 +135,92 @@ final class AppState: ObservableObject {
             let uiImage = UIImage(cgImage: cgImage)
             return uiImage.jpegData(compressionQuality: 0.6)
         } catch {
-            logger.error("生成缩略图失败: \(error.localizedDescription)")
+            logger.error("生成缩略图失败: \(error.localizedDescription, privacy: .public)")
             return nil
         }
     }
 
     /// 追加最近记录（处理成功后调用）
-    private func appendRecentRecord(outputURL: URL, outputFPS: Double) {
+    private func appendRecentRecord(
+        outputURL: URL,
+        outputFPS: Double,
+        processingMode: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        duration: TimeInterval
+    ) {
         let thumbnail = generateThumbnail(from: outputURL)
+        let fileSizeMB = (try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+            .map { Double($0) / (1024 * 1024) }
         let record = RecentRecord(
             fileName: outputURL.lastPathComponent,
             outputFPS: outputFPS,
-            thumbnailData: thumbnail
+            thumbnailData: thumbnail,
+            processingMode: processingMode,
+            outputWidth: outputWidth,
+            outputHeight: outputHeight,
+            fileSizeMB: fileSizeMB,
+            duration: duration,
+            outputPath: outputURL.path
         )
         recentRecords.insert(record, at: 0)
         // 最多保留 20 条
         if recentRecords.count > 20 {
             recentRecords = Array(recentRecords.prefix(20))
         }
+        saveRecentRecords()
+    }
+
+    /// 重播最近记录（输出文件仍存在时直接展示结果页，否则提示重新导入）
+    func replayRecentRecord(_ record: RecentRecord) {
+        if let path = record.outputPath,
+           FileManager.default.fileExists(atPath: path) {
+            outputURL = URL(fileURLWithPath: path)
+            processingMode = record.processingMode ?? "已处理视频"
+            logger.info("重播最近记录: \(record.fileName, privacy: .public)")
+        } else {
+            showToast("原文件已被清理，请重新导入视频", style: .warning)
+            logger.info("最近记录文件已清理: \(record.fileName, privacy: .public)")
+        }
+    }
+
+    /// 删除指定最近记录
+    func deleteRecentRecord(_ record: RecentRecord) {
+        recentRecords.removeAll { $0.id == record.id }
+        saveRecentRecords()
+    }
+
+    /// 重命名最近记录
+    func renameRecord(_ record: RecentRecord, newName: String) {
+        guard let idx = recentRecords.firstIndex(where: { $0.id == record.id }) else { return }
+        recentRecords[idx].displayName = newName
+        saveRecentRecords()
+    }
+
+    /// 用已处理视频作为输入，再次增强
+    func enhanceRecord(_ record: RecentRecord) {
+        guard let path = record.outputPath,
+              FileManager.default.fileExists(atPath: path) else {
+            showToast("原文件已被清理", style: .warning)
+            return
+        }
+        let url = URL(fileURLWithPath: path)
+        logger.info("从最近记录重新增强: \(record.fileName, privacy: .public)")
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            do {
+                let info = try await MediaImporter.loadVideoInfo(from: url)
+                self.selectedVideo = info
+                self.showSettings = true
+            } catch {
+                self.showToast("无法读取视频: \(error.localizedDescription)", style: .error)
+            }
+        }
+    }
+
+    /// 清空所有最近记录
+    func clearAllRecentRecords() {
+        recentRecords.removeAll()
         saveRecentRecords()
     }
 
@@ -137,13 +231,14 @@ final class AppState: ObservableObject {
         logger.info("开始导入视频: \(url.lastPathComponent, privacy: .public)")
         stage = .decoding
 
-        Task {
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
             do {
                 let info = try await MediaImporter.loadVideoInfo(from: url)
                 self.selectedVideo = info
                 self.showSettings = true
                 self.stage = .idle
-                logger.info("视频导入成功: \(info.fileName, privacy: .public), \(info.width)x\(info.height), \(info.originalFPS)fps")
+                logger.info("视频导入成功: \(info.fileName, privacy: .public), \(info.width, privacy: .public)x\(info.height, privacy: .public), \(info.originalFPS, privacy: .public)fps")
             } catch {
                 self.stage = .idle
                 self.showToast(error.localizedDescription, style: .error)
@@ -154,20 +249,35 @@ final class AppState: ObservableObject {
 
     // MARK: - 开始处理
 
-    /// 启动视频处理管线（补帧 + 音频透传，模型缺失时自动降级为空转）
+    /// 启动视频处理管线（补帧或超分，二者互斥，模型缺失时自动降级）
     func startProcessing() {
         guard let video = selectedVideo else {
             showToast("未选择视频", style: .error)
             return
         }
 
-        logger.info("开始处理: \(video.fileName, privacy: .public), 倍数\(self.frameMultiplier.label)")
+        // 确保 selectedMode 与当前选择同步
+        let mode: PipelineMode
+        switch selectedMode {
+        case .interpolation:
+            mode = .interpolation(frameMultiplier)
+        case .superResolution:
+            mode = .superResolution(superResolutionEngine, superResolutionScale)
+        }
+
+        logger.info("开始处理: \(video.fileName, privacy: .public), 模式:\(mode.displayName, privacy: .public)")
 
         isProcessing = true
         progress = 0
         processedFrames = 0
+        // 根据视频时长和帧率计算总帧数，用于进度页显示"已处理 X / Y 帧"
+        totalFrames = max(Int((video.duration * video.originalFPS).rounded()), 1)
         stage = .decoding
         processingStartTime = Date()
+
+        // 启动性能监控（处理中页面显示 CPU/内存）
+        performanceMonitor.resetStatistics()
+        performanceMonitor.start()
 
         // 统一申请后台任务，处理全程持有（包括最小化到首页）
         beginBackgroundTask()
@@ -177,24 +287,45 @@ final class AppState: ObservableObject {
             .appendingPathComponent("output_\(UUID().uuidString).mp4")
         self.outputURL = nil
 
-        pipeline.process(
-            inputURL: video.url,
-            outputURL: outputURL,
-            multiplier: frameMultiplier.rawValue,
-            fastMode: fastMode,
-            outputResolution: outputResolution,
-            progress: { [weak self] value, stage in
+        // 启动进度轮询定时器（每 0.5s 从 pipeline 读取原子进度，避免高频主线程回调）
+        progressTimer?.invalidate()
+        progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
                 guard let self = self else { return }
+                let (value, stage) = self.pipeline.pollProgress()
                 self.progress = value
                 self.stage = stage
-                // 基于已用时间和进度估算剩余时间
+                if self.totalFrames > 0 {
+                    self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
+                }
                 if let start = self.processingStartTime, value > 0.01 {
                     let elapsed = Date().timeIntervalSince(start)
                     self.estimatedRemaining = elapsed * (1.0 - value) / value
                 }
+            }
+        }
+
+        pipeline.process(
+            inputURL: video.url,
+            outputURL: outputURL,
+            mode: mode,
+            fastMode: fastMode,
+            outputResolution: outputResolution,
+            progress: { [weak self] value, stage in
+                // 进度防抖：循环中不再调用此闭包，仅完成时可能调用 1.0
+                guard let self = self else { return }
+                self.progress = value
+                self.stage = stage
             },
             completion: { [weak self] result in
                 guard let self = self else { return }
+
+                // 停止进度轮询定时器
+                self.progressTimer?.invalidate()
+                self.progressTimer = nil
+
+                // 停止性能监控
+                self.performanceMonitor.stop()
 
                 switch result {
                 case .success(let url):
@@ -202,14 +333,65 @@ final class AppState: ObservableObject {
                     self.progress = 1.0
                     self.estimatedRemaining = 0
                     self.outputURL = url
-                    self.processingMode = self.pipeline.isUsingAIInterpolation
-                        ? "AI补帧（\(self.frameMultiplier.label)）"
-                        : "空转管线（帧率不变）"
-                    // 追加最近记录
-                    let outputFPS = (self.selectedVideo?.originalFPS ?? 30) * Double(self.frameMultiplier.rawValue)
-                    self.appendRecentRecord(outputURL: url, outputFPS: outputFPS)
+
+                    // 记录处理统计（总耗时、CPU/内存平均与峰值）
+                    if let start = self.processingStartTime {
+                        self.totalElapsedSeconds = Date().timeIntervalSince(start)
+                    }
+                    self.cpuAverage = self.performanceMonitor.cpuAverage
+                    self.cpuPeak = self.performanceMonitor.cpuPeak
+                    self.memoryAverageMB = self.performanceMonitor.memoryAverage
+                    self.memoryPeakMB = self.performanceMonitor.memoryPeak
+
+                    // 根据实际模式设置处理描述
+                    switch mode {
+                    case .interpolation:
+                        self.processingMode = self.pipeline.isUsingAIInterpolation
+                            ? "AI补帧（\(self.frameMultiplier.label)）"
+                            : "空转管线（帧率不变）"
+                    case .superResolution(let engineType, let scale):
+                        self.processingMode = "AI超分（\(engineType.shortName) \(scale.label)）"
+                    }
+
+                    // 追加最近记录（超分模式帧率不变）
+                    let outputFPS: Double
+                    switch mode {
+                    case .interpolation:
+                        outputFPS = (self.selectedVideo?.originalFPS ?? 30) * Double(self.frameMultiplier.rawValue)
+                    case .superResolution:
+                        outputFPS = self.selectedVideo?.originalFPS ?? 30
+                    }
+
+                    // 读取输出视频元数据（异步加载）
+                    Task { @MainActor in
+                        let outputAsset = AVURLAsset(url: url)
+                        let outputTracks = try? await outputAsset.loadTracks(withMediaType: .video)
+                        let outputTrack = outputTracks?.first
+                        let outputSize = try? await outputTrack?.load(.naturalSize)
+                        let outputTransform = try? await outputTrack?.load(.preferredTransform)
+                        let outputFinalSize = outputSize?.applying(outputTransform ?? .identity) ?? .zero
+                        let outputWidth = Int(abs(outputFinalSize.width))
+                        let outputHeight = Int(abs(outputFinalSize.height))
+                        let dur = try? await outputAsset.load(.duration)
+                        let outputDuration = dur?.seconds ?? 0
+
+                        self.appendRecentRecord(
+                            outputURL: url,
+                            outputFPS: outputFPS,
+                            processingMode: self.processingMode,
+                            outputWidth: outputWidth,
+                            outputHeight: outputHeight,
+                            duration: outputDuration
+                        )
+                    }
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
+                    // 处理完成发本地通知（用户切后台时能收到）
+                    self.sendBackgroundNotification(
+                        title: "处理完成",
+                        body: "视频已处理完成，点击查看结果",
+                        identifier: "bz_process_complete"
+                    )
                     // 记录本机实测处理速度系数（视频时长/实际耗时）
                     if let start = self.processingStartTime,
                        let videoDuration = self.selectedVideo?.duration,
@@ -221,7 +403,7 @@ final class AppState: ObservableObject {
                             let averaged = self.measuredSpeedFactor.map { ($0 * 0.7) + (speedFactor * 0.3) } ?? speedFactor
                             self.measuredSpeedFactor = averaged
                             UserDefaults.standard.set(averaged, forKey: self.processingSpeedKey)
-                            self.logger.info("实测速度系数: \(String(format: "%.2f", speedFactor)), 滑动平均: \(String(format: "%.2f", averaged))")
+                            self.logger.info("实测速度系数: \(String(format: "%.2f", speedFactor), privacy: .public), 滑动平均: \(String(format: "%.2f", averaged), privacy: .public)")
                         }
                     }
                     // 处理完成，结束后台任务
@@ -254,6 +436,7 @@ final class AppState: ObservableObject {
 
     func cancelProcessing() {
         pipeline.cancel()
+        performanceMonitor.stop()
         isProcessing = false
         isProcessingMinimized = false
         stage = .idle
@@ -308,21 +491,25 @@ final class AppState: ObservableObject {
         // 任务完成后（outputURL != nil）不再发后台通知
         guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
         sendBackgroundNotification(
-            title: "补帧处理中",
-            body: "你刚切到后台，处理将继续约30秒，点我回到App继续",
+            title: "视频处理中",
+            body: "为避免处理中断，建议保持App在前台，后台可能被系统暂停",
             identifier: "bz_bg_warning"
         )
     }
 
-    /// 后台时间即将耗尽时调用
+    /// 后台时间即将耗尽时调用（只记录日志，不发通知避免频繁打扰）
     func backgroundTimeExpiring() {
-        // 任务完成后不再发通知
         guard (isProcessing || isProcessingMinimized) && outputURL == nil else { return }
-        sendBackgroundNotification(
-            title: "补帧即将暂停",
-            body: "系统马上要挂起任务，点我回来继续处理",
-            identifier: "bz_bg_expiring"
-        )
+        logger.warning("后台任务时间即将耗尽，处理可能被系统中断")
+    }
+
+    /// 应用回到前台时调用，检查处理状态
+    func applicationWillEnterForeground() {
+        // 如果处理失败（后台被系统杀死），提示用户
+        if stage == .failed {
+            showToast("后台处理被系统中断，请重新开始", style: .warning)
+            logger.warning("应用回到前台，检测到处理失败（可能后台被系统中断）")
+        }
     }
 
     private func sendBackgroundNotification(title: String, body: String, identifier: String) {
@@ -350,6 +537,9 @@ final class AppState: ObservableObject {
         isProcessingMinimized = false
         showSettings = false
         selectedVideo = nil
+        selectedMode = .interpolation(.x2)
+        superResolutionEngine = .fastSRGAN
+        superResolutionScale = .x4
         stage = .idle
         progress = 0
         processedFrames = 0

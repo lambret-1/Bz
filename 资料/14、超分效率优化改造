@@ -1,0 +1,519 @@
+超分效率优化改造
+
+当前超分 4x 处理 124 帧需 611 秒（约 5 秒/帧），CPU 仅 27%，根因是解码与推理串行无重叠、音频二次编码、瓦片调度开销大。本文档给出分阶段改造方案，预期综合提升 50-70%。
+
+---
+
+1. 现状瓶颈分析
+
+```
+当前流程（串行）：
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│ 解码一帧  │──▶│ AI推理一帧│──▶│ 编码一帧  │──▶│ 下一帧    │
+│ (IO空闲) │   │ (IO等待) │   │ (推理等待)│   │          │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘
+                          ↑
+                     音频 ExportSession 二次编码（视频再跑一遍）
+```
+
+五大瓶颈：
+
+| 编号 | 瓶颈 | 影响 | 严重度 |
+|------|------|------|--------|
+| B1 | 解码与推理串行，CPU 空转等 ANE | 吞吐量上不去 | ★★★★★ |
+| B2 | AVAssetExportSession 音频合成导致视频二次编码 | 总时间 +30-40% | ★★★★★ |
+| B3 | 128×128 瓦片，1080p 需 135 次 CoreML 调用/帧 | ANE 调度开销 1s+/帧 | ★★★★☆ |
+| B4 | 每帧新建 CVPixelBuffer，内存分配开销 | 延迟抖动、内存碎片 | ★★★☆☆ |
+| B5 | 每 0.5% 帧 DispatchQueue.main.async 回调 | 主线程频繁打断 | ★★☆☆☆ |
+
+---
+
+2. 改造目标
+
+· 124 帧 720p 4x 超分：从 611 秒降至 250-300 秒
+· CPU 利用率：从 27% 提升至 60%+
+· 内存峰值：控制在 500MB 以内（iPhone 8 Plus 安全线）
+· 进度更新：从 200 次/视频降至 ~20 次/视频
+
+---
+
+3. 第一阶段：低风险高收益（预计提升 30-40%）
+
+### 3.1 音频直写 AVAssetWriter（消除 B2）
+
+当前流程：写无声临时视频 → AVAssetExportSession 合成音频（视频重编码）
+改造后：AVAssetWriter 同时写 videoInput 和 audioInput，一次编码完成
+
+实现要点：
+
+```swift
+// VideoPipeline.swift 中新增音频输入
+private var audioWriterInput: AVAssetWriterInput?
+private var audioReaderOutput: AVAssetReaderTrackOutput?
+
+// 配置 Writer 时增加音频轨
+func configureAudioWriter(asset: AVAsset) throws {
+    guard let audioTrack = try? asset.loadTracks(withMediaType: .audio).first else { return }
+
+    let audioOutput = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: nil)
+    audioOutput.alwaysCopiesSampleData = false
+    guard reader.canAdd(audioOutput) else { return }
+    reader.add(audioOutput)
+    audioReaderOutput = audioOutput
+
+    let audioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+    audioInput.expectsMediaDataInRealTime = false
+    guard writer.canAdd(audioInput) else { return }
+    writer.add(audioInput)
+    audioWriterInput = audioInput
+}
+```
+
+音频编码队列（独立于视频编码队列）：
+
+```swift
+private let audioEncodeQueue = DispatchQueue(label: "com.lambret.bz.audio.encode", qos: .userInitiated)
+
+func startAudioEncoding() {
+    guard let audioInput = audioWriterInput, let audioOutput = audioReaderOutput else { return }
+
+    audioInput.requestMediaDataWhenReady(on: audioEncodeQueue) { [weak self] in
+        guard let self = self else { return }
+        while audioInput.isReadyForMoreMediaData {
+            guard let sample = audioOutput.copyNextSampleBuffer() else {
+                audioInput.markAsFinished()
+                return
+            }
+            audioInput.append(sample)
+        }
+    }
+}
+```
+
+注意事项：
+· 音频 outputSettings 传 nil 表示透传原格式（不重编码）
+· 音频和视频的 writer.startWriting() 只需调用一次
+· 完成等待：videoInput.markAsFinished() 和 audioInput.markAsFinished() 都调用后再 writer.finishWriting()
+
+⚠️ PTS 同步（极易踩坑）：
+· 超分模式帧率不变，**视频 PTS 必须直接透传原 sample buffer 的时间戳**，禁止用 frameIndex/outputFPS 重新计算
+· 音频 PTS 同样直接透传，音视频时间戳同源即可保证同步
+· 补帧模式帧率变化时，视频 PTS 重新计算后，音频 PTS 需用 CMSampleBufferSetOutputPresentationTimeStamp 整体平移对齐
+· 第一帧音视频起点必须一致（通常都是 kCMTimeZero 或原始时间戳），否则 writer.finishWriting() 会报错或音画不同步
+
+⚠️ 音频起始 PTS 非零（剪辑/拼接视频）：
+· 部分视频的音频轨起始 PTS 不是 0（经过快速剪辑或拼接），直接透传会导致 writer.finishWriting 报 Cannot Decode
+· 修正：写入前获取 asset.timeRange.start，音视频第一帧 PTS 统一用 CMTimeSubtract(pts, startTime) 平移到从 0 开始
+· 视频和音频必须用同一个 startTime 偏移，保持相对对齐
+
+### 3.2 进度回调防抖（消除 B5）
+
+当前：每处理 0.5% 帧 DispatchQueue.main.async { progress = ... }
+改造后：原子变量记录进度，Timer 每 0.5 秒读取并刷新 UI
+
+```swift
+// ProcessingView 或 AppState 中
+// iOS 16+ 推荐 OSAllocatedUnfairLock，开销仅为 NSLock 的几十分之一
+private let progressLock = OSAllocatedUnfairLock(initialState: 0.0)
+private var progressTimer: Timer?
+
+var progress: Double {
+    progressLock.withLock { $0 }
+}
+
+func updateProgress(_ value: Double) {
+    progressLock.withLock { $0 = value }
+}
+
+// 启动时开启定时器
+func startProgressTimer() {
+    progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+        guard let self = self else { return }
+        let p = self.progress
+        DispatchQueue.main.async {
+            self.appState.progress = p
+        }
+    }
+}
+
+// 解码/推理循环中只更新原子变量，不切主线程
+frameIndex += 1
+updateProgress(Double(frameIndex) / Double(totalFrames))
+```
+
+### 3.3 CVPixelBufferPool 复用（消除 B4）
+
+为三种尺寸分别创建缓冲池：
+· 输入池：reader 输出尺寸（如 1280×720）
+· AI 输出池：4x 尺寸（如 5120×2880）
+· 最终输出池：outputWidth × outputHeight
+
+```swift
+final class PixelBufferPool {
+    private let pool: CVPixelBufferPool
+
+    // minBufferCount 必须足够大：三队列流水线中 inputPool 至少需要
+    // Reader处理中1 + 队列A积压4 + Inference处理中1 + 余量 = 至少6个
+    // 给 12 确保不枯竭，CVPixelBufferPool 内存吃紧时会自动回收
+    init(width: Int, height: Int, pixelFormat: OSType = kCVPixelFormatType_32BGRA, minBufferCount: Int = 12) {
+        let poolAttributes: [String: Any] = [
+            kCVPixelBufferPoolMinimumBufferCountKey as String: minBufferCount
+        ]
+        let bufferAttributes: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+        ]
+        var pool: CVPixelBufferPool?
+        CVPixelBufferPoolCreate(nil, poolAttributes as CFDictionary, bufferAttributes as CFDictionary, &pool)
+        self.pool = pool!
+    }
+
+    func create() -> CVPixelBuffer? {
+        var buffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
+        return buffer
+    }
+}
+```
+
+使用方式：
+
+```swift
+// VideoPipeline 中持有三个池
+private var inputPool: PixelBufferPool?
+private var aiOutputPool: PixelBufferPool?
+private var outputPool: PixelBufferPool?
+
+// 初始化时创建
+inputPool = PixelBufferPool(width: Int(naturalWidth), height: Int(naturalHeight))
+aiOutputPool = PixelBufferPool(width: Int(naturalWidth * 4), height: Int(naturalHeight * 4))
+outputPool = PixelBufferPool(width: Int(outputWidth), height: Int(outputHeight))
+
+// 循环中从池取 buffer，不再 CVPixelBufferCreate
+guard let outputBuffer = outputPool?.create() else { break }
+```
+
+⚠️ 深拷贝也必须用池（性能暗坑）：
+· alwaysCopiesSampleData=false 时，copyNextSampleBuffer 返回的 buffer 可能被 reader 复用，必须深拷贝
+· 禁止每次 malloc 新建 buffer，应从 inputPool 取 buffer 后用 memcpy/vImageCopyBuffer 拷贝数据
+· 深拷贝实现：
+
+```swift
+func deepCopyWithPool(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+    guard let dest = inputPool?.create() else { return nil }
+    CVPixelBufferLockBaseAddress(source, .readOnly)
+    CVPixelBufferLockBaseAddress(dest, [])
+    defer {
+        CVPixelBufferUnlockBaseAddress(source, .readOnly)
+        CVPixelBufferUnlockBaseAddress(dest, [])
+    }
+    guard let srcAddr = CVPixelBufferGetBaseAddress(source),
+          let dstAddr = CVPixelBufferGetBaseAddress(dest) else { return nil }
+
+    // ⚠️ Stride 越界陷阱：源和目标的 bytesPerRow 可能因内存对齐而不同
+    // 必须分别读取，不能用 source 的 stride 直接拷贝到 dest
+    let height = CVPixelBufferGetHeight(source)
+    let srcBytesPerRow = CVPixelBufferGetBytesPerRow(source)
+    let dstBytesPerRow = CVPixelBufferGetBytesPerRow(dest)
+
+    if srcBytesPerRow == dstBytesPerRow {
+        // stride 相同，一键全拷（最快）
+        memcpy(dstAddr, srcAddr, height * srcBytesPerRow)
+    } else {
+        // stride 不同，必须逐行拷贝，每行取较小的宽度
+        for row in 0..<height {
+            memcpy(dstAddr + row * dstBytesPerRow,
+                   srcAddr + row * srcBytesPerRow,
+                   min(srcBytesPerRow, dstBytesPerRow))
+        }
+    }
+    return dest
+}
+```
+
+---
+
+4. 第二阶段：架构改造（预计提升 20-30%）
+
+### 4.1 拆分 ReaderQueue 和 InferenceQueue（消除 B1）
+
+当前：decodeQueue 中 copyNextSampleBuffer → engine.upscale → enqueue 串行
+改造后：四队列流水线（InferenceQueue 只做推理，不混入 CPU 缩放）
+
+```
+┌─────────────┐   ┌──────────────┐   ┌────────────────┐   ┌─────────────┐
+│ ReaderQueue │──▶│ InferenceQueue│──▶│PostProcessQueue│──▶│ EncodeQueue │
+│ 读帧+深拷贝  │   │  仅AI超分     │   │  vImage缩放     │   │  写入编码器  │
+│ (IO密集)    │   │ (ANE密集)    │   │  (CPU密集)     │   │ (编码密集)  │
+└─────────────┘   └──────────────┘   └────────────────┘   └─────────────┘
+      │                  │                   │                  │
+      ▼                  ▼                   ▼                  ▼
+  BoundedQueue A     BoundedQueue B      BoundedQueue C      writer
+  (容量 4)          (容量 6)            (容量 6)
+```
+
+⚠️ ANE 饿死陷阱：InferenceQueue 绝对不能混入 scaleToOutput（vImage CPU 缩放）。
+否则 ANE 算完一帧后必须等 CPU 缩图完成才取下一帧，ANE 空转。缩放必须移到 PostProcessQueue。
+
+```swift
+private let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
+private let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)
+private let postProcessQueue = DispatchQueue(label: "com.lambret.bz.sr.postprocess", qos: .userInitiated)
+
+// ReaderQueue：只负责读帧和深拷贝
+func runReader() {
+    readerQueue.async { [weak self] in
+        guard let self = self else { return }
+        var frameIndex = 0
+        while !self.isCancelled {
+            guard let sample = self.videoReaderOutput?.copyNextSampleBuffer() else { break }
+            guard let pixelBuffer = CMSampleBufferGetImageBuffer(sample) else { continue }
+
+            // alwaysCopiesSampleData=false 时必须深拷贝，否则 buffer 会被 reader 复用
+            guard let copiedBuffer = self.deepCopyWithPool(pixelBuffer) else { continue }
+
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            // 放入 Reader→Inference 队列
+            if !self.readerToInferenceQueue.enqueue((copiedBuffer, pts, frameIndex)) {
+                break // 被取消
+            }
+            frameIndex += 1
+        }
+        self.readerToInferenceQueue.close()
+    }
+}
+
+// InferenceQueue：只负责 AI 推理，绝不混入 CPU 缩放（防止 ANE 饿死）
+func runInference() {
+    inferenceQueue.async { [weak self] in
+        guard let self = self else { return }
+        while !self.isCancelled {
+            guard let (pixelBuffer, pts, frameIndex) = self.readerToInferenceQueue.dequeue() else { break }
+
+            autoreleasepool {
+                // 只做 AI 超分，4x 输出
+                let result = self.engine?.upscale(pixelBuffer) ?? self.scalePixelBuffer(pixelBuffer, scale: 4)
+                // 放入 Inference→PostProcess 队列，缩放交给 PostProcessQueue
+                _ = self.inferenceToPostQueue.enqueue((result, pts, frameIndex))
+            }
+
+            // 只更新原子进度，不切主线程
+            self.updateProgress(Double(frameIndex) / Double(self.totalFrames))
+        }
+        self.inferenceToPostQueue.close()
+    }
+}
+
+// PostProcessQueue：只负责 vImage 缩放到最终输出尺寸
+func runPostProcess() {
+    postProcessQueue.async { [weak self] in
+        guard let self = self else { return }
+        while !self.isCancelled {
+            guard let (pixelBuffer, pts, frameIndex) = self.inferenceToPostQueue.dequeue() else { break }
+
+            autoreleasepool {
+                // 合并缩放：AI 4x 输出一次性缩放到最终 outputWidth/outputHeight
+                let final = self.scaleToOutput(pixelBuffer)
+                // 放入 PostProcess→Encode 队列
+                _ = self.postToEncodeQueue.enqueue((final, pts, frameIndex))
+            }
+        }
+        self.postToEncodeQueue.close()
+    }
+}
+```
+
+⚠️ 取消时的死锁陷阱（必须处理）：
+· BoundedQueue 的 enqueue 和 dequeue 都会阻塞，用户点取消时必须唤醒所有阻塞线程
+· 队列必须提供 cancel() 方法，内部调用 condition.broadcast() 唤醒所有等待者
+· 取消路径：用户点取消 → isCancelled=true → 两个队列都调用 cancel() → 阻塞的 enqueue/dequeue 被唤醒 → 检查 isCancelled 后返回 false/nil → 各队列自然退出
+· 禁止只设 isCancelled 而不 broadcast，否则线程永远卡在 wait() 导致内存泄漏和后台任务无法结束
+
+```swift
+// BoundedQueue 必须实现的取消方法
+func cancel() {
+    condition.lock()
+    isCancelled = true
+    condition.broadcast()  // 唤醒所有阻塞在 enqueue 和 dequeue 的线程
+    condition.unlock()
+}
+```
+
+### 4.2 队列容量调整 + autoreleasepool
+
+四队列架构下的容量配置：
+· Reader→Inference 队列容量 4（输入帧，较小）
+· Inference→PostProcess 队列容量 6（AI 4x 输出帧，较大）
+· PostProcess→Encode 队列容量 10（最终输出帧，编码背压缓冲）
+· 每帧推理和后处理都包裹 autoreleasepool，防止 CoreML/vImage 临时对象堆积
+
+```swift
+// 容量计算依据：1080p 4x 输出每帧 ~33MB
+// Post→Encode 10帧 = 330MB，Inference→Post 6帧 = 198MB，总计 ~530MB（含输入帧余量）
+let readerToInferenceQueue = BoundedQueue<RawFrame>(capacity: 4)
+let inferenceToPostQueue = BoundedQueue<AIOutputFrame>(capacity: 6)
+let postToEncodeQueue = BoundedQueue<ProcessedFrame>(capacity: 10)
+
+// 每个队列的每帧处理都包裹 autoreleasepool
+autoreleasepool {
+    let upscaled = engine.upscale(pixelBuffer)
+    _ = inferenceToPostQueue.enqueue((upscaled, pts, frameIndex))
+}
+```
+
+---
+
+5. 第三阶段：算法与模型优化（预计提升 20-50%）
+
+### 5.1 合并缩放（消除冗余 vImage）
+
+当前：AI 4x 输出 → 如果 targetScale<4x 先缩回 → 如果 needsScaling 再缩放到 outputResolution
+改造后：AI 4x 输出 → 一次性缩放到最终 outputWidth/outputHeight
+
+```swift
+func scaleToOutput(_ buffer: CVPixelBuffer) -> CVPixelBuffer? {
+    let targetWidth = Int(outputWidth)
+    let targetHeight = Int(outputHeight)
+    let sourceWidth = CVPixelBufferGetWidth(buffer)
+    let sourceHeight = CVPixelBufferGetHeight(buffer)
+
+    // 尺寸相同直接返回
+    if sourceWidth == targetWidth && sourceHeight == targetHeight {
+        return buffer
+    }
+
+    guard let outputBuffer = outputPool?.create() else { return nil }
+    // vImage 一次性缩放
+    var sourceBuffer = vImage_Buffer()
+    var destBuffer = vImage_Buffer()
+    // ... vImageScale_ARGB8888 一次性缩放
+    return outputBuffer
+}
+```
+
+### 5.2 模型重转：256×256 输入尺寸（消除 B3）
+
+当前：128×128 瓦片，1080p 需 135 次/帧
+改造后：256×256 瓦片，1080p 需 (1920/256)×(1080/256) = 8×5 = 40 次/帧，调度开销降 70%
+
+转换脚本修改（Scripts/convert_fast_srgan.py）：
+
+```python
+# 将输入尺寸从 128 改为 256
+input_shape = (1, 3, 256, 256)
+mlmodel = ct.convert(
+    torch_model,
+    inputs=[ct.ImageType(name="input", shape=input_shape, scale=1/255.0)],
+    outputs=[ct.ImageType(name="output", scale=1/255.0)],
+    compute_precision=ct.precision.FLOAT16,
+    minimum_deployment_target=ct.target.iOS16
+)
+```
+
+注意：
+· 模型权重不变，只改输入尺寸，需验证卷积层 padding 是否正确
+· 256×256 单次推理内存是 128×128 的 4 倍，需确认 ANE 内存足够
+· Fast-SRGAN 模型较小（1.9MB），256×256 应该没问题
+· Real-ESRGAN 模型较大，建议先保持 128×128
+
+### 5.3（可选）Metal 瓦片拼接
+
+当前瓦片拼接在 CPU 上 memcpy，4x 输出 33MB/帧
+改造后用 MTLBlitCommandEncoder 做 GPU 端拷贝
+
+### 5.4（可选）NV12 输入 + Metal 色彩转换
+
+当前：AVAssetReaderTrackOutput 强制输出 32BGRA，触发 CPU 端 NV12→BGRA 转换，消耗内存带宽
+改造后：reader outputSettings 传 nil 输出原生 NV12（420YpCbCr8BiPlanarVideoRange），用 Metal shader 做 NV12→RGB 转换后直接构造 MLMultiArray
+
+实现要点：
+· reader 输出 NV12 是 VideoToolbox 硬件解码原生格式，零 CPU 转换
+· Metal compute shader 读取 Y 平面和 UV 平面，输出 RGB 三通道到 MTLTexture
+· 从 MTLTexture 读取数据构造 MLMultiArray，或直接用 CoreML 的 CVPixelBuffer 输入（如模型支持）
+· 此优化需重写引擎预处理逻辑，风险较高，放在 256×256 模型之后做
+
+---
+
+6. 改造顺序与风险控制
+
+| 阶段 | 步骤 | 风险 | 回滚方式 | 验证标准 |
+|------|------|------|----------|----------|
+| 一 | 音频直写 | 中（音视频同步） | 保留 muxAudio 旧代码，开关切换 | 输出视频有声音、音画同步 |
+| 一 | 进度防抖 | 低 | 恢复原回调 | 进度环流畅更新 |
+| 一 | CVPixelBufferPool | 低 | 恢复 CVPixelBufferCreate | 内存峰值下降、无崩溃 |
+| 二 | 拆四队列（Reader/Inference/PostProcess/Encode） | 高（同步复杂） | 保留 runSuperResolutionAsync 旧实现 | 速度提升、无死锁、无顺序错乱、ANE 不空转 |
+| 二 | 缓冲+autoreleasepool | 低 | 调回原参数 | 内存峰值 < 500MB |
+| 三 | 合并缩放 | 低 | 恢复两次缩放 | 输出尺寸正确 |
+| 三 | 256×256 模型 | 中（模型转换） | 保留 128×128 模型文件 | 推理结果正确、速度提升 |
+
+建议：第一阶段分三步提交，每步打包验证后再做下一步，降低风险：
+1. 先做 3.2 进度防抖（零风险，解决 UI 卡顿）
+2. 再做 3.1 音频直写（收益最大，重点验证音画同步）
+3. 最后做 3.3 PixelBufferPool（涉及多线程内存，最容易出 Bug）
+第二阶段拆队列是硬骨头，确认深拷贝用池、cancel 不死锁、PTS 同步后再动手。第三阶段最后做。
+
+---
+
+7. 验证方法
+
+每阶段完成后运行以下测试：
+
+1. 功能测试：720p 视频 4x 超分，输出视频可播放、有声音、音画同步
+2. 性能测试：记录 124 帧处理总时间，对比基线 611 秒
+3. 内存测试：用 Instruments 记录内存峰值，确认 < 500MB
+4. 稳定性测试：连续处理 3 个视频，无崩溃、无内存泄漏
+5. 边界测试：1x（跳过 AI）、2x、3x、4x 各跑一次
+6. 取消测试：处理中途点取消，确认所有队列正确退出、临时文件清理
+7. B帧视频测试：用含B帧的H.264/HEVC视频测试，确认 append 返回值检查生效，无 PTS 乱序导致的写入失败
+8. 性能测试必须用 Release/Profile 包，禁止用 Debug 包测速度（Debug 无 -O 优化，memcpy/vImage 慢数倍）
+
+---
+
+8. 极端边缘场景预警（真机联调必遇）
+
+### 8.1 B帧导致 PTS 乱序
+
+· H.264/HEVC 视频大量使用 B 帧时，copyNextSampleBuffer 输出是解码顺序（DTS），PTS 可能乱序（如 0,3,1,2）
+· AVAssetWriterInput 默认 expectsMediaDataInRealTime=false 时内部会自动缓存排序，但乱序严重时 append() 会返回 false
+· **强制要求**：每次 pixelBufferAdaptor.append() 后必须检查返回值，false 时立即打印 writer.error，禁止硬塞
+· 音频 append 同样需要检查返回值
+
+### 8.2 四队列线程竞争（老机型）
+
+· Reader/Inference/PostProcess/Encode 四个串行队列，在老设备（iPhone 8 Plus 及更早）可能出现 CPU 时间片竞争
+· 缓解措施：用 QoS 区分优先级——InferenceQueue=.userInitiated，PostProcessQueue=.utility，EncodeQueue=.userInitiated
+· 禁止用 usleep() 主动降速，会降低吞吐量
+· BoundedQueue 内部锁必须轻量（NSCondition 或 os_unfair_lock），禁止用 pthread_mutex 重量级锁
+
+### 8.3 CoreML 异步推理 Buffer 生命周期
+
+· 当前使用同步 prediction()，无此问题
+· 未来若改为异步 prediction(from:options:) 配合回调，从池中取出的 Buffer 在推理回调完成前绝对不能 unlock 或还回池子
+· 否则 CoreML 读到脏数据，画面绿屏或闪烁
+
+### 8.4 Debug 与 Release 性能落差
+
+· Debug 模式无 -O 优化，memcpy、vImage、Swift 数组操作都比 Release 慢 3-10 倍
+· **性能测试必须用 Profile（Release）或 AdHoc 包**，Debug 包的速度数据无参考价值
+· Debug 模式可用于内存测试（guard 检查更完整），但速度数据以 Release 为准
+
+---
+
+9. 预期收益汇总
+
+| 阶段 | 预期提升 | 累计速度 |
+|------|----------|----------|
+| 基线 | - | 611 秒（5.0 秒/帧） |
+| 第一阶段完成 | +30-40% | 370-430 秒（3.0-3.5 秒/帧） |
+| 第二阶段完成 | +20-30% | 280-340 秒（2.3-2.7 秒/帧） |
+| 第三阶段完成 | +20-50% | 180-270 秒（1.5-2.2 秒/帧） |
+
+最终目标：124 帧 720p 4x 超分控制在 5 分钟以内。
+
+⚠️ 收益预期修正：
+· 第二阶段拆队列不会让 ANE 变快，ANE 算一帧的时间是固定的
+· 拆队列的意义是让解码 IO 和编码不再拖后腿，把这部分时间隐藏掉
+· 如果瓶颈 100% 在 AI 推理，拆队列提升可能只有 5%；如果解码编码占 30%，就能隐藏这 30%
+· 20-30% 的预估基于当前 CPU 仅 27%（说明 IO/编码有较大占比）的实测数据

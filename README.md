@@ -1,6 +1,16 @@
-# Bz — iOS 端侧视频补帧 App
+# Bz — iOS 端侧视频增强 App
 
-> 纯原生 Swift + SwiftUI，最低 iOS 16.0，完全端侧 AI 补帧（30fps → 60fps / 120fps），不上架 App Store，通过侧载分发。
+> 纯原生 Swift + SwiftUI，最低 iOS 16.0，完全端侧 AI 视频增强（补帧 30fps→60fps/120fps + 超分 720p→1080p/480p→1080p），不上架 App Store，通过侧载分发。
+
+## 功能特性
+
+- **AI 补帧**：RIFE 4.22 Lite，支持 2x / 4x 帧率提升，快速模式自适应 AI/帧混合
+- **AI 超分**：双引擎可选，与补帧模式互斥
+  - **PiperSR 2x**：640×360 全帧推理，ANE 原生，速度快，适合 720p→1080p
+  - **Real-ESRGAN 4x**：128×128 瓦片拼接+羽化融合，适合 480p 及以下极低清素材
+- **音频透传**：补帧/超分均复用原视频音轨，音画同步
+- **完全端侧**：所有 AI 推理在设备本地完成，不上传任何数据
+- **Debug 性能监控**：Debug 构建右上角悬浮 HUD，实时显示 FPS / CPU 使用率 / 内存占用，可拖动、可收起
 
 ## 快速开始
 
@@ -21,6 +31,19 @@ App 使用 RIFE 4.22 Lite 模型进行端侧补帧。模型文件（`RIFE_Lite.m
 
 > 模型来源：[Practical-RIFE](https://github.com/hzwer/Practical-RIFE)（MIT 许可证），权重镜像：[Hugging Face](https://huggingface.co/anon0077/RIFE-Models)
 > 模型缺失时 App 自动降级为空转管线（帧率不变），不影响基础功能。
+
+### AI 模型（超分）
+
+超分模式提供两个可选引擎，模型文件需放入 `FrameInterpolation/Resources/` 目录：
+
+| 引擎 | 模型文件 | 放大倍数 | 适用场景 |
+|------|---------|---------|---------|
+| PiperSR | `PiperSR_2x_video_720p.mlmodelc` | 2x | 720p→1080p，速度快 |
+| Real-ESRGAN | `real_esrgan_x4v3.mlmodelc` | 4x | 480p 及以下极低清素材 |
+
+> 模型缺失时超分模式自动降级为 vImage 高质量缩放，不影响基础功能。
+> PiperSR 模型来源：[ModelPiper/PiperSR-2x](https://huggingface.co/ModelPiper/PiperSR-2x)
+> Real-ESRGAN 模型来源：[Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)（BSD-3-Clause）
 
 ### 下载 IPA
 

@@ -5,9 +5,9 @@ import OSLog
 /// Metal 帧混合器：使用 GPU 做简单 alpha 混合，用于快速模式
 /// IOSurface 零拷贝 + PixelBufferPool 复用 + GPU 状态检查，避免黑帧
 final class MetalFrameBlender {
-    static let shared = MetalFrameBlender()
+    static let shared: MetalFrameBlender? = MetalFrameBlender()
 
-    private let helper = MetalComputeHelper.shared
+    private let helper: MetalComputeHelper
     private let pipeline: MTLComputePipelineState
     private let logger = Logger(subsystem: "com.lambret.bz", category: "MetalFrameBlender")
 
@@ -17,11 +17,13 @@ final class MetalFrameBlender {
     private var configuredHeight = 0
 
     private init?() {
-        guard let library = helper.device.makeDefaultLibrary(),
+        guard let metalHelper = MetalComputeHelper.shared,
+              let library = metalHelper.device.makeDefaultLibrary(),
               let function = library.makeFunction(name: "simple_blend"),
-              let pipeline = try? helper.device.makeComputePipelineState(function: function) else {
+              let pipeline = try? metalHelper.device.makeComputePipelineState(function: function) else {
             return nil
         }
+        self.helper = metalHelper
         self.pipeline = pipeline
     }
 
@@ -85,7 +87,7 @@ final class MetalFrameBlender {
 
         // 关键：检查 GPU 执行状态，失败返回 nil（调用方回退CPU），不返回黑帧
         guard commandBuffer.status == .completed, commandBuffer.error == nil else {
-            logger.error("Metal blend GPU执行失败: \(commandBuffer.error?.localizedDescription ?? "unknown"), status: \(commandBuffer.status.rawValue)")
+            logger.error("Metal blend GPU执行失败: \(commandBuffer.error?.localizedDescription ?? "unknown", privacy: .public), status: \(commandBuffer.status.rawValue, privacy: .public)")
             return nil
         }
 

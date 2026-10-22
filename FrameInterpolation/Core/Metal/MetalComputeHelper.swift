@@ -1,9 +1,13 @@
 import Metal
 import CoreVideo
+import OSLog
 
 /// Metal 计算辅助工具：封装纹理创建、缓冲区管理等通用操作
+/// 单例模式，Metal 初始化失败时 shared 为 nil，调用方需降级处理
 final class MetalComputeHelper {
-    static let shared = MetalComputeHelper()
+    private let logger = Logger(subsystem: "com.lambret.bz", category: "MetalComputeHelper")
+
+    static let shared: MetalComputeHelper? = MetalComputeHelper()
 
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
@@ -11,10 +15,10 @@ final class MetalComputeHelper {
     // 保护 textureCache 访问，CVMetalTextureCache 非线程安全
     private let cacheLock = NSLock()
 
-    private init() {
+    private init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
               let queue = device.makeCommandQueue() else {
-            fatalError("Metal 初始化失败")
+            return nil
         }
         self.device = device
         self.commandQueue = queue
@@ -31,6 +35,7 @@ final class MetalComputeHelper {
         if status == kCVReturnSuccess {
             self.textureCache = cache
         }
+        logger.info("MetalComputeHelper 初始化成功，设备: \(device.name, privacy: .public)")
     }
 
     /// 从 CVPixelBuffer 的 IOSurface 创建 MTLTexture（零拷贝，推荐用于输入/输出帧）

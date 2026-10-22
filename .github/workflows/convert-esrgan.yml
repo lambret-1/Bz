@@ -1,0 +1,53 @@
+name: Convert Real-ESRGAN x4v3 to Core ML
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [test]
+    paths:
+      - 'Scripts/convert_esrgan.py'
+      - 'Scripts/esrgan_model/**'
+      - '.github/workflows/convert-esrgan.yml'
+
+jobs:
+  convert:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.7.0 torchvision==0.22.0 coremltools==8.0 numpy
+
+      - name: 运行模型转换
+        run: |
+          cd Scripts
+          python convert_esrgan.py
+
+      - name: 验证模型文件
+        run: |
+          if [ -d "Scripts/real_esrgan_x4v3.mlpackage" ]; then
+            echo "✅ 模型转换成功"
+            find Scripts/real_esrgan_x4v3.mlpackage -type f | head -20
+          else
+            echo "❌ 模型转换失败，未找到 real_esrgan_x4v3.mlpackage"
+            exit 1
+          fi
+
+      - name: 上传 mlpackage
+        uses: actions/upload-artifact@v4
+        with:
+          name: real_esrgan_x4v3
+          path: Scripts/real_esrgan_x4v3.mlpackage
+          retention-days: 90

@@ -1,36 +1,62 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreVideo
 import OSLog
 import Accelerate
 
-/// 视频处理管线：解码 → 补帧 → 编码 + 音频透传
-/// 支持 2x/4x 补帧，模型缺失时自动降级为空转（帧率不变）
+/// 视频处理管线：解码 → 补帧/超分 → 编码 + 音频透传
+/// 支持补帧模式（2x/4x）与超分模式（Fast-SRGAN 4x / Real-ESRGAN 4x），两种模式互斥
+/// 模型缺失时自动降级：补帧→空转（帧率不变），超分→vImage缩放
 final class VideoPipeline {
     private let logger = Logger(subsystem: "com.lambret.bz", category: "VideoPipeline")
     private var isCancelled = false
-    /// 帧插值器，模型缺失时为 nil（降级为空转）
-    private let interpolator: FrameInterpolator?
+    /// 帧插值器，懒加载：首次进入补帧模式时才加载模型，避免启动时同步加载阻塞UI
+    private lazy var interpolator: FrameInterpolator? = {
+        let interp = FrameInterpolator()
+        if interp == nil {
+            logger.warning("RIFE Lite 模型未加载，补帧管线将以空转模式运行（帧率不变）")
+        } else {
+            logger.info("RIFE Lite 模型加载成功，补帧功能已启用")
+        }
+        return interp
+    }()
     /// 后台处理队列
     private let processingQueue = DispatchQueue(label: "com.lambret.bz.pipeline", qos: .userInitiated)
+
+    /// CVPixelBuffer 内存池（复用缓冲，避免循环中频繁分配释放）
+    private let bufferPool = PixelBufferPoolManager(minBufferCount: 12)
+
+    /// 原子进度保护（iOS 16+ OSAllocatedUnfairLock，开销仅为 NSLock 的几十分之一）
+    private let progressLock = OSAllocatedUnfairLock(initialState: (value: 0.0, stage: ProcessingStage.decoding))
+
+    /// 轮询当前进度（线程安全，供外部 Timer 每 0.5s 调用一次）
+    func pollProgress() -> (value: Double, stage: ProcessingStage) {
+        progressLock.withLock { ($0.value, $0.stage) }
+    }
+
+    /// 内部更新进度（只写原子变量，不切主线程）
+    private func updateProgress(_ value: Double, stage: ProcessingStage) {
+        progressLock.withLock {
+            $0.value = value
+            $0.stage = stage
+        }
+    }
 
     /// 音频诊断结果（供结果页展示，不依赖Xcode控制台）
     static var 音频诊断结果: String = "未执行"
 
-    /// 是否使用 AI 补帧（模型加载成功为 true，缺失为 false）
-    var isUsingAIInterpolation: Bool { interpolator != nil }
+    /// 是否使用 AI 补帧（模型文件存在即视为可用，实际加载在首次补帧时完成）
+    var isUsingAIInterpolation: Bool = true
+
+    /// 当前使用的超分引擎类型（处理完成后供结果页查询）
+    private(set) var currentSuperResolutionEngine: SuperResolutionEngineType?
 
     init() {
-        self.interpolator = FrameInterpolator()
-        if interpolator == nil {
-            logger.warning("RIFE Lite 模型未加载，管线将以空转模式运行（帧率不变）")
-        } else {
-            logger.info("RIFE Lite 模型加载成功，补帧功能已启用")
-        }
+        // 模型懒加载，启动时不加载任何模型，避免阻塞UI
     }
 
     // MARK: - 公开方法
 
-    /// 开始处理视频
+    /// 开始处理视频（补帧模式，向后兼容接口）
     /// - Parameters:
     ///   - inputURL: 输入视频文件 URL
     ///   - outputURL: 输出视频文件 URL
@@ -46,26 +72,72 @@ final class VideoPipeline {
         progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
         completion: @escaping @MainActor (Result<URL, Error>) -> Void
     ) {
+        let frameMultiplier = FrameMultiplier(rawValue: multiplier) ?? .x2
+        process(
+            inputURL: inputURL,
+            outputURL: outputURL,
+            mode: .interpolation(frameMultiplier),
+            fastMode: fastMode,
+            outputResolution: outputResolution,
+            progress: progress,
+            completion: completion
+        )
+    }
+
+    /// 开始处理视频（统一入口，支持补帧与超分双模式）
+    /// - Parameters:
+    ///   - inputURL: 输入视频文件 URL
+    ///   - outputURL: 输出视频文件 URL
+    ///   - mode: 处理模式（补帧或超分，二者互斥）
+    ///   - fastMode: 快速模式（仅补帧模式生效）
+    ///   - outputResolution: 输出分辨率限制
+    ///   - progress: 进度回调（0.0~1.0, 当前阶段），主线程调用
+    ///   - completion: 完成回调，主线程调用
+    func process(
+        inputURL: URL,
+        outputURL: URL,
+        mode: PipelineMode,
+        fastMode: Bool = false,
+        outputResolution: OutputResolution = .auto,
+        progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
+        completion: @escaping @MainActor (Result<URL, Error>) -> Void
+    ) {
         isCancelled = false
-        let effectiveMultiplier = interpolator != nil ? multiplier : 1
-        logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 倍数\(effectiveMultiplier)x, 快速模式:\(fastMode), 分辨率:\(outputResolution.rawValue)")
+        currentSuperResolutionEngine = nil
+
+        let effectiveMultiplier: Int
+        let modeDescription: String
+        switch mode {
+        case .interpolation(let m):
+            effectiveMultiplier = interpolator != nil ? m.rawValue : 1
+            modeDescription = "补帧\(effectiveMultiplier)x"
+        case .superResolution(let engineType, let scale):
+            effectiveMultiplier = 1 // 超分模式帧率不变
+            currentSuperResolutionEngine = engineType
+            modeDescription = "超分\(engineType.shortName)\(scale.label)"
+        }
+
+        logger.info("开始处理: \(inputURL.lastPathComponent, privacy: .public), 模式:\(modeDescription, privacy: .public), 快速模式:\(fastMode, privacy: .public), 分辨率:\(outputResolution.rawValue, privacy: .public)")
 
         processingQueue.async { [weak self] in
             guard let self = self else { return }
-            do {
-                try self.runPipeline(
-                    inputURL: inputURL,
-                    outputURL: outputURL,
-                    multiplier: effectiveMultiplier,
-                    fastMode: fastMode,
-                    outputResolution: outputResolution,
-                    progress: progress,
-                    completion: completion
-                )
-            } catch {
-                self.logger.error("管线处理失败: \(error.localizedDescription, privacy: .public)")
-                Task { @MainActor in
-                    completion(.failure(error))
+            Task {
+                do {
+                    try await self.runPipeline(
+                        inputURL: inputURL,
+                        outputURL: outputURL,
+                        mode: mode,
+                        multiplier: effectiveMultiplier,
+                        fastMode: fastMode,
+                        outputResolution: outputResolution,
+                        progress: progress,
+                        completion: completion
+                    )
+                } catch {
+                    self.logger.error("管线处理失败: \(error.localizedDescription, privacy: .public)")
+                    await MainActor.run {
+                        completion(.failure(error))
+                    }
                 }
             }
         }
@@ -77,74 +149,112 @@ final class VideoPipeline {
         isCancelled = true
     }
 
+    // MARK: - 同步等待辅助（避免 async 上下文 wait 警告）
+
+    private static func waitGroup(_ group: DispatchGroup) {
+        group.wait()
+    }
+
+    private static func waitSemaphore(_ semaphore: DispatchSemaphore) {
+        semaphore.wait()
+    }
+
+    private static func waitWriterFinish(writer: AVAssetWriter) {
+        let semaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting {
+            semaphore.signal()
+        }
+        semaphore.wait()
+    }
+
     // MARK: - 私有方法
 
     private func runPipeline(
         inputURL: URL,
         outputURL: URL,
+        mode: PipelineMode,
         multiplier: Int,
         fastMode: Bool,
         outputResolution: OutputResolution,
         progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
         completion: @escaping @MainActor (Result<URL, Error>) -> Void
-    ) throws {
+    ) async throws {
         let asset = AVURLAsset(url: inputURL)
 
-        // 异步加载轨道（iOS 16+ 同步属性可能返回空，必须用 loadTracks）
-        let tracksSemaphore = DispatchSemaphore(value: 0)
-        var loadedVideoTrack: AVAssetTrack?
-        var loadedAudioTrack: AVAssetTrack?
-        asset.loadTracks(withMediaType: .video) { videoTracks, error in
-            loadedVideoTrack = videoTracks?.first
-            asset.loadTracks(withMediaType: .audio) { audioTracks, _ in
-                loadedAudioTrack = audioTracks?.first
-                tracksSemaphore.signal()
-            }
-        }
-        tracksSemaphore.wait()
-
-        print("[Bz音频诊断] 视频轨道: \(loadedVideoTrack != nil ? "有" : "无"), 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
-
-        // 获取视频轨道
-        guard let videoTrack = loadedVideoTrack else {
+        // 异步加载轨道
+        let videoTracks = try await asset.loadTracks(withMediaType: .video)
+        let audioTracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let loadedVideoTrack = videoTracks.first else {
             throw PipelineError.noVideoTrack
         }
+        let loadedAudioTrack = audioTracks.first
+
+        print("[Bz音频诊断] 视频轨道: 有, 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
+        if let audioTrack = loadedAudioTrack {
+            let formatDesc = try? await audioTrack.load(.formatDescriptions)
+            let dataRate = try? await audioTrack.load(.estimatedDataRate)
+            print("[Bz音频诊断] 音频格式: \(String(describing: formatDesc)), 估计码率: \(String(describing: dataRate))bps")
+        }
+
+        let videoTrack = loadedVideoTrack
 
         // 帧率与帧数计算
-        let inputFPS = Double(videoTrack.nominalFrameRate)
+        let nominalFPS = try await videoTrack.load(.nominalFrameRate)
+        let inputFPS = Double(nominalFPS)
         guard inputFPS > 0 else {
             throw PipelineError.invalidFrameRate
         }
-        let outputFPS = inputFPS * Double(multiplier)
-        let durationSeconds = CMTimeGetSeconds(asset.duration)
+
+        // 超分模式帧率不变，补帧模式按倍数提升
+        let outputFPS: Double
+        /// 用户选择的超分放大倍数（1-4x）
+        let targetScale: Int
+        /// 模型原生放大倍数（固定 4x）
+        let nativeScale: Int
+        switch mode {
+        case .interpolation:
+            outputFPS = inputFPS * Double(multiplier)
+            targetScale = 1
+            nativeScale = 1
+        case .superResolution(let engineType, let scale):
+            outputFPS = inputFPS // 超分模式帧率保持不变
+            targetScale = scale.rawValue
+            nativeScale = engineType.nativeScaleFactor
+        }
+
+        let duration = try await asset.load(.duration)
+        let durationSeconds = CMTimeGetSeconds(duration)
         let totalInputFrames = max(Int(durationSeconds * inputFPS), 1)
 
-        // 输出尺寸（根据 outputResolution 缩放）
-        let naturalSize = videoTrack.naturalSize
-        let transform = videoTrack.preferredTransform
-        var outputWidth = Int(naturalSize.width)
-        var outputHeight = Int(naturalSize.height)
+        // 输出尺寸（按用户选择的放大倍数计算）
+        let naturalSize = try await videoTrack.load(.naturalSize)
+        let transform = try await videoTrack.load(.preferredTransform)
+        var outputWidth = Int(naturalSize.width) * targetScale
+        var outputHeight = Int(naturalSize.height) * targetScale
 
-        // 计算目标高度（保持宽高比）
-        let targetHeight: Int?
+        // 计算目标短边（自动识别横竖屏，保持宽高比）
+        let targetShortSide: Int?
         switch outputResolution {
         case .auto:
-            targetHeight = nil
+            targetShortSide = nil
         case .p720:
-            targetHeight = 720
+            targetShortSide = 720
         case .p1080:
-            targetHeight = 1080
+            targetShortSide = 1080
         }
 
         var needsScaling = false
-        if let targetH = targetHeight, outputHeight > targetH {
-            let scale = Double(targetH) / Double(outputHeight)
-            outputWidth = Int(Double(outputWidth) * scale)
-            outputHeight = targetH
-            // 确保宽高为偶数（H.264 编码要求）
-            outputWidth = outputWidth - (outputWidth % 2)
-            outputHeight = outputHeight - (outputHeight % 2)
-            needsScaling = true
+        if let targetShort = targetShortSide {
+            let currentShort = min(outputWidth, outputHeight)
+            if currentShort > targetShort {
+                let scale = Double(targetShort) / Double(currentShort)
+                outputWidth = Int(Double(outputWidth) * scale)
+                outputHeight = Int(Double(outputHeight) * scale)
+                // 确保宽高为偶数（H.264 编码要求）
+                outputWidth = outputWidth - (outputWidth % 2)
+                outputHeight = outputHeight - (outputHeight % 2)
+                needsScaling = true
+            }
         }
 
         guard outputWidth > 0, outputHeight > 0 else {
@@ -152,12 +262,7 @@ final class VideoPipeline {
         }
 
         print("[Bz音频诊断] 输入: \(Int(naturalSize.width))x\(Int(naturalSize.height)), 输出: \(outputWidth)x\(outputHeight), 缩放:\(needsScaling), 快速模式:\(fastMode)")
-        print("[Bz音频诊断] 输出: \(outputFPS)fps, 倍数\(multiplier)x")
-
-        // 临时无声视频文件（第一阶段输出）
-        let tempVideoURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("mp4")
+        print("[Bz音频诊断] 输出: \(outputFPS)fps, 模式:\(mode.displayName)")
 
         // 删除已存在的输出文件
         if FileManager.default.fileExists(atPath: outputURL.path) {
@@ -176,34 +281,81 @@ final class VideoPipeline {
         }
         reader.add(videoReaderOutput)
 
-        // MARK: 配置 Writer（仅视频，音频后续用 AVAssetExportSession 合成）
-        let writer = try AVAssetWriter(outputURL: tempVideoURL, fileType: .mp4)
-
-        // 按分辨率设置H.264码率，避免默认低码率导致油画感模糊
-        let maxDimension = max(outputWidth, outputHeight)
-        let bitRate: Int
-        if maxDimension >= 1920 {
-            bitRate = 20_000_000  // 1080p 20Mbps
-        } else if maxDimension >= 1280 {
-            bitRate = 10_000_000  // 720p 10Mbps
-        } else {
-            bitRate = 5_000_000   // 更低分辨率 5Mbps
+        // MARK: 配置音频 Reader（直写模式，不再二次编码）
+        var audioReaderOutput: AVAssetReaderTrackOutput?
+        if let audioTrack = loadedAudioTrack {
+            // 音频 Reader 输出 PCM 格式（解码），Writer 用 AAC 编码
+            // 透传模式(outputSettings:nil)在部分视频上不稳定，PCM→AAC 更可靠
+            let audioOutputSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false
+            ]
+            let output = AVAssetReaderTrackOutput(track: audioTrack, outputSettings: audioOutputSettings)
+            output.alwaysCopiesSampleData = true
+            if reader.canAdd(output) {
+                reader.add(output)
+                audioReaderOutput = output
+                print("[Bz音频诊断] 音频模式：PCM解码→AAC编码，已配置音频 Reader")
+            } else {
+                print("[Bz音频诊断] 音频 Reader 添加失败，reader状态: \(reader.status.rawValue)")
+            }
         }
 
-        let videoWriterInput = AVAssetWriterInput(
-            mediaType: .video,
-            outputSettings: [
-                AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: outputWidth,
-                AVVideoHeightKey: outputHeight,
-                AVVideoCompressionPropertiesKey: [
-                    AVVideoAverageBitRateKey: bitRate,
-                    AVVideoMaxKeyFrameIntervalKey: 60,
-                    AVVideoAllowFrameReorderingKey: false
-                ]
-            ]
-        )
-        videoWriterInput.expectsMediaDataInRealTime = false
+        // MARK: 配置 Writer（音视频同时写入，消除二次编码）
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+
+        // 按像素数比例动态计算码率，优先使用 HEVC 降低开销
+        // 原理：放大分辨率 = 像素数增加 = 需要更高码率承载新增细节
+        // HEVC 相比 H.264 压缩效率提升约 40%，相同画质下码率可降低
+        let inputWidth = Int(naturalSize.width)
+        let inputHeight = Int(naturalSize.height)
+        let inputPixelCount = max(inputWidth * inputHeight, 1)
+        let outputPixelCount = outputWidth * outputHeight
+        let pixelScaleRatio = Double(outputPixelCount) / Double(inputPixelCount)
+
+        // 输入视频原始码率（estimatedDataRate 单位 bps）
+        let inputDataRate = (try? await videoTrack.load(.estimatedDataRate)) ?? 0
+        let inputBitRate = Double(inputDataRate)
+        // 基础码率：输入码率 × 像素数放大比例；输入码率无效时按分辨率兜底
+        let baseBitRate: Double
+        if inputBitRate > 100_000 {
+            baseBitRate = inputBitRate * pixelScaleRatio
+        } else {
+            // 兜底：按输出像素数计算，每百万像素约 4Mbps（HEVC）
+            baseBitRate = Double(outputPixelCount) / 1_000_000.0 * 4_000_000
+        }
+
+        // HEVC 效率系数：相同画质下比 H.264 节省约 35% 码率
+        let hevcEfficiencyFactor = 0.65
+        // 码率上下限：最低 2Mbps，最高 60Mbps（避免超大文件）
+        let targetBitRate = max(2_000_000, min(60_000_000, Int(baseBitRate * hevcEfficiencyFactor)))
+
+        logger.info("编码配置: HEVC, 输入码率 \(inputBitRate/1_000_000, privacy: .public)Mbps, 像素放大 \(String(format: "%.2f", pixelScaleRatio), privacy: .public)x, 输出码率 \(Double(targetBitRate)/1_000_000, privacy: .public)Mbps")
+
+        // 优先使用 HEVC，不支持时降级为 H.264（码率相应提高，因为 H.264 效率较低）
+        let videoWriterInput: AVAssetWriterInput
+        if let hevcInput = makeVideoWriterInput(
+            codec: .hevc,
+            width: outputWidth,
+            height: outputHeight,
+            bitRate: targetBitRate,
+            writer: writer
+        ) {
+            videoWriterInput = hevcInput
+            logger.info("使用 HEVC 编码")
+        } else {
+            let h264BitRate = min(80_000_000, Int(Double(targetBitRate) / hevcEfficiencyFactor))
+            videoWriterInput = makeVideoWriterInput(
+                codec: .h264,
+                width: outputWidth,
+                height: outputHeight,
+                bitRate: h264BitRate,
+                writer: writer
+            )!
+            logger.warning("HEVC 不可用，降级为 H.264 编码，码率 \(Double(h264BitRate)/1_000_000, privacy: .public)Mbps")
+        }
         videoWriterInput.transform = transform
 
         let pixelBufferAdaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -215,10 +367,37 @@ final class VideoPipeline {
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
         )
-        guard writer.canAdd(videoWriterInput) else {
-            throw PipelineError.writerConfigurationFailed
+
+        // MARK: 配置音频 Writer Input（透传原格式，不重编码）
+        var audioWriterInput: AVAssetWriterInput?
+        if audioReaderOutput != nil {
+            // 从音频轨道获取声道数和采样率，用于 AAC 编码配置
+            let audioFormatDesc = (try? await loadedAudioTrack?.load(.formatDescriptions))?.first
+            let audioChannels = audioFormatDesc.flatMap { desc -> Int? in
+                let basicDesc = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+                return Int(basicDesc?.pointee.mChannelsPerFrame ?? 2)
+            } ?? 2
+            let audioSampleRate = audioFormatDesc.flatMap { desc -> Double? in
+                let basicDesc = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+                return basicDesc?.pointee.mSampleRate
+            } ?? 44100
+
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVNumberOfChannelsKey: audioChannels,
+                AVSampleRateKey: audioSampleRate,
+                AVEncoderBitRateKey: 128000
+            ]
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            input.expectsMediaDataInRealTime = false
+            if writer.canAdd(input) {
+                writer.add(input)
+                audioWriterInput = input
+                print("[Bz音频诊断] 音频模式：已配置 AAC 编码 Writer Input，声道:\(audioChannels)，采样率:\(audioSampleRate)")
+            } else {
+                print("[Bz音频诊断] 音频 Writer Input 添加失败，writer状态: \(writer.status.rawValue)")
+            }
         }
-        writer.add(videoWriterInput)
 
         // MARK: 启动读写
         guard reader.startReading() else {
@@ -226,12 +405,136 @@ final class VideoPipeline {
         }
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
-        Self.音频诊断结果 = "视频处理中，后续合成音频"
+        Self.音频诊断结果 = audioWriterInput != nil ? "音视频编码中" : "无声视频处理中"
 
-        // MARK: 视频处理循环
+        // MARK: 启动音频直写（独立队列，与视频处理并行）
+        let audioEncodeGroup = DispatchGroup()
+        if let audioInput = audioWriterInput, let audioOutput = audioReaderOutput {
+            audioEncodeGroup.enter()
+            let audioQueue = DispatchQueue(label: "com.lambret.bz.audio.encode", qos: .userInitiated)
+            audioInput.requestMediaDataWhenReady(on: audioQueue) {
+                while audioInput.isReadyForMoreMediaData {
+                    guard let sample = audioOutput.copyNextSampleBuffer() else {
+                        audioInput.markAsFinished()
+                        audioEncodeGroup.leave()
+                        return
+                    }
+                    // PTS 直接透传，音视频同源保持同步
+                    if !audioInput.append(sample) {
+                        print("[Bz音频诊断] 音频 append 失败: \(writer.error?.localizedDescription ?? "未知")，停止音频写入")
+                        audioInput.markAsFinished()
+                        audioEncodeGroup.leave()
+                        return
+                    }
+                }
+            }
+            print("[Bz音频诊断] 音频直写已启动")
+        }
+
+        // MARK: 视频处理循环（按模式分发）
         var outputFrameIndex = 0
-        var previousPixelBuffer: CVPixelBuffer?
         var lastProgressReport = 0.0
+
+        switch mode {
+        case .interpolation:
+            try runInterpolationAsync(
+                reader: reader,
+                videoReaderOutput: videoReaderOutput,
+                writer: writer,
+                videoWriterInput: videoWriterInput,
+                pixelBufferAdaptor: pixelBufferAdaptor,
+                outputFPS: outputFPS,
+                multiplier: multiplier,
+                fastMode: fastMode,
+                needsScaling: needsScaling,
+                outputWidth: outputWidth,
+                outputHeight: outputHeight,
+                totalInputFrames: totalInputFrames,
+                progress: progress,
+                outputFrameIndex: &outputFrameIndex,
+                lastProgressReport: &lastProgressReport
+            )
+        case .superResolution(let engineType, let scale):
+            try runSuperResolutionAsync(
+                reader: reader,
+                videoReaderOutput: videoReaderOutput,
+                writer: writer,
+                videoWriterInput: videoWriterInput,
+                pixelBufferAdaptor: pixelBufferAdaptor,
+                outputFPS: outputFPS,
+                engineType: engineType,
+                targetScale: scale,
+                nativeScale: nativeScale,
+                needsScaling: needsScaling,
+                outputWidth: outputWidth,
+                outputHeight: outputHeight,
+                totalInputFrames: totalInputFrames,
+                progress: progress,
+                outputFrameIndex: &outputFrameIndex,
+                lastProgressReport: &lastProgressReport
+            )
+        }
+
+        // 检查 reader 最终状态
+        if reader.status == .failed {
+            if let error = reader.error {
+                throw error
+            }
+            throw PipelineError.readerFailed
+        }
+
+        videoWriterInput.markAsFinished()
+        print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)")
+
+        // 等待音频编码完成（如果有音频）
+        if audioWriterInput != nil {
+            print("[Bz音频诊断] 等待音频编码完成...")
+            Self.waitGroup(audioEncodeGroup)
+            print("[Bz音频诊断] 音频编码完成")
+        }
+
+        // MARK: 完成写入（音视频都已 markAsFinished）
+        Self.waitWriterFinish(writer: writer)
+
+        guard writer.status == .completed else {
+            let error = writer.error ?? PipelineError.writerFailed
+            logger.error("编码失败: \(error.localizedDescription, privacy: .public)")
+            try? FileManager.default.removeItem(at: outputURL)
+            throw error
+        }
+
+        Self.音频诊断结果 = audioWriterInput != nil ? "音视频编码完成" : "无声视频处理完成"
+        print("[Bz音频诊断] 全部完成，输出: \(outputURL.lastPathComponent)")
+
+        // 释放内存池
+        bufferPool.reset()
+
+        Task { @MainActor in
+            progress(1.0, .finished)
+            completion(.success(outputURL))
+        }
+    }
+
+    // MARK: - 补帧模式处理循环
+
+    private func runInterpolationLoop(
+        reader: AVAssetReader,
+        videoReaderOutput: AVAssetReaderTrackOutput,
+        writer: AVAssetWriter,
+        videoWriterInput: AVAssetWriterInput,
+        pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
+        outputFPS: Double,
+        multiplier: Int,
+        fastMode: Bool,
+        needsScaling: Bool,
+        outputWidth: Int,
+        outputHeight: Int,
+        totalInputFrames: Int,
+        progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
+        outputFrameIndex: inout Int,
+        lastProgressReport: inout Double
+    ) throws {
+        var previousPixelBuffer: CVPixelBuffer?
 
         // 局部函数：写入中间帧（复制颜色空间+缩放+写入Writer）
         func writeIntermediateFrame(_ frame: CVPixelBuffer, source: CVPixelBuffer) {
@@ -262,49 +565,35 @@ final class VideoPipeline {
             if progressValue - lastProgressReport >= 0.01 {
                 lastProgressReport = progressValue
                 let stage: ProcessingStage = interpolator != nil ? .inferring : .decoding
-                Task { @MainActor in
-                    progress(progressValue, stage)
-                }
+                // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI，避免高频主线程回调
+                updateProgress(progressValue, stage: stage)
             }
 
             autoreleasepool {
                 // 如果有前一帧且插值器可用，生成中间帧（RIFE分层递归策略）
                 if let prev = previousPixelBuffer, multiplier > 1 {
-                    // 快速模式：根据运动强度自适应切换AI/blend
-                    // 运动强度 >= 阈值走AI，静态画面走blend节省算力
                     let motion = fastMode ? estimateMotion(frame0: prev, frame1: pixelBuffer) : 255
                     let highMotion = motion >= 8.0
-                    // 非快速模式全部走AI；快速模式下高运动走AI
                     let useAI = !fastMode || highMotion
 
                     if multiplier == 2 {
-                        // 2x：单个中间帧 t=0.5，失败时用prev深拷贝补位
                         let midFrame = useAI
                             ? self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
                             : self.blendFrames(prev, pixelBuffer)
                         writeIntermediateFrame(midFrame ?? self.deepCopyPixelBuffer(prev) ?? prev, source: pixelBuffer)
                     } else if multiplier == 4 {
-                        // 4x：RIFE分层递归，每个位置都必须有帧，失败用补位
-                        // t=0.5 永远走AI（视觉重心帧，保证质量）
                         let mid05 = self.interpolator?.interpolate(frame0: prev, frame1: pixelBuffer)
                             ?? self.deepCopyPixelBuffer(prev) ?? prev
-
-                        // t=0.25: frame0 + mid05，快速模式低运动走blend
                         let mid025 = useAI
                             ? self.interpolator?.interpolate(frame0: prev, frame1: mid05)
                             : self.blendFrames(prev, mid05)
                         writeIntermediateFrame(mid025 ?? self.deepCopyPixelBuffer(prev) ?? prev, source: pixelBuffer)
-
-                        // t=0.5
                         writeIntermediateFrame(mid05, source: pixelBuffer)
-
-                        // t=0.75: mid05 + frame1，快速模式低运动走blend
                         let mid075 = useAI
                             ? self.interpolator?.interpolate(frame0: mid05, frame1: pixelBuffer)
                             : self.blendFrames(mid05, pixelBuffer)
                         writeIntermediateFrame(mid075 ?? self.deepCopyPixelBuffer(pixelBuffer) ?? pixelBuffer, source: pixelBuffer)
                     } else {
-                        // 其他倍数：回退到简单线性插值，每帧都补位
                         for _ in 1..<multiplier {
                             if self.isCancelled { return }
                             let midFrame = useAI
@@ -317,20 +606,401 @@ final class VideoPipeline {
 
                 // 写入当前原始帧（输出分辨率缩放）
                 let finalFrame = needsScaling ? self.scalePixelBuffer(pixelBuffer, to: outputWidth, outputHeight) ?? pixelBuffer : pixelBuffer
-                let currentPTS = CMTime(
-                    value: Int64(outputFrameIndex),
-                    timescale: Int32(outputFPS)
-                )
+                let currentPTS = CMTime(value: Int64(outputFrameIndex), timescale: Int32(outputFPS))
                 self.waitForWriterReady(videoWriterInput)
                 pixelBufferAdaptor.append(finalFrame, withPresentationTime: currentPTS)
                 outputFrameIndex += 1
             }
 
-            // Bug2修复：深拷贝前一帧，防止reader复用内存覆盖（alwaysCopiesSampleData=false时）
             previousPixelBuffer = deepCopyPixelBuffer(pixelBuffer) ?? pixelBuffer
         }
+    }
 
-        // 检查 reader 最终状态
+    // MARK: - 超分模式处理循环
+
+    private func runSuperResolutionLoop(
+        reader: AVAssetReader,
+        videoReaderOutput: AVAssetReaderTrackOutput,
+        writer: AVAssetWriter,
+        videoWriterInput: AVAssetWriterInput,
+        pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
+        outputFPS: Double,
+        engineType: SuperResolutionEngineType,
+        targetScale: SuperResolutionScale,
+        nativeScale: Int,
+        needsScaling: Bool,
+        outputWidth: Int,
+        outputHeight: Int,
+        totalInputFrames: Int,
+        progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
+        outputFrameIndex: inout Int,
+        lastProgressReport: inout Double
+    ) throws {
+        // 1x 模式或模型缺失时跳过 AI 超分，直接复制/缩放帧
+        let needsAI = targetScale.needsAISuperResolution
+        let engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
+        // 设置引擎目标放大倍数（RealESRGANx2引擎内部直接输出目标尺寸）
+        engine?.targetScale = targetScale.rawValue
+        let usingAI = engine != nil
+        if needsAI && engine == nil {
+            logger.warning("\(engineType.displayName, privacy: .public) 模型未加载，超分模式降级为 vImage 缩放")
+        }
+        if !needsAI {
+            logger.info("超分倍数 1x，跳过 AI 推理，直接透传帧")
+        }
+
+        var inputFrameIndex = 0
+
+        // 超分处理较慢，立即报告初始进度，避免用户误以为卡死
+        Task { @MainActor in
+            progress(0.0, usingAI ? .superResolving : .decoding)
+        }
+
+        while reader.status == .reading {
+            if isCancelled {
+                reader.cancelReading()
+                writer.cancelWriting()
+                engine?.cancel()
+                throw PipelineError.cancelled
+            }
+
+            guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
+                  let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                break
+            }
+
+            // 进度计算（超分模式一进一出，inputFrameIndex == outputFrameIndex）
+            let progressValue = min(Double(inputFrameIndex) / Double(totalInputFrames), 0.99)
+            if progressValue - lastProgressReport >= 0.01 {
+                lastProgressReport = progressValue
+                let stage: ProcessingStage = usingAI ? .superResolving : .decoding
+                // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
+                updateProgress(progressValue, stage: stage)
+            }
+
+            autoreleasepool {
+                let processedFrame: CVPixelBuffer
+
+                if !needsAI {
+                    // 1x 模式：直接使用原帧
+                    processedFrame = pixelBuffer
+                } else if let engine = engine,
+                          let aiFrame = engine.upscale(pixelBuffer) {
+                    // AI 超分：RealESRGANx2引擎已内部缩放到目标倍数，其他引擎需再缩放
+                    if engineType == .realESRGANx2 {
+                        processedFrame = aiFrame
+                    } else if targetScale.rawValue < nativeScale {
+                        let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
+                        let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
+                        let targetW = srcWidth * targetScale.rawValue
+                        let targetH = srcHeight * targetScale.rawValue
+                        processedFrame = self.scalePixelBuffer(aiFrame, to: targetW, targetH) ?? aiFrame
+                    } else {
+                        processedFrame = aiFrame
+                    }
+                } else {
+                    // 降级：vImage 缩放到目标尺寸
+                    let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
+                    let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
+                    let targetW = srcWidth * targetScale.rawValue
+                    let targetH = srcHeight * targetScale.rawValue
+                    processedFrame = self.scalePixelBuffer(pixelBuffer, to: targetW, targetH) ?? pixelBuffer
+                }
+
+                // 复制颜色空间附件
+                copyColorSpaceAttachments(from: pixelBuffer, to: processedFrame)
+
+                // 最终输出缩放（根据 outputResolution 限制）
+                let finalFrame = needsScaling ? self.scalePixelBuffer(processedFrame, to: outputWidth, outputHeight) ?? processedFrame : processedFrame
+
+                // 超分模式帧率不变，PTS 按 outputFPS 等间隔排列
+                let currentPTS = CMTime(value: Int64(outputFrameIndex), timescale: Int32(outputFPS))
+                self.waitForWriterReady(videoWriterInput)
+                pixelBufferAdaptor.append(finalFrame, withPresentationTime: currentPTS)
+                outputFrameIndex += 1
+                inputFrameIndex += 1
+            }
+        }
+    }
+
+    // MARK: - 异步超分管线（解码+推理与编码并发）
+
+    /// 异步超分管线：解码+推理在独立队列，编码由 requestMediaDataWhenReady 驱动
+    /// 通过有界 FrameBuffer 实现背压，避免内存爆炸
+    private func runSuperResolutionAsync(
+        reader: AVAssetReader,
+        videoReaderOutput: AVAssetReaderTrackOutput,
+        writer: AVAssetWriter,
+        videoWriterInput: AVAssetWriterInput,
+        pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
+        outputFPS: Double,
+        engineType: SuperResolutionEngineType,
+        targetScale: SuperResolutionScale,
+        nativeScale: Int,
+        needsScaling: Bool,
+        outputWidth: Int,
+        outputHeight: Int,
+        totalInputFrames: Int,
+        progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
+        outputFrameIndex: inout Int,
+        lastProgressReport: inout Double
+    ) throws {
+        // 1x 模式或模型缺失时跳过 AI 超分
+        let needsAI = targetScale.needsAISuperResolution
+        let engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
+        let usingAI = engine != nil
+        if needsAI && engine == nil {
+            logger.warning("\(engineType.displayName, privacy: .public) 模型未加载，超分模式降级为 vImage 缩放")
+        }
+
+        // 立即报告初始进度
+        Task { @MainActor in
+            progress(0.0, usingAI ? .superResolving : .decoding)
+        }
+
+        // 启动诊断日志会话
+        DiagnosticLogger.shared.startSession()
+        DiagnosticLogger.shared.writeLine("模式: \(usingAI ? engineType.displayName : "vImage缩放")")
+        DiagnosticLogger.shared.writeLine("输入: \(totalInputFrames)帧, 输出: \(outputWidth)x\(outputHeight)")
+        DiagnosticLogger.shared.writeLine("----------------------------------------")
+
+        // MARK: 黄金三队列流水线
+        // Reader（只读不拷）→ Inference（深拷贝+ANE+缩放）→ Encode
+        // 队列容量：Reader→Inference(6)、Inference→Encode(10)
+        let readerToInference = FrameBuffer(capacity: 6)
+        let inferenceToEncode = FrameBuffer(capacity: 10)
+
+        let readerQueue = DispatchQueue(label: "com.lambret.bz.sr.reader", qos: .userInitiated)
+        let inferenceQueue = DispatchQueue(label: "com.lambret.bz.sr.inference", qos: .userInitiated)
+        let encodeQueue = DispatchQueue(label: "com.lambret.bz.sr.encode", qos: .userInitiated)
+
+        // 跨队列错误传递
+        let errorLock = NSLock()
+        var pipelineError: Error?
+
+        func setError(_ error: Error) {
+            errorLock.lock()
+            if pipelineError == nil { pipelineError = error }
+            errorLock.unlock()
+        }
+
+        // 关闭所有队列（cancel或错误时调用）
+        func closeAllQueues() {
+            readerToInference.close()
+            inferenceToEncode.close()
+        }
+
+        // MARK: 队列1：Reader（只调copyNextSampleBuffer，不深拷贝，IO密集型独立队列）
+        let readerGroup = DispatchGroup()
+        readerGroup.enter()
+        readerQueue.async { [weak self] in
+            guard let self = self else {
+                readerToInference.close()
+                readerGroup.leave()
+                return
+            }
+
+            var localFrameIndex = 0
+            var localProgress = 0.0
+
+            defer {
+                readerToInference.close()
+                readerGroup.leave()
+            }
+
+            while reader.status == .reading {
+                if self.isCancelled {
+                    reader.cancelReading()
+                    setError(PipelineError.cancelled)
+                    return
+                }
+
+                guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
+                      let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                    break
+                }
+
+                // 进度计算（在Reader阶段更新，因为帧率不变）
+                let progressValue = min(Double(localFrameIndex) / Double(totalInputFrames), 0.99)
+                if progressValue - localProgress >= 0.01 {
+                    localProgress = progressValue
+                    let stage: ProcessingStage = usingAI ? .superResolving : .decoding
+                    updateProgress(progressValue, stage: stage)
+                }
+
+                // 直接传递原始CVPixelBuffer（引用计数retain，reader不会复用）
+                // 深拷贝放到Inference队列，与ANE计算在同一线程，共享L1 Cache
+                let pts = CMTime(value: Int64(localFrameIndex), timescale: Int32(outputFPS))
+                if !readerToInference.enqueue(ProcessedFrame(pixelBuffer: pixelBuffer, presentationTime: pts)) {
+                    return
+                }
+
+                localFrameIndex += 1
+            }
+        }
+
+        // MARK: 队列2：Inference（深拷贝→ANE推理→vImage缩放，全部在同一线程）
+        let inferenceGroup = DispatchGroup()
+        inferenceGroup.enter()
+        inferenceQueue.async { [weak self] in
+            guard let self = self else {
+                inferenceToEncode.close()
+                inferenceGroup.leave()
+                return
+            }
+
+            defer {
+                inferenceToEncode.close()
+                inferenceGroup.leave()
+            }
+
+            var frameIndex = 0
+            while true {
+                if self.isCancelled {
+                    setError(PipelineError.cancelled)
+                    return
+                }
+
+                let t0 = CACurrentMediaTime()
+                // 从Reader队列取原始帧
+                guard let frame = readerToInference.dequeue() else {
+                    break
+                }
+                let t1 = CACurrentMediaTime()
+
+                autoreleasepool {
+                    // 1. 深拷贝（reader的buffer生命周期由reader管理，必须拷贝）
+                    guard let copiedFrame = self.deepCopyPixelBuffer(frame.pixelBuffer) else { return }
+                    let t2 = CACurrentMediaTime()
+
+                    // 2. ANE推理
+                    let aiFrame: CVPixelBuffer
+                    if !needsAI {
+                        aiFrame = copiedFrame
+                    } else if let engine = engine {
+                        guard let upscaled = engine.upscale(copiedFrame) else {
+                            self.logger.error("第\(frameIndex, privacy: .public)帧超分推理失败，引擎返回nil")
+                            setError(PipelineError.unknown)
+                            return
+                        }
+                        aiFrame = upscaled
+                    } else {
+                        self.logger.error("超分引擎未初始化")
+                        setError(PipelineError.unknown)
+                        return
+                    }
+                    let t3 = CACurrentMediaTime()
+
+                    // 3. vImage统一缩放到最终输出尺寸（一步到位）
+                    var finalFrame = aiFrame
+                    let currentWidth = CVPixelBufferGetWidth(finalFrame)
+                    let currentHeight = CVPixelBufferGetHeight(finalFrame)
+                    if currentWidth != outputWidth || currentHeight != outputHeight {
+                        if let scaled = self.scalePixelBuffer(finalFrame, to: outputWidth, outputHeight) {
+                            finalFrame = scaled
+                        }
+                    }
+                    let t4 = CACurrentMediaTime()
+
+                    // 4. 复制颜色空间附件
+                    self.copyColorSpaceAttachments(from: frame.pixelBuffer, to: finalFrame)
+
+                    // 5. 入队到Encode
+                    if !inferenceToEncode.enqueue(ProcessedFrame(pixelBuffer: finalFrame, presentationTime: frame.presentationTime)) {
+                        return
+                    }
+                    let t5 = CACurrentMediaTime()
+
+                    // 诊断日志（每10帧打印一次，同时写入文件）
+                    if frameIndex % 10 == 0 {
+                        let logLine = "帧\(frameIndex) 等待出队:\(String(format: "%.3f", t1-t0))s 深拷:\(String(format: "%.3f", t2-t1))s 推理:\(String(format: "%.3f", t3-t2))s 缩放:\(String(format: "%.3f", t4-t3))s 入队:\(String(format: "%.3f", t5-t4))s"
+                        self.logger.info("\(logLine, privacy: .public)")
+                        DiagnosticLogger.shared.writeLine(logLine)
+                    }
+                    frameIndex += 1
+                }
+            }
+        }
+
+        // MARK: 队列3：Encode（requestMediaDataWhenReady驱动）
+        let encodeGroup = DispatchGroup()
+        encodeGroup.enter()
+        var encodeFinished = false
+        let finishEncode = {
+            if !encodeFinished {
+                encodeFinished = true
+                videoWriterInput.markAsFinished()
+                encodeGroup.leave()
+            }
+        }
+        videoWriterInput.requestMediaDataWhenReady(on: encodeQueue) { [weak self] in
+            guard let self = self else {
+                finishEncode()
+                return
+            }
+
+            while videoWriterInput.isReadyForMoreMediaData {
+                // 从Inference队列取帧
+                guard let frame = inferenceToEncode.dequeue() else {
+                    finishEncode()
+                    return
+                }
+
+                if self.isCancelled {
+                    setError(PipelineError.cancelled)
+                    finishEncode()
+                    return
+                }
+
+                // 追加到writer
+                let appended = pixelBufferAdaptor.append(frame.pixelBuffer, withPresentationTime: frame.presentationTime)
+                if !appended {
+                    if writer.status == .failed {
+                        setError(writer.error ?? PipelineError.writerFailed)
+                    }
+                    finishEncode()
+                    return
+                }
+            }
+        }
+
+        // 等待Reader和Inference完成
+        Self.waitGroup(readerGroup)
+        Self.waitGroup(inferenceGroup)
+
+        // 检查前置队列错误
+        errorLock.lock()
+        let preError = pipelineError
+        errorLock.unlock()
+
+        if let error = preError {
+            closeAllQueues()
+            if writer.status == .writing {
+                writer.cancelWriting()
+            }
+            engine?.cancel()
+            throw error
+        }
+
+        // 等待编码完成
+        Self.waitGroup(encodeGroup)
+
+        // 检查编码端错误
+        errorLock.lock()
+        let encodeError = pipelineError
+        errorLock.unlock()
+
+        if let error = encodeError {
+            if case PipelineError.cancelled = error {
+                throw error
+            }
+            if writer.status == .failed {
+                throw writer.error ?? error
+            }
+            throw error
+        }
+
+        // 检查reader最终状态
         if reader.status == .failed {
             if let error = reader.error {
                 throw error
@@ -338,52 +1008,279 @@ final class VideoPipeline {
             throw PipelineError.readerFailed
         }
 
-        videoWriterInput.markAsFinished()
-        print("[Bz音频诊断] 视频处理完成，输出帧数: \(outputFrameIndex)")
+        // 输出帧数 = Inference队列的入队数
+        let finalFrameCount = inferenceToEncode.totalEnqueued
+        outputFrameIndex = finalFrameCount
+        logger.info("黄金三队列超分管线完成，输出帧数: \(finalFrameCount, privacy: .public)")
 
-        // MARK: 完成视频写入
-        let semaphore = DispatchSemaphore(value: 0)
-        writer.finishWriting {
-            semaphore.signal()
+        // 结束诊断日志会话
+        DiagnosticLogger.shared.writeLine("----------------------------------------")
+        DiagnosticLogger.shared.writeLine("输出帧数: \(finalFrameCount)")
+        DiagnosticLogger.shared.endSession()
+    }
+
+    // MARK: - 异步补帧管线（解码+推理与编码并发）
+
+    /// 异步补帧管线：解码+推理在独立队列，编码由 requestMediaDataWhenReady 驱动
+    private func runInterpolationAsync(
+        reader: AVAssetReader,
+        videoReaderOutput: AVAssetReaderTrackOutput,
+        writer: AVAssetWriter,
+        videoWriterInput: AVAssetWriterInput,
+        pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor,
+        outputFPS: Double,
+        multiplier: Int,
+        fastMode: Bool,
+        needsScaling: Bool,
+        outputWidth: Int,
+        outputHeight: Int,
+        totalInputFrames: Int,
+        progress: @escaping @MainActor (Double, ProcessingStage) -> Void,
+        outputFrameIndex: inout Int,
+        lastProgressReport: inout Double
+    ) throws {
+        let frameBuffer = FrameBuffer(capacity: 8)
+        let decodeQueue = DispatchQueue(label: "com.lambret.bz.fi.decode", qos: .userInitiated)
+        let encodeQueue = DispatchQueue(label: "com.lambret.bz.fi.encode", qos: .userInitiated)
+
+        let errorLock = NSLock()
+        var pipelineError: Error?
+        var localOutputFrameCount = 0
+
+        func setError(_ error: Error) {
+            errorLock.lock()
+            if pipelineError == nil { pipelineError = error }
+            errorLock.unlock()
         }
-        semaphore.wait()
 
-        guard writer.status == .completed else {
-            let error = writer.error ?? PipelineError.writerFailed
-            logger.error("视频编码失败: \(error.localizedDescription, privacy: .public)")
-            try? FileManager.default.removeItem(at: tempVideoURL)
+        // MARK: 解码+推理队列
+        let decodeGroup = DispatchGroup()
+        decodeGroup.enter()
+        decodeQueue.async { [weak self] in
+            guard let self = self else {
+                frameBuffer.close()
+                decodeGroup.leave()
+                return
+            }
+
+            var previousPixelBuffer: CVPixelBuffer?
+            var localFrameIndex = 0
+            var localProgress = 0.0
+
+            // 确保解码队列退出时关闭缓冲队列，唤醒编码端
+            defer {
+                frameBuffer.close()
+                localOutputFrameCount = localFrameIndex
+                decodeGroup.leave()
+            }
+
+            // 局部函数：处理并入队一帧
+            func enqueueFrame(_ frame: CVPixelBuffer, source: CVPixelBuffer) -> Bool {
+                if self.isCancelled { return false }
+                self.copyColorSpaceAttachments(from: source, to: frame)
+                let finalFrame = needsScaling
+                    ? self.scalePixelBuffer(frame, to: outputWidth, outputHeight) ?? frame
+                    : frame
+                let pts = CMTime(value: Int64(localFrameIndex), timescale: Int32(outputFPS))
+                let ok = frameBuffer.enqueue(ProcessedFrame(pixelBuffer: finalFrame, presentationTime: pts))
+                if ok { localFrameIndex += 1 }
+                return ok
+            }
+
+            while reader.status == .reading {
+                if self.isCancelled {
+                    reader.cancelReading()
+                    setError(PipelineError.cancelled)
+                    return
+                }
+
+                guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer(),
+                      let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+                    break
+                }
+
+                // 进度计算
+                let inputFrameIndex = localFrameIndex / max(multiplier, 1)
+                let progressValue = min(Double(inputFrameIndex) / Double(totalInputFrames), 0.99)
+                if progressValue - localProgress >= 0.01 {
+                    localProgress = progressValue
+                    let stage: ProcessingStage = self.interpolator != nil ? .inferring : .decoding
+                    // 进度防抖：只写原子变量，由外部 Timer 轮询更新 UI
+                    updateProgress(progressValue, stage: stage)
+                }
+
+                autoreleasepool {
+                    // 深拷贝当前帧（alwaysCopiesSampleData=false 时原帧由 reader 管理）
+                    let currentFrame = self.deepCopyPixelBuffer(pixelBuffer) ?? pixelBuffer
+
+                    // 如果有前一帧且插值器可用，生成中间帧
+                    if let prev = previousPixelBuffer, multiplier > 1 {
+                        let motion = fastMode ? self.estimateMotion(frame0: prev, frame1: currentFrame) : 255
+                        let highMotion = motion >= 8.0
+                        let useAI = !fastMode || highMotion
+
+                        if multiplier == 2 {
+                            let midFrame = useAI
+                                ? self.interpolator?.interpolate(frame0: prev, frame1: currentFrame)
+                                : self.blendFrames(prev, currentFrame)
+                            if !enqueueFrame(midFrame ?? self.deepCopyPixelBuffer(prev) ?? prev, source: currentFrame) { return }
+                        } else if multiplier == 4 {
+                            let mid05 = self.interpolator?.interpolate(frame0: prev, frame1: currentFrame)
+                                ?? self.deepCopyPixelBuffer(prev) ?? prev
+                            let mid025 = useAI
+                                ? self.interpolator?.interpolate(frame0: prev, frame1: mid05)
+                                : self.blendFrames(prev, mid05)
+                            if !enqueueFrame(mid025 ?? self.deepCopyPixelBuffer(prev) ?? prev, source: currentFrame) { return }
+                            if !enqueueFrame(mid05, source: currentFrame) { return }
+                            let mid075 = useAI
+                                ? self.interpolator?.interpolate(frame0: mid05, frame1: currentFrame)
+                                : self.blendFrames(mid05, currentFrame)
+                            if !enqueueFrame(mid075 ?? self.deepCopyPixelBuffer(currentFrame) ?? currentFrame, source: currentFrame) { return }
+                        } else {
+                            for _ in 1..<multiplier {
+                                if self.isCancelled { return }
+                                let midFrame = useAI
+                                    ? self.interpolator?.interpolate(frame0: prev, frame1: currentFrame)
+                                    : self.blendFrames(prev, currentFrame)
+                                if !enqueueFrame(midFrame ?? self.deepCopyPixelBuffer(prev) ?? prev, source: currentFrame) { return }
+                            }
+                        }
+                    }
+
+                    // 写入当前原始帧
+                    if !enqueueFrame(currentFrame, source: currentFrame) { return }
+
+                    // 更新前一帧
+                    previousPixelBuffer = currentFrame
+                }
+            }
+        }
+
+        // MARK: 编码队列
+        let encodeGroup = DispatchGroup()
+        encodeGroup.enter()
+        var encodeFinished = false
+        let finishEncode = {
+            if !encodeFinished {
+                encodeFinished = true
+                videoWriterInput.markAsFinished()
+                encodeGroup.leave()
+            }
+        }
+        videoWriterInput.requestMediaDataWhenReady(on: encodeQueue) { [weak self] in
+            guard let self = self else {
+                finishEncode()
+                return
+            }
+
+            while videoWriterInput.isReadyForMoreMediaData {
+                guard let frame = frameBuffer.dequeue() else {
+                    finishEncode()
+                    return
+                }
+
+                if self.isCancelled {
+                    setError(PipelineError.cancelled)
+                    finishEncode()
+                    return
+                }
+
+                let appended = pixelBufferAdaptor.append(frame.pixelBuffer, withPresentationTime: frame.presentationTime)
+                if !appended {
+                    if writer.status == .failed {
+                        setError(writer.error ?? PipelineError.writerFailed)
+                    }
+                    finishEncode()
+                    return
+                }
+            }
+        }
+
+        // 等待解码+推理完成
+        Self.waitGroup(decodeGroup)
+
+        errorLock.lock()
+        let decodeError = pipelineError
+        errorLock.unlock()
+
+        if let error = decodeError {
+            if writer.status == .writing {
+                writer.cancelWriting()
+            }
             throw error
         }
 
-        // MARK: 第二阶段：用 AVAssetExportSession 合成原视频音频
-        if loadedAudioTrack != nil {
-            Self.音频诊断结果 = "合成音频中..."
-            print("[Bz音频诊断] 开始合成原视频音频")
-            try self.muxAudio(
-                videoURL: tempVideoURL,
-                sourceAsset: asset,
-                outputURL: outputURL
-            )
-            print("[Bz音频诊断] 音频合成完成")
+        // 等待编码完成
+        Self.waitGroup(encodeGroup)
+
+        errorLock.lock()
+        let encodeError = pipelineError
+        errorLock.unlock()
+
+        if let error = encodeError {
+            if case PipelineError.cancelled = error {
+                throw error
+            }
+            if writer.status == .failed {
+                throw writer.error ?? error
+            }
+            throw error
+        }
+
+        if reader.status == .failed {
+            if let error = reader.error {
+                throw error
+            }
+            throw PipelineError.readerFailed
+        }
+
+        outputFrameIndex = localOutputFrameCount
+        let finalFrameCount = localOutputFrameCount
+        logger.info("异步补帧管线完成，输出帧数: \(finalFrameCount, privacy: .public)")
+    }
+
+    // MARK: - 创建视频写入输入（支持 HEVC/H.264，自动检测兼容性）
+
+    /// 创建视频写入输入，自动检测编码兼容性并添加到 writer
+    /// - Returns: 创建成功返回 AVAssetWriterInput（已添加到 writer），不支持该编码返回 nil
+    private func makeVideoWriterInput(
+        codec: AVVideoCodecType,
+        width: Int,
+        height: Int,
+        bitRate: Int,
+        writer: AVAssetWriter
+    ) -> AVAssetWriterInput? {
+        var compressionProperties: [String: Any] = [
+            AVVideoAverageBitRateKey: bitRate,
+            AVVideoMaxKeyFrameIntervalKey: 60
+        ]
+
+        if codec == .hevc {
+            compressionProperties[AVVideoAllowFrameReorderingKey] = true
         } else {
-            // 无音频轨道，直接移动临时文件到输出位置
-            try? FileManager.default.removeItem(at: outputURL)
-            try FileManager.default.moveItem(at: tempVideoURL, to: outputURL)
-            Self.音频诊断结果 = "原视频无音频轨道"
-            print("[Bz音频诊断] 原视频无音频，直接输出无声视频")
+            compressionProperties[AVVideoAllowFrameReorderingKey] = false
         }
 
-        // 清理临时文件
-        try? FileManager.default.removeItem(at: tempVideoURL)
+        let input = AVAssetWriterInput(
+            mediaType: .video,
+            outputSettings: [
+                AVVideoCodecKey: codec,
+                AVVideoWidthKey: width,
+                AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: compressionProperties
+            ]
+        )
+        input.expectsMediaDataInRealTime = false
 
-        Task { @MainActor in
-            progress(1.0, .finished)
-            completion(.success(outputURL))
+        guard writer.canAdd(input) else {
+            return nil
         }
+        writer.add(input)
+        return input
     }
 
     // MARK: - 合成音频（AVMutableComposition + AVAssetExportSession）
-    private func muxAudio(videoURL: URL, sourceAsset: AVAsset, outputURL: URL) throws {
+    private func muxAudio(videoURL: URL, sourceAsset: AVAsset, outputURL: URL) async throws {
         let videoAsset = AVURLAsset(url: videoURL)
         let composition = AVMutableComposition()
 
@@ -395,19 +1292,23 @@ final class VideoPipeline {
             Self.音频诊断结果 = "合成失败：无法创建视频轨道"
             throw PipelineError.writerConfigurationFailed
         }
-        guard let sourceVideoTrack = videoAsset.tracks(withMediaType: .video).first else {
+        let videoTracks = try await videoAsset.loadTracks(withMediaType: .video)
+        guard let sourceVideoTrack = videoTracks.first else {
             Self.音频诊断结果 = "合成失败：临时视频无视频轨道"
             throw PipelineError.noVideoTrack
         }
+        let videoDuration = try await videoAsset.load(.duration)
+        let videoTransform = try await sourceVideoTrack.load(.preferredTransform)
         try videoTrack.insertTimeRange(
-            CMTimeRange(start: .zero, duration: videoAsset.duration),
+            CMTimeRange(start: .zero, duration: videoDuration),
             of: sourceVideoTrack,
             at: .zero
         )
-        videoTrack.preferredTransform = sourceVideoTrack.preferredTransform
+        videoTrack.preferredTransform = videoTransform
 
         // 音频轨道（从原视频复制）
-        guard let sourceAudioTrack = sourceAsset.tracks(withMediaType: .audio).first else {
+        let audioTracks = try await sourceAsset.loadTracks(withMediaType: .audio)
+        guard let sourceAudioTrack = audioTracks.first else {
             Self.音频诊断结果 = "合成失败：原视频无音频轨道"
             throw PipelineError.writerConfigurationFailed
         }
@@ -418,8 +1319,9 @@ final class VideoPipeline {
             Self.音频诊断结果 = "合成失败：无法创建音频轨道"
             throw PipelineError.writerConfigurationFailed
         }
+        let sourceDuration = try await sourceAsset.load(.duration)
         try audioTrack.insertTimeRange(
-            CMTimeRange(start: .zero, duration: sourceAsset.duration),
+            CMTimeRange(start: .zero, duration: sourceDuration),
             of: sourceAudioTrack,
             at: .zero
         )
@@ -442,7 +1344,7 @@ final class VideoPipeline {
         exportSession.exportAsynchronously {
             exportSemaphore.signal()
         }
-        exportSemaphore.wait()
+        Self.waitSemaphore(exportSemaphore)
 
         if exportSession.status != .completed {
             let error = exportSession.error ?? PipelineError.writerFailed
@@ -460,20 +1362,27 @@ final class VideoPipeline {
         let height = CVPixelBufferGetHeight(source)
         let pixelFormat = CVPixelBufferGetPixelFormatType(source)
 
-        var resultBuffer: CVPixelBuffer?
-        let attrs = [
-            kCVPixelBufferPixelFormatTypeKey: pixelFormat,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
-        ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixelFormat, attrs, &resultBuffer) == kCVReturnSuccess,
-              let result = resultBuffer else {
+        // 优先从内存池获取，池枯竭时降级为临时分配
+        var resultBuffer: CVPixelBuffer? = bufferPool.makeBuffer(width: width, height, pixelFormat)
+        if resultBuffer == nil {
+            let attrs = [
+                kCVPixelBufferPixelFormatTypeKey: pixelFormat,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]
+            ] as CFDictionary
+            guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, pixelFormat, attrs, &resultBuffer) == kCVReturnSuccess,
+                  let result = resultBuffer else {
+                return nil
+            }
+            resultBuffer = result
+        }
+        guard let result = resultBuffer else { return nil }
+
+        guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess else {
             return nil
         }
-
-        CVPixelBufferLockBaseAddress(source, .readOnly)
-        CVPixelBufferLockBaseAddress(result, [])
         defer {
             CVPixelBufferUnlockBaseAddress(source, .readOnly)
             CVPixelBufferUnlockBaseAddress(result, [])
@@ -502,33 +1411,48 @@ final class VideoPipeline {
 
     // MARK: - vImage 缩放 CVPixelBuffer（输出分辨率控制）
     private func scalePixelBuffer(_ source: CVPixelBuffer, to width: Int, _ height: Int) -> CVPixelBuffer? {
-        CVPixelBufferLockBaseAddress(source, .readOnly)
+        guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
         defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
 
+        guard let srcData = CVPixelBufferGetBaseAddress(source) else {
+            return nil
+        }
         var srcBuffer = vImage_Buffer(
-            data: CVPixelBufferGetBaseAddress(source),
+            data: srcData,
             height: vImagePixelCount(CVPixelBufferGetHeight(source)),
             width: vImagePixelCount(CVPixelBufferGetWidth(source)),
             rowBytes: CVPixelBufferGetBytesPerRow(source)
         )
 
-        var dstPixelBuffer: CVPixelBuffer?
-        let attrs = [
-            kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey: width,
-            kCVPixelBufferHeightKey: height,
-            kCVPixelBufferIOSurfacePropertiesKey: [:]
-        ] as CFDictionary
-        guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &dstPixelBuffer) == kCVReturnSuccess,
-              let dst = dstPixelBuffer else {
+        // 优先从内存池获取，池枯竭时降级为临时分配
+        var dstPixelBuffer: CVPixelBuffer? = bufferPool.makeBuffer(width: width, height, kCVPixelFormatType_32BGRA)
+        if dstPixelBuffer == nil {
+            let attrs = [
+                kCVPixelBufferPixelFormatTypeKey: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey: width,
+                kCVPixelBufferHeightKey: height,
+                kCVPixelBufferIOSurfacePropertiesKey: [:]
+            ] as CFDictionary
+            guard CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA, attrs, &dstPixelBuffer) == kCVReturnSuccess,
+                  let dst = dstPixelBuffer else {
+                return nil
+            }
+            dstPixelBuffer = dst
+        }
+        guard let dst = dstPixelBuffer else { return nil }
+
+        guard CVPixelBufferLockBaseAddress(dst, []) == kCVReturnSuccess else {
             return nil
         }
-
-        CVPixelBufferLockBaseAddress(dst, [])
         defer { CVPixelBufferUnlockBaseAddress(dst, []) }
 
+        guard let dstData = CVPixelBufferGetBaseAddress(dst) else {
+            return nil
+        }
         var dstBuffer = vImage_Buffer(
-            data: CVPixelBufferGetBaseAddress(dst),
+            data: dstData,
             height: vImagePixelCount(height),
             width: vImagePixelCount(width),
             rowBytes: CVPixelBufferGetBytesPerRow(dst)
@@ -554,8 +1478,11 @@ final class VideoPipeline {
         let smallW = 64
         let smallH = 64
 
-        CVPixelBufferLockBaseAddress(frame0, .readOnly)
-        CVPixelBufferLockBaseAddress(frame1, .readOnly)
+        // iOSurface-backed 的 CVPixelBuffer Lock 可能失败
+        guard CVPixelBufferLockBaseAddress(frame0, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(frame1, .readOnly) == kCVReturnSuccess else {
+            return 255
+        }
         defer {
             CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
             CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
@@ -623,18 +1550,26 @@ final class VideoPipeline {
             return nil
         }
 
-        CVPixelBufferLockBaseAddress(frame0, .readOnly)
-        CVPixelBufferLockBaseAddress(frame1, .readOnly)
-        CVPixelBufferLockBaseAddress(result, [])
+        // iOSurface-backed 的 CVPixelBuffer Lock 可能失败，GetBaseAddress 返回 NULL
+        guard CVPixelBufferLockBaseAddress(frame0, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(frame1, .readOnly) == kCVReturnSuccess,
+              CVPixelBufferLockBaseAddress(result, []) == kCVReturnSuccess else {
+            return nil
+        }
         defer {
             CVPixelBufferUnlockBaseAddress(frame0, .readOnly)
             CVPixelBufferUnlockBaseAddress(frame1, .readOnly)
             CVPixelBufferUnlockBaseAddress(result, [])
         }
 
-        let src0 = CVPixelBufferGetBaseAddress(frame0)!.assumingMemoryBound(to: UInt8.self)
-        let src1 = CVPixelBufferGetBaseAddress(frame1)!.assumingMemoryBound(to: UInt8.self)
-        let dst = CVPixelBufferGetBaseAddress(result)!.assumingMemoryBound(to: UInt8.self)
+        guard let src0Ptr = CVPixelBufferGetBaseAddress(frame0),
+              let src1Ptr = CVPixelBufferGetBaseAddress(frame1),
+              let dstPtr = CVPixelBufferGetBaseAddress(result) else {
+            return nil
+        }
+        let src0 = src0Ptr.assumingMemoryBound(to: UInt8.self)
+        let src1 = src1Ptr.assumingMemoryBound(to: UInt8.self)
+        let dst = dstPtr.assumingMemoryBound(to: UInt8.self)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(result)
         let totalBytes = bytesPerRow * height
 
@@ -653,7 +1588,7 @@ final class VideoPipeline {
             Thread.sleep(forTimeInterval: 0.005)
             waitCount += 1
             if waitCount > 200 { // 超过 1 秒未就绪
-                logger.warning("Writer 超过 1 秒未就绪，等待次数: \(waitCount)")
+                logger.warning("Writer 超过 1 秒未就绪，等待次数: \(waitCount, privacy: .public)")
                 break
             }
         }
@@ -673,8 +1608,7 @@ final class VideoPipeline {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            if let unmanagedValue = CVBufferGetAttachment(src, key, nil) {
-                let value = unmanagedValue.takeUnretainedValue()
+            if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
         }

@@ -1,48 +1,117 @@
 import SwiftUI
+import PhotosUI
 
 /// 首页：导入卡片 + 最近记录
 /// 选择视频后通过独立 fullScreenCover 展示参数设置页，不共用导航栈
 struct HomeView: View {
     @EnvironmentObject var appState: AppState
     @State private var showPicker = false
+    @State private var showAppSettings = false
+
+    // --- 图片超分新增状态 ---
+    @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var inputImage: UIImage?
+    @State private var outputImage: UIImage?
+    @State private var isProcessingImage = false
+    @State private var isSavingImage = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: DesignTokens.Spacing.l) {
                 // 顶部标题
                 HStack {
-                    Text("补帧")
+                    Text("AI 增强")
                         .font(.largeTitle.bold())
                     Spacer()
+                    NavigationLink(destination: LogViewerView()) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.title2)
+                            .foregroundColor(DesignTokens.Colors.textPrimary)
+                    }
+                    Button {
+                        showAppSettings = true
+                    } label: {
+                        Image(systemName: "gearshape")
+                            .font(.title2)
+                            .foregroundColor(DesignTokens.Colors.textPrimary)
+                    }
                 }
 
-                // 导入卡片
-                CardView {
-                    VStack(spacing: DesignTokens.Spacing.m) {
-                        Image(systemName: "photo.on.rectangle.angled")
-                            .font(.system(size: 48))
-                            .foregroundColor(DesignTokens.Colors.accent)
+                // 功能入口：视频增加 + 图片超分 并排大图标
+                HStack(spacing: DesignTokens.Spacing.l) {
+                    // 视频增加
+                    Button {
+                        showPicker = true
+                    } label: {
+                        VStack(spacing: DesignTokens.Spacing.s) {
+                            Image(systemName: "film.stack")
+                                .font(.system(size: 44))
+                                .foregroundColor(DesignTokens.Colors.accent)
+                            Text("视频增强")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundColor(DesignTokens.Colors.textPrimary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 120)
+                        .background(DesignTokens.Colors.bgSecondary)
+                        .cornerRadius(DesignTokens.Radius.l)
+                    }
+                    .buttonStyle(.plain)
 
-                        Text("导入视频开始补帧")
-                            .font(.headline)
-
-                        Text("支持 30fps → 60fps，完全本地处理")
-                            .font(.subheadline)
-                            .foregroundColor(DesignTokens.Colors.textSecondary)
-                            .multilineTextAlignment(.center)
-
-                        PrimaryButton(title: "从相册选择") {
-                            showPicker = true
+                    // 图片超分
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                        VStack(spacing: DesignTokens.Spacing.s) {
+                            if isProcessingImage {
+                                ProgressView()
+                                    .scaleEffect(1.2)
+                            } else {
+                                Image(systemName: "photo.badge.plus")
+                                    .font(.system(size: 44))
+                                    .foregroundColor(DesignTokens.Colors.accent)
+                            }
+                            Text(isProcessingImage ? "处理中…" : "图片超分")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundColor(DesignTokens.Colors.textPrimary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 120)
+                        .background(DesignTokens.Colors.bgSecondary)
+                        .cornerRadius(DesignTokens.Radius.l)
+                    }
+                }
+                .onChange(of: selectedPhotoItem) { newItem in
+                    Task {
+                        if let data = try? await newItem?.loadTransferable(type: Data.self),
+                           let uiImage = UIImage(data: data) {
+                            await MainActor.run {
+                                self.inputImage = uiImage
+                                // 立即重置selection，避免下次选同一张图时onChange不触发
+                                self.selectedPhotoItem = nil
+                                startImageUpscale(uiImage)
+                            }
                         }
                     }
-                    .frame(maxWidth: .infinity)
                 }
 
-                // 最近记录
+                // 3. 最近记录
                 HStack {
                     Text("最近记录")
                         .font(.headline)
                     Spacer()
+                    if !appState.recentRecords.isEmpty {
+                        NavigationLink {
+                            RecentVideosView()
+                                .environmentObject(appState)
+                        } label: {
+                            HStack(spacing: 2) {
+                                Text("全部")
+                                    .font(.subheadline)
+                                Image(systemName: "chevron.right")
+                                    .font(.caption)
+                            }
+                            .foregroundColor(DesignTokens.Colors.accent)
+                        }
+                    }
                 }
 
                 if appState.recentRecords.isEmpty {
@@ -55,8 +124,14 @@ struct HomeView: View {
                 } else {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: DesignTokens.Spacing.m) {
-                            ForEach(appState.recentRecords) { record in
-                                RecentRecordCard(record: record)
+                            ForEach(appState.recentRecords.prefix(10)) { record in
+                                RecentRecordCard(
+                                    record: record,
+                                    onTap: { appState.replayRecentRecord(record) },
+                                    onDelete: { appState.deleteRecentRecord(record) },
+                                    onRename: { newName in appState.renameRecord(record, newName: newName) },
+                                    onEnhance: { appState.enhanceRecord(record) }
+                                )
                             }
                         }
                     }
@@ -65,7 +140,6 @@ struct HomeView: View {
             .padding(DesignTokens.Spacing.m)
         }
         .background(DesignTokens.Colors.bgPrimary)
-        // 相册选择器
         .sheet(isPresented: $showPicker) {
             VideoPicker(
                 onPick: { url in
@@ -77,12 +151,14 @@ struct HomeView: View {
                 }
             )
         }
-        // 参数设置页（独立全屏导航，不共用首页导航栈）
         .fullScreenCover(isPresented: $appState.showSettings) {
             SettingsView()
                 .environmentObject(appState)
         }
-        // Toast 覆盖层
+        .fullScreenCover(isPresented: $showAppSettings) {
+            AppSettingsView()
+                .environmentObject(appState)
+        }
         .overlay(alignment: .top) {
             if let message = appState.toastMessage {
                 ToastView(message: message, style: appState.toastStyle)
@@ -90,7 +166,6 @@ struct HomeView: View {
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        // 处理中横幅（最小化到首页时显示）
         .overlay(alignment: .top) {
             if appState.isProcessingMinimized {
                 Button {
@@ -101,7 +176,7 @@ struct HomeView: View {
                             .progressViewStyle(.linear)
                             .frame(width: 80)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("补帧中 \(Int(appState.progress * 100))%")
+                            Text("处理中 \(Int(appState.progress * 100))%")
                                 .font(.caption.weight(.medium))
                             Text(appState.stage.rawValue)
                                 .font(.caption2)
@@ -122,10 +197,67 @@ struct HomeView: View {
                 .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
-        // 处理中页（从首页横幅恢复时展示）
         .fullScreenCover(isPresented: $appState.isProcessing) {
             ProcessingView()
                 .environmentObject(appState)
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { appState.outputURL != nil && !appState.isProcessing },
+            set: { if !$0 { appState.outputURL = nil } }
+        )) {
+            if let url = appState.outputURL {
+                ResultView(outputURL: url)
+                    .environmentObject(appState)
+            }
+        }
+        .fullScreenCover(isPresented: Binding(
+            get: { outputImage != nil },
+            set: { if !$0 { outputImage = nil; inputImage = nil; selectedPhotoItem = nil } }
+        )) {
+            ImageSRResultView(
+                inputImage: inputImage,
+                outputImage: outputImage,
+                isSaving: $isSavingImage,
+                onSave: { saveImageToAlbum(outputImage!) },
+                onClose: { outputImage = nil }
+            )
+        }
+    }
+    
+    private func startImageUpscale(_ image: UIImage) {
+        isProcessingImage = true
+        appState.imageSRService.processImage(image) { result in
+            isProcessingImage = false
+            if let result = result {
+                self.outputImage = result
+            } else {
+                appState.showToast("图片超分失败，请重试", style: .error)
+            }
+        }
+    }
+
+    private func saveImageToAlbum(_ image: UIImage) {
+        isSavingImage = true
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else {
+                DispatchQueue.main.async {
+                    isSavingImage = false
+                    appState.showToast("没有相册写入权限，请在设置中开启", style: .error)
+                }
+                return
+            }
+            PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            } completionHandler: { success, error in
+                DispatchQueue.main.async {
+                    isSavingImage = false
+                    if success {
+                        appState.showToast("已保存到相册")
+                    } else {
+                        appState.showToast(error?.localizedDescription ?? "保存失败", style: .error)
+                    }
+                }
+            }
         }
     }
 }
@@ -133,6 +265,12 @@ struct HomeView: View {
 // MARK: - 最近记录卡片
 struct RecentRecordCard: View {
     let record: RecentRecord
+    var onTap: (() -> Void)? = nil
+    var onDelete: (() -> Void)? = nil
+    var onRename: ((String) -> Void)? = nil
+    var onEnhance: (() -> Void)? = nil
+    @State private var showRenameAlert = false
+    @State private var renameText = ""
 
     private var thumbnailImage: UIImage? {
         guard let data = record.thumbnailData else { return nil }
@@ -140,37 +278,218 @@ struct RecentRecordCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
-            ZStack {
-                RoundedRectangle(cornerRadius: DesignTokens.Radius.s)
-                    .fill(DesignTokens.Colors.bgTertiary)
-                    .frame(width: 160, height: 90)
+        Button(action: { onTap?() }) {
+            VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
+                ZStack(alignment: .bottomLeading) {
+                    RoundedRectangle(cornerRadius: DesignTokens.Radius.s)
+                        .fill(DesignTokens.Colors.bgTertiary)
+                        .frame(width: 180, height: 101)
 
-                if let image = thumbnailImage {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 160, height: 90)
-                        .clipped()
-                        .cornerRadius(DesignTokens.Radius.s)
-                } else {
-                    Image(systemName: "video.fill")
+                    if let image = thumbnailImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 180, height: 101)
+                            .clipped()
+                            .cornerRadius(DesignTokens.Radius.s)
+                    } else {
+                        Image(systemName: "video.fill")
+                            .font(.system(size: 32))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+
+                    if let duration = record.durationText {
+                        Text(duration)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.black.opacity(0.6))
+                            .cornerRadius(4)
+                            .padding(6)
+                    }
+
+                    if let mode = record.processingMode {
+                        Text(mode)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(DesignTokens.Colors.accent.opacity(0.9))
+                            .cornerRadius(4)
+                            .padding(6)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    }
+                }
+                .frame(width: 180, height: 101)
+
+                Text(record.displayFileName)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DesignTokens.Colors.textPrimary)
+                    .lineLimit(1)
+                    .frame(width: 180, alignment: .leading)
+
+                HStack(spacing: 6) {
+                    if let resolution = record.resolutionText {
+                        Text(resolution)
+                            .font(.system(size: 10))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+                    Text("·")
+                        .font(.system(size: 10))
                         .foregroundColor(DesignTokens.Colors.textSecondary)
+                    Text("\(Int(record.outputFPS))fps")
+                        .font(.system(size: 10))
+                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                    if let size = record.fileSizeText {
+                        Text("·")
+                            .font(.system(size: 10))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                        Text(size)
+                            .font(.system(size: 10))
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    }
+                }
+                .frame(width: 180, alignment: .leading)
+
+                Text(record.formattedDate)
+                    .font(.system(size: 10))
+                    .foregroundColor(DesignTokens.Colors.textSecondary.opacity(0.7))
+                    .frame(width: 180, alignment: .leading)
+            }
+            .frame(width: 180)
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            Button {
+                renameText = record.displayFileName
+                showRenameAlert = true
+            } label: {
+                Label("重命名", systemImage: "pencil")
+            }
+            Button {
+                onEnhance?()
+            } label: {
+                Label("视频增强", systemImage: "sparkles")
+            }
+            Divider()
+            Button(role: .destructive) {
+                onDelete?()
+            } label: {
+                Label("删除", systemImage: "trash")
+            }
+        }
+        .alert("重命名", isPresented: $showRenameAlert) {
+            TextField("输入新名称", text: $renameText)
+            Button("取消", role: .cancel) {}
+            Button("确定") {
+                if !renameText.isEmpty {
+                    onRename?(renameText)
                 }
             }
-            .frame(width: 160, height: 90)
-
-            Text(record.fileName)
-                .font(.caption)
-                .lineLimit(1)
-            Text("\(Int(record.outputFPS))fps")
-                .font(.caption2)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(DesignTokens.Colors.accent)
-                .foregroundColor(.white)
-                .cornerRadius(4)
+        } message: {
+            Text("输入新的显示名称")
         }
-        .frame(width: 160)
+    }
+}
+
+// MARK: - 图片超分结果页（独立全屏）
+struct ImageSRResultView: View {
+    let inputImage: UIImage?
+    let outputImage: UIImage?
+    @Binding var isSaving: Bool
+    let onSave: () -> Void
+    let onClose: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var appState: AppState
+    @State private var splitProgress: CGFloat = 0.5
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: DesignTokens.Spacing.l) {
+                    if let output = outputImage, let input = inputImage {
+                        // 对比滑块
+                        GeometryReader { geo in
+                            ZStack(alignment: .topLeading) {
+                                // 超分结果（底层全显示）
+                                Image(uiImage: output)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: geo.size.width, height: geo.size.height)
+                                    .clipped()
+
+                                // 原图（上层，按splitProgress裁剪左侧）
+                                Image(uiImage: input)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: geo.size.width, height: geo.size.height)
+                                    .clipped()
+                                    .frame(width: geo.size.width * splitProgress)
+                                    .clipped()
+
+                                // 分割线
+                                Rectangle()
+                                    .fill(Color.white)
+                                    .frame(width: 2, height: geo.size.height)
+                                    .offset(x: geo.size.width * splitProgress - 1)
+
+                                // 拖拽手柄
+                                Image(systemName: "arrow.left.and.right.circle.fill")
+                                    .font(.system(size: 24))
+                                    .foregroundColor(.white)
+                                    .shadow(radius: 4)
+                                    .offset(x: geo.size.width * splitProgress - 12, y: geo.size.height / 2 - 12)
+                            }
+                            .contentShape(Rectangle())
+                            .gesture(
+                                DragGesture()
+                                    .onChanged { value in
+                                        splitProgress = min(max(value.location.x / geo.size.width, 0), 1)
+                                    }
+                            )
+                        }
+                        .aspectRatio(output.size, contentMode: .fit)
+                        .cornerRadius(DesignTokens.Radius.m)
+                        .padding(.horizontal, DesignTokens.Spacing.m)
+
+                        Text("拖动滑块对比原图与超分效果")
+                            .font(.caption)
+                            .foregroundColor(DesignTokens.Colors.textSecondary)
+                    } else if let image = outputImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            .cornerRadius(DesignTokens.Radius.m)
+                            .padding(.horizontal, DesignTokens.Spacing.m)
+                    }
+                }
+            }
+            .background(DesignTokens.Colors.bgPrimary)
+            .overlay(alignment: .top) {
+                if let message = appState.toastMessage {
+                    ToastView(message: message, style: appState.toastStyle)
+                        .padding(.top, DesignTokens.Spacing.s)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .navigationTitle("图片超分结果")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("完成") { onClose() }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                PrimaryButton(
+                    title: isSaving ? "保存中…" : "保存到相册",
+                    isLoading: isSaving
+                ) {
+                    onSave()
+                }
+                .padding(DesignTokens.Spacing.m)
+                .background(DesignTokens.Colors.bgPrimary)
+            }
+        }
     }
 }

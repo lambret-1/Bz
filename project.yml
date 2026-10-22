@@ -23,12 +23,17 @@ targets:
       path: FrameInterpolation/Resources/Info.plist
       properties:
         CFBundleDisplayName: AI 补帧
-        CFBundleShortVersionString: "0.2.5"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.2.6"
+        CFBundleVersion: "202610221649"
         UILaunchScreen:
           UIColorName: BgPrimary
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
         NSPhotoLibraryUsageDescription: 需要访问相册以导入和保存视频
         NSPhotoLibraryAddUsageDescription: 需要保存补帧后的视频到相册
     settings:

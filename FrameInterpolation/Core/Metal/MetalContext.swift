@@ -24,7 +24,7 @@ final class MetalContext {
         self.device = device
         self.commandQueue = queue
         self.library = library
-        logger.info("Metal 上下文初始化成功，设备: \(device.name)")
+        logger.info("Metal 上下文初始化成功，设备: \(device.name, privacy: .public)")
     }
 
     /// 获取或创建指定名称的计算管线状态
