@@ -43,7 +43,7 @@ final class AppState: ObservableObject {
     /// 处理模式：补帧或超分（二者互斥）
     @Published var selectedMode: PipelineMode = .interpolation(.x2)
     /// 超分引擎类型（仅超分模式生效）
-    @Published var superResolutionEngine: SuperResolutionEngineType = .fastSRGAN
+    @Published var superResolutionEngine: SuperResolutionEngineType = .realESRGAN
     /// 超分放大倍数（1-4x 可调，仅超分模式生效）
     @Published var superResolutionScale: SuperResolutionScale = .x4
 
@@ -538,7 +538,7 @@ final class AppState: ObservableObject {
         showSettings = false
         selectedVideo = nil
         selectedMode = .interpolation(.x2)
-        superResolutionEngine = .fastSRGAN
+        superResolutionEngine = .realESRGAN
         superResolutionScale = .x4
         stage = .idle
         progress = 0
