@@ -3,10 +3,10 @@ import CoreVideo
 import CoreImage
 import OSLog
 
-final class RealESRGANEngine: SuperResolutionEngine {
-    private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANEngine")
+final class RealESRGANx2Engine: SuperResolutionEngine {
+    private let logger = Logger(subsystem: "com.lambret.bz", category: "RealESRGANx2Engine")
 
-    static let engineType: SuperResolutionEngineType = .realESRGAN
+    static let engineType: SuperResolutionEngineType = .realESRGANx2
     
     // 模型要求固定的 512x512 输入
     let inputWidth: Int = 512
