@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreVideo
 import OSLog
 import Accelerate
@@ -149,6 +149,24 @@ final class VideoPipeline {
         isCancelled = true
     }
 
+    // MARK: - 同步等待辅助（避免 async 上下文 wait 警告）
+
+    private static func waitGroup(_ group: DispatchGroup) {
+        group.wait()
+    }
+
+    private static func waitSemaphore(_ semaphore: DispatchSemaphore) {
+        semaphore.wait()
+    }
+
+    private static func waitWriterFinish(writer: AVAssetWriter) {
+        let semaphore = DispatchSemaphore(value: 0)
+        writer.finishWriting {
+            semaphore.signal()
+        }
+        semaphore.wait()
+    }
+
     // MARK: - 私有方法
 
     private func runPipeline(
@@ -171,7 +189,7 @@ final class VideoPipeline {
         }
         let loadedAudioTrack = audioTracks.first
 
-        print("[Bz音频诊断] 视频轨道: \(loadedVideoTrack != nil ? "有" : "无"), 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
+        print("[Bz音频诊断] 视频轨道: 有, 音频轨道: \(loadedAudioTrack != nil ? "有" : "无")")
         if let audioTrack = loadedAudioTrack {
             let formatDesc = try? await audioTrack.load(.formatDescriptions)
             let dataRate = try? await audioTrack.load(.estimatedDataRate)
@@ -471,16 +489,12 @@ final class VideoPipeline {
         // 等待音频编码完成（如果有音频）
         if audioWriterInput != nil {
             print("[Bz音频诊断] 等待音频编码完成...")
-            audioEncodeGroup.wait()
+            Self.waitGroup(audioEncodeGroup)
             print("[Bz音频诊断] 音频编码完成")
         }
 
         // MARK: 完成写入（音视频都已 markAsFinished）
-        let semaphore = DispatchSemaphore(value: 0)
-        writer.finishWriting {
-            semaphore.signal()
-        }
-        semaphore.wait()
+        Self.waitWriterFinish(writer: writer)
 
         guard writer.status == .completed else {
             let error = writer.error ?? PipelineError.writerFailed
@@ -951,8 +965,8 @@ final class VideoPipeline {
         }
 
         // 等待Reader和Inference完成
-        readerGroup.wait()
-        inferenceGroup.wait()
+        Self.waitGroup(readerGroup)
+        Self.waitGroup(inferenceGroup)
 
         // 检查前置队列错误
         errorLock.lock()
@@ -969,7 +983,7 @@ final class VideoPipeline {
         }
 
         // 等待编码完成
-        encodeGroup.wait()
+        Self.waitGroup(encodeGroup)
 
         // 检查编码端错误
         errorLock.lock()
@@ -1183,7 +1197,7 @@ final class VideoPipeline {
         }
 
         // 等待解码+推理完成
-        decodeGroup.wait()
+        Self.waitGroup(decodeGroup)
 
         errorLock.lock()
         let decodeError = pipelineError
@@ -1197,7 +1211,7 @@ final class VideoPipeline {
         }
 
         // 等待编码完成
-        encodeGroup.wait()
+        Self.waitGroup(encodeGroup)
 
         errorLock.lock()
         let encodeError = pipelineError
@@ -1330,7 +1344,7 @@ final class VideoPipeline {
         exportSession.exportAsynchronously {
             exportSemaphore.signal()
         }
-        exportSemaphore.wait()
+        Self.waitSemaphore(exportSemaphore)
 
         if exportSession.status != .completed {
             let error = exportSession.error ?? PipelineError.writerFailed
@@ -1594,8 +1608,7 @@ final class VideoPipeline {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            if let unmanagedValue = CVBufferGetAttachment(src, key, nil) {
-                let value = unmanagedValue.takeUnretainedValue()
+            if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
         }
