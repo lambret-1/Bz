@@ -93,12 +93,12 @@ jobs:
           git commit -m "chore: 自动递增版本号至 v${NEW_VERSION} [skip ci]"
           git push origin HEAD:${GITHUB_REF_NAME} || echo "警告: 版本号提交失败（权限不足），仅本次构建使用新版本号"
 
-      - name: 下载 RealESRGAN_x2 模型文件
+      - name: 下载 RealESRGAN_x4 模型文件
         run: |
-          mkdir -p FrameInterpolation/Resources/RealESRGAN_x2.mlpackage/Data/com.apple.CoreML
-          curl -L -o FrameInterpolation/Resources/RealESRGAN_x2.mlpackage/Data/com.apple.CoreML/model.mlmodel \
+          mkdir -p FrameInterpolation/Resources/RealESRGAN_x4.mlpackage/Data/com.apple.CoreML
+          curl -L -o FrameInterpolation/Resources/RealESRGAN_x4.mlpackage/Data/com.apple.CoreML/model.mlmodel \
             "https://github.com/lambret-1/Bz/releases/download/model-realesrgan-x2/model.mlmodel"
-          echo "模型大小: $(du -h FrameInterpolation/Resources/RealESRGAN_x2.mlpackage/Data/com.apple.CoreML/model.mlmodel | cut -f1)"
+          echo "模型大小: $(du -h FrameInterpolation/Resources/RealESRGAN_x4.mlpackage/Data/com.apple.CoreML/model.mlmodel | cut -f1)"
 
       - name: 生成 Xcode 工程
         run: xcodegen generate
