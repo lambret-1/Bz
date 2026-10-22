@@ -27,7 +27,7 @@ extension VideoPipeline {
         // 1x 模式或模型缺失时跳过 AI 超分，直接复制/缩放帧
         let needsAI = targetScale.needsAISuperResolution
         let engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
-        // 设置引擎目标放大倍数（RealESRGAN引擎内部处理）
+        // 设置引擎目标放大倍数（RealESRGANx2引擎内部直接输出目标尺寸）
         engine?.targetScale = targetScale.rawValue
         let usingAI = engine != nil
         if needsAI && engine == nil {
@@ -74,7 +74,14 @@ extension VideoPipeline {
                     processedFrame = pixelBuffer
                 } else if let engine = engine,
                           let aiFrame = engine.upscale(pixelBuffer) {
-                    // AI 超分：RealESRGAN引擎内部处理
+                    // AI 超分：引擎内部处理
+                    if targetScale.rawValue < nativeScale {
+                        let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
+                        let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
+                        let targetW = srcWidth * targetScale.rawValue
+                        let targetH = srcHeight * targetScale.rawValue
+                        processedFrame = self.scalePixelBuffer(aiFrame, to: targetW, targetH) ?? aiFrame
+                    } else {
                         processedFrame = aiFrame
                     }
                 } else {
