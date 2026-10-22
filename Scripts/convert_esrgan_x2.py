@@ -152,7 +152,14 @@ def load_model_official(pth_path: str) -> RRDBNet:
     print("🔧 加载官方 3 通道模型 (x2plus)...")
     model = RRDBNet(in_nc=3, out_nc=3, nf=64, nb=23, gc=32, scale=SCALE)
     checkpoint = torch.load(pth_path, map_location='cpu', weights_only=False)
-    state_dict = checkpoint.get('params', checkpoint)
+
+    # 修复：正确解包官方权重（优先 params_ema，推理效果更好）
+    if 'params_ema' in checkpoint:
+        state_dict = checkpoint['params_ema']
+    elif 'params' in checkpoint:
+        state_dict = checkpoint['params']
+    else:
+        state_dict = checkpoint
     
     # 严格加载，结构必须与官方完全一致
     model.load_state_dict(state_dict, strict=True)
