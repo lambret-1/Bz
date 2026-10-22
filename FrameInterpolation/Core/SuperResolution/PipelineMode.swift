@@ -67,18 +67,6 @@ enum SuperResolutionScale: Int, CaseIterable, Identifiable {
 /// 超分引擎类型枚举
 enum SuperResolutionEngineType: String, CaseIterable, Identifiable {
     /// PiperSR 2x：2x 超分，640×360 全帧推理，ANE 原生，速度快
-    case fastSRGAN = "PiperSR"
-    /// Real-ESRGAN x4v3：4x 超分，128×128 瓦片拼接，适合极低清素材
-    case realESRGAN = "Real-ESRGAN"
-    /// Real-ESRGAN x4：4x 输出，512×512 全帧推理
-    case realESRGANx4 = "Real-ESRGAN-x4"
-
-    var id: String { rawValue }
-
-    /// 短名称（用于显示）
-    var shortName: String {
-        switch self {
-        case .fastSRGAN: return "PiperSR"
         case .realESRGAN: return "Real-ESRGAN"
         case .realESRGANx4: return "ESRGAN-x4"
         }
