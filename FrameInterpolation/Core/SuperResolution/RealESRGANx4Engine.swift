@@ -129,7 +129,7 @@ final class RealESRGANx4Engine: SuperResolutionEngine {
 
     func cancel() {
         isCancelledFlag = true
-        logger.info("收到取消请求（帧\(frameCount)）")
+        logger.info("收到取消请求（帧\(self.frameCount)）")
     }
 
     // MARK: - 采样工具
