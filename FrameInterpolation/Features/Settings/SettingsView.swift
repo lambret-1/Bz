@@ -374,7 +374,7 @@ struct SettingsView: View {
                 return String(format: "约 %.1f 分钟", seconds / 60)
             }
 
-            let defaultSpeed: Double = appState.superResolutionEngine == .fastSRGAN ? 1.0 : 0.3
+            let defaultSpeed: Double = appState.superResolutionEngine == .realESRGAN ? 1.0 : 0.3
             let speedFactor = appState.measuredSpeedFactor ?? defaultSpeed
             var base = video.duration / speedFactor
 
