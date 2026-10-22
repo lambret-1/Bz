@@ -1,7 +1,7 @@
 import UIKit
 
 class ImageSuperResolutionService {
-    private var engine: RealESRGANx4Engine?
+    private var engine: RealESRGANEngine?
 
     init() {
         // 懒加载：第一次处理图片时才加载
@@ -10,7 +10,7 @@ class ImageSuperResolutionService {
     /// 处理图片（在后台线程执行，完成后切回主线程）
     func processImage(_ inputImage: UIImage, completion: @escaping (UIImage?) -> Void) {
         if engine == nil {
-            engine = RealESRGANx4Engine()
+            engine = RealESRGANEngine()
         }
         guard let engine = engine else {
             completion(nil)
