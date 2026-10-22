@@ -12,6 +12,7 @@ final class RealESRGANEngine: SuperResolutionEngine {
     let inputWidth: Int = 512
     let inputHeight: Int = 512
     let scaleFactor: Int = 4 // 模型输出是 2048x2048
+    var targetScale: Int = 4
 
     private let model: MLModel
     private let ciContext = CIContext(options: [.workingColorSpace: NSNull()])

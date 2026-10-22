@@ -616,7 +616,9 @@ final class VideoPipeline {
     ) throws {
         // 1x 模式或模型缺失时跳过 AI 超分，直接复制/缩放帧
         let needsAI = targetScale.needsAISuperResolution
-        let engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
+        var engine = needsAI ? SuperResolutionEngineFactory.makeEngine(type: engineType) : nil
+        // 设置引擎目标放大倍数（RealESRGANx2引擎内部直接输出目标尺寸）
+        engine?.targetScale = targetScale.rawValue
         let usingAI = engine != nil
         if needsAI && engine == nil {
             logger.warning("\(engineType.displayName) 模型未加载，超分模式降级为 vImage 缩放")
@@ -662,8 +664,10 @@ final class VideoPipeline {
                     processedFrame = pixelBuffer
                 } else if let engine = engine,
                           let aiFrame = engine.upscale(pixelBuffer) {
-                    // AI 超分（原生 4x），若目标倍数 < 4x 则缩放到目标尺寸
-                    if targetScale.rawValue < nativeScale {
+                    // AI 超分：RealESRGANx2引擎已内部缩放到目标倍数，其他引擎需再缩放
+                    if engineType == .realESRGANx2 {
+                        processedFrame = aiFrame
+                    } else if targetScale.rawValue < nativeScale {
                         let srcWidth = CVPixelBufferGetWidth(pixelBuffer)
                         let srcHeight = CVPixelBufferGetHeight(pixelBuffer)
                         let targetW = srcWidth * targetScale.rawValue

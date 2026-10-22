@@ -17,6 +17,7 @@ final class FastSRGANEngine: SuperResolutionEngine {
     let inputWidth: Int = 640
     let inputHeight: Int = 360
     let scaleFactor: Int = 2
+    var targetScale: Int = 2
 
     // MARK: - 私有属性
 

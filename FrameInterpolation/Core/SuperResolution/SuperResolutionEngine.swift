@@ -23,6 +23,9 @@ protocol SuperResolutionEngine: AnyObject {
     /// 输出放大倍数
     var scaleFactor: Int { get }
 
+    /// 用户选择的目标放大倍数（可选，引擎内部需要时设置）
+    var targetScale: Int { get set }
+
     /// 取消当前处理（瓦片引擎中断瓦片循环）
     func cancel()
 }

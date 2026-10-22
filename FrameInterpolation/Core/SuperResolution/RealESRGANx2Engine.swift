@@ -50,6 +50,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
     private var isCancelledFlag = false
     private let cancelLock = NSLock()
     private var frameCount: Int = 0
+    /// 用户选择的目标放大倍数（2x/3x/4x），由Pipeline设置
+    var targetScale: Int = 4
 
     init?() {
         let tStart = CFAbsoluteTimeGetCurrent()
@@ -176,9 +178,9 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             return nil
         }
 
-        // 5. 输出缩放到目标尺寸（源尺寸×scaleFactor）
-        let targetW = srcW * scaleFactor
-        let targetH = srcH * scaleFactor
+        // 5. 输出缩放到目标尺寸（用户选择的targetScale）
+        let targetW = srcW * self.targetScale
+        let targetH = srcH * self.targetScale
         guard let finalOutput = resizePixelBuffer(modelOutput, width: targetW, height: targetH) else {
             return modelOutput
         }
@@ -187,7 +189,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         // 每10帧打一次日志，避免刷屏
         self.frameCount += 1
         if self.frameCount % 10 == 1 || self.frameCount <= 3 {
-            logger.info("✅ [原生4x] \(srcW, privacy: .public)x\(srcH, privacy: .public)→\(targetW, privacy: .public)x\(targetH, privacy: .public) 推理\(predMs, privacy: .public)ms 总\(totalMs, privacy: .public)ms 帧\(self.frameCount, privacy: .public)")
+            logger.info("✅ [目标\(self.targetScale)x] 帧\(self.frameCount, privacy: .public) \(srcW, privacy: .public)x\(srcH, privacy: .public)→\(targetW, privacy: .public)x\(targetH, privacy: .public) 推理\(predMs, privacy: .public)ms 总\(totalMs, privacy: .public)ms")
         }
 
         return finalOutput
