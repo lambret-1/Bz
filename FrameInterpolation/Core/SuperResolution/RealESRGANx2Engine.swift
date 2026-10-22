@@ -559,8 +559,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in keys {
-            if let v = CVBufferGetAttachment(src, key, nil) {
-                CVBufferSetAttachment(dst, key, v.takeUnretainedValue(), .shouldPropagate)
+            if let v = CVBufferCopyAttachment(src, key, nil) {
+                CVBufferSetAttachment(dst, key, v, .shouldPropagate)
             }
         }
     }
