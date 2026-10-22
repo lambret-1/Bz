@@ -97,7 +97,9 @@ final class AppState: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] note in
-            self?.debugInfo = note.object as? String ?? ""
+            Task { @MainActor in
+                self?.debugInfo = note.object as? String ?? ""
+            }
         }
     }
 
@@ -288,16 +290,18 @@ final class AppState: ObservableObject {
         // 启动进度轮询定时器（每 0.5s 从 pipeline 读取原子进度，避免高频主线程回调）
         progressTimer?.invalidate()
         progressTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            let (value, stage) = self.pipeline.pollProgress()
-            self.progress = value
-            self.stage = stage
-            if self.totalFrames > 0 {
-                self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
-            }
-            if let start = self.processingStartTime, value > 0.01 {
-                let elapsed = Date().timeIntervalSince(start)
-                self.estimatedRemaining = elapsed * (1.0 - value) / value
+            Task { @MainActor in
+                guard let self = self else { return }
+                let (value, stage) = self.pipeline.pollProgress()
+                self.progress = value
+                self.stage = stage
+                if self.totalFrames > 0 {
+                    self.processedFrames = min(Int(value * Double(self.totalFrames)), self.totalFrames)
+                }
+                if let start = self.processingStartTime, value > 0.01 {
+                    let elapsed = Date().timeIntervalSince(start)
+                    self.estimatedRemaining = elapsed * (1.0 - value) / value
+                }
             }
         }
 
@@ -358,22 +362,28 @@ final class AppState: ObservableObject {
                         outputFPS = self.selectedVideo?.originalFPS ?? 30
                     }
 
-                    // 读取输出视频元数据
-                    let outputAsset = AVURLAsset(url: url)
-                    let outputTrack = outputAsset.tracks(withMediaType: .video).first
-                    let outputSize = outputTrack?.naturalSize.applying(outputTrack?.preferredTransform ?? .identity) ?? .zero
-                    let outputWidth = Int(abs(outputSize.width))
-                    let outputHeight = Int(abs(outputSize.height))
-                    let outputDuration = CMTimeGetSeconds(outputAsset.duration)
+                    // 读取输出视频元数据（异步加载）
+                    Task { @MainActor in
+                        let outputAsset = AVURLAsset(url: url)
+                        let outputTracks = try? await outputAsset.loadTracks(withMediaType: .video)
+                        let outputTrack = outputTracks?.first
+                        let outputSize = try? await outputTrack?.load(.naturalSize)
+                        let outputTransform = try? await outputTrack?.load(.preferredTransform)
+                        let outputFinalSize = outputSize?.applying(outputTransform ?? .identity) ?? .zero
+                        let outputWidth = Int(abs(outputFinalSize.width))
+                        let outputHeight = Int(abs(outputFinalSize.height))
+                        let dur = try? await outputAsset.load(.duration)
+                        let outputDuration = dur?.seconds ?? 0
 
-                    self.appendRecentRecord(
-                        outputURL: url,
-                        outputFPS: outputFPS,
-                        processingMode: self.processingMode,
-                        outputWidth: outputWidth,
-                        outputHeight: outputHeight,
-                        duration: outputDuration
-                    )
+                        self.appendRecentRecord(
+                            outputURL: url,
+                            outputFPS: outputFPS,
+                            processingMode: self.processingMode,
+                            outputWidth: outputWidth,
+                            outputHeight: outputHeight,
+                            duration: outputDuration
+                        )
+                    }
                     self.showToast("处理完成")
                     self.logger.info("处理完成: \(url.lastPathComponent, privacy: .public)")
                     // 处理完成发本地通知（用户切后台时能收到）
