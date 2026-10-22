@@ -145,8 +145,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         let tStart = CFAbsoluteTimeGetCurrent()
 
         // 1. 输入缩放到模型要求的 256×256（不再切Tile，全帧一次推理）
-        guard let resizedInput = resizePixelBuffer(pixelBuffer, width: inputWidth, height: inputHeight) else {
-            logger.error("❌ 输入缩放到 \(inputWidth, privacy: .public)x\(inputHeight, privacy: .public) 失败")
+        guard let resizedInput = resizePixelBuffer(pixelBuffer, width: self.inputWidth, height: self.inputHeight) else {
+            logger.error("❌ 输入缩放到 \(self.inputWidth, privacy: .public)x\(self.inputHeight, privacy: .public) 失败")
             return nil
         }
 
@@ -166,8 +166,8 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         let predMs = (CFAbsoluteTimeGetCurrent() - tPred) * 1000
 
         // 4. Tensor → BGRA 输出 1024×1024
-        let modelOutW = inputWidth * scaleFactor
-        let modelOutH = inputHeight * scaleFactor
+        let modelOutW = self.inputWidth * self.scaleFactor
+        let modelOutH = self.inputHeight * self.scaleFactor
         guard let modelOutput = float16ToBGRA(width: modelOutW, height: modelOutH) else {
             logger.error("❌ Tensor转BGRA失败")
             return nil
