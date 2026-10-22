@@ -61,9 +61,9 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
 
         if isCancelledFlag { return nil }
 
-        // 3. 后处理：模型输出 2048×2048，缩放到目标尺寸（src尺寸 × targetScale）
-        let targetOutWidth = srcWidth * targetScale
-        let targetOutHeight = srcHeight * targetScale
+        // 3. 后处理：缩放到目标尺寸
+        let targetOutWidth = srcWidth * 2
+        let targetOutHeight = srcHeight * 2
         
         guard let finalOutput = resizePixelBuffer(outputBuffer, targetWidth: targetOutWidth, targetHeight: targetOutHeight) else {
             return nil
