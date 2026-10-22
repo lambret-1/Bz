@@ -393,7 +393,7 @@ final class AppState: ObservableObject {
                             let averaged = self.measuredSpeedFactor.map { ($0 * 0.7) + (speedFactor * 0.3) } ?? speedFactor
                             self.measuredSpeedFactor = averaged
                             UserDefaults.standard.set(averaged, forKey: self.processingSpeedKey)
-                            self.logger.info("实测速度系数: \(String(format: "%.2f", speedFactor, privacy: .public)), 滑动平均: \(String(format: "%.2f", averaged, privacy: .public))")
+                            self.logger.info("实测速度系数: \(String(format: "%.2f", speedFactor), privacy: .public), 滑动平均: \(String(format: "%.2f", averaged), privacy: .public)")
                         }
                     }
                     // 处理完成，结束后台任务

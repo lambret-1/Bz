@@ -306,7 +306,7 @@ final class VideoPipeline {
         // 码率上下限：最低 2Mbps，最高 60Mbps（避免超大文件）
         let targetBitRate = max(2_000_000, min(60_000_000, Int(baseBitRate * hevcEfficiencyFactor)))
 
-        logger.info("编码配置: HEVC, 输入码率 \(inputBitRate/1_000_000, privacy: .public)Mbps, 像素放大 \(String(format: "%.2f", pixelScaleRatio, privacy: .public))x, 输出码率 \(Double(targetBitRate, privacy: .public)/1_000_000)Mbps")
+        logger.info("编码配置: HEVC, 输入码率 \(inputBitRate/1_000_000, privacy: .public)Mbps, 像素放大 \(String(format: "%.2f", pixelScaleRatio), privacy: .public)x, 输出码率 \(Double(targetBitRate)/1_000_000, privacy: .public)Mbps")
 
         // 优先使用 HEVC，不支持时降级为 H.264（码率相应提高，因为 H.264 效率较低）
         let videoWriterInput: AVAssetWriterInput
@@ -328,7 +328,7 @@ final class VideoPipeline {
                 bitRate: h264BitRate,
                 writer: writer
             )!
-            logger.warning("HEVC 不可用，降级为 H.264 编码，码率 \(Double(h264BitRate, privacy: .public)/1_000_000)Mbps")
+            logger.warning("HEVC 不可用，降级为 H.264 编码，码率 \(Double(h264BitRate)/1_000_000, privacy: .public)Mbps")
         }
         videoWriterInput.transform = transform
 
