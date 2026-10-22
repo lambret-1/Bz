@@ -1,0 +1,35 @@
+name: SwiftLint
+
+on:
+  pull_request:
+    branches: [main, testping]
+    paths:
+      - '**.swift'
+      - 'project.yml'
+      - '.swiftlint.yml'
+      - '.github/workflows/swiftlint.yml'
+      - 'scripts/**'
+
+jobs:
+  lint:
+    name: SwiftLint 严格检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 SwiftLint 0.57.0
+        run: |
+          chmod +x scripts/lint.sh
+          scripts/lint.sh --install-only
+
+      - name: 运行 SwiftLint
+        uses: SchmiedmayerLab/action-swiftlint@v4
+        env:
+          DIFF_BASE: ${{ github.base_ref }}
+        with:
+          args: --strict

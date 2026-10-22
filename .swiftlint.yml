@@ -1,0 +1,81 @@
+# SwiftLint 基础配置
+# 文档：https://github.com/realm/SwiftLint
+
+# 排除目录（不参与 lint）
+excluded:
+  - build
+  - .build
+  - Scripts
+  - 资料
+  - FrameInterpling.xcodeproj
+  - FrameInterpolation.xcodeproj
+  - FrameInterpolation.xcworkspace
+  - fastlane
+  - DerivedData
+
+# 禁用规则（默认启用但项目不需要的）
+disabled_rules:
+  - trailing_whitespace
+  - todo
+  - cyclomatic_complexity
+
+# 可选启用规则（默认关闭但项目推荐的）
+opt_in_rules:
+  - empty_count
+  - force_unwrapping
+  - implicit_return
+  - contains_over_first_not_nil
+  - sorted_first_last
+  - closure_spacing
+  - leading_whitespace
+  - trailing_semicolon
+
+# 行长度限制
+line_length:
+  warning: 160
+  error: 220
+  ignores_urls: true
+  ignores_interpolated_strings: true
+
+# 类型体长度
+type_body_length:
+  warning: 350
+  error: 600
+
+# 文件长度
+file_length:
+  warning: 600
+  error: 1200
+  ignore_comment_only_lines: true
+
+# 函数体长度
+function_body_length:
+  warning: 80
+  error: 200
+
+# 标识符命名
+identifier_name:
+  min_length:
+    warning: 2
+    error: 1
+  max_length:
+    warning: 50
+    error: 60
+  excluded:
+    - id
+    - x
+    - y
+    - z
+    - i
+    - j
+
+# 大括号位置
+opening_brace:
+  - enable_defaults
+
+# 计算属性返回
+implicit_return:
+  # 单行闭包/计算属性隐式 return
+  included:
+    - closure
+    - function
