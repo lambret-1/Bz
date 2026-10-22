@@ -142,29 +142,48 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
         let srcH = CVPixelBufferGetHeight(pixelBuffer)
         guard srcW > 0, srcH > 0 else { return nil }
 
-        // 诊断 + 转换
-        let fmt = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        let isPlanar = CVPixelBufferIsPlanar(pixelBuffer)
-        logger.info("🔍 upscale \(srcW, privacy: .public)x\(srcH, privacy: .public) fmt=\(fmt, privacy: .public) planar=\(isPlanar, privacy: .public)")
+        let tStart = CFAbsoluteTimeGetCurrent()
 
-        let bgraInput: CVPixelBuffer
-        if fmt == kCVPixelFormatType_32BGRA && !isPlanar {
-            bgraInput = pixelBuffer
-        } else {
-            let tConv = CFAbsoluteTimeGetCurrent()
-            guard let converted = convertToBGRA(pixelBuffer, width: srcW, height: srcH) else {
-                logger.error("❌ 转 BGRA 失败")
-                return nil
-            }
-            let ms = (CFAbsoluteTimeGetCurrent() - tConv) * 1000
-            logger.info("✅ 转 BGRA 完成 \(ms, privacy: .public)ms")
-            bgraInput = converted
+        // 1. 输入缩放到模型要求的 256×256（不再切Tile，全帧一次推理）
+        guard let resizedInput = resizePixelBuffer(pixelBuffer, width: inputWidth, height: inputHeight) else {
+            logger.error("❌ 输入缩放到 \(inputWidth, privacy: .public)x\(inputHeight, privacy: .public) 失败")
+            return nil
         }
 
-        if srcW <= inputWidth && srcH <= inputHeight {
-            return upscaleSingleTile(bgraInput)
+        // 2. BGRA → Tensor
+        guard bgraToTensor(resizedInput) else {
+            logger.error("❌ BGRA转Tensor失败")
+            return nil
         }
-        return upscaleTiled(bgraInput)
+
+        // 3. 全帧推理一次
+        let tPred = CFAbsoluteTimeGetCurrent()
+        do { _ = try model.prediction(from: inputProvider, options: predOpts) }
+        catch {
+            logger.error("❌ 推理失败: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+        let predMs = (CFAbsoluteTimeGetCurrent() - tPred) * 1000
+
+        // 4. Tensor → BGRA 输出 1024×1024
+        let modelOutW = inputWidth * scaleFactor
+        let modelOutH = inputHeight * scaleFactor
+        guard let modelOutput = float16ToBGRA(width: modelOutW, height: modelOutH) else {
+            logger.error("❌ Tensor转BGRA失败")
+            return nil
+        }
+
+        // 5. 输出缩放到目标尺寸（源尺寸×scaleFactor）
+        let targetW = srcW * scaleFactor
+        let targetH = srcH * scaleFactor
+        guard let finalOutput = resizePixelBuffer(modelOutput, width: targetW, height: targetH) else {
+            return modelOutput
+        }
+
+        let totalMs = (CFAbsoluteTimeGetCurrent() - tStart) * 1000
+        logger.info("✅ \(srcW, privacy: .public)x\(srcH, privacy: .public)→\(targetW, privacy: .public)x\(targetH, privacy: .public) 推理\(predMs, privacy: .public)ms 总\(totalMs, privacy: .public)ms")
+
+        return finalOutput
     }
 
     func cancel() {
@@ -535,5 +554,57 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
                 CVBufferSetAttachment(dst, key, v.takeUnretainedValue(), .shouldPropagate)
             }
         }
+    }
+
+    // MARK: - vImage 缩放
+
+    private func resizePixelBuffer(_ src: CVPixelBuffer, width: Int, height: Int) -> CVPixelBuffer? {
+        guard let dst = Self.makeBGRA(width: width, height: height) else { return nil }
+        CVPixelBufferLockBaseAddress(src, .readOnly)
+        CVPixelBufferLockBaseAddress(dst, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(src, .readOnly)
+            CVPixelBufferUnlockBaseAddress(dst, [])
+        }
+        var srcBuf = vImage_Buffer(
+            data: CVPixelBufferGetBaseAddress(src),
+            height: vImagePixelCount(CVPixelBufferGetHeight(src)),
+            width: vImagePixelCount(CVPixelBufferGetWidth(src)),
+            rowBytes: CVPixelBufferGetBytesPerRow(src))
+        var dstBuf = vImage_Buffer(
+            data: CVPixelBufferGetBaseAddress(dst),
+            height: vImagePixelCount(height),
+            width: vImagePixelCount(width),
+            rowBytes: CVPixelBufferGetBytesPerRow(dst))
+        vImageScale_ARGB8888(&srcBuf, &dstBuf, nil, vImage_Flags(kvImageHighQualityResampling))
+        return dst
+    }
+
+    // MARK: - Float16 Tensor → BGRA
+
+    private func float16ToBGRA(width: Int, height: Int) -> CVPixelBuffer? {
+        guard let dst = makeOutputBuffer(width: width, height: height) else { return nil }
+        CVPixelBufferLockBaseAddress(dst, [])
+        defer { CVPixelBufferUnlockBaseAddress(dst, []) }
+
+        let planeSize = width * height
+        let src = UnsafePointer<Float16>(OpaquePointer(outputArray.dataPointer))
+        let dstPtr = CVPixelBufferGetBaseAddress(dst)!.assumingMemoryBound(to: UInt8.self)
+        let dstRowBytes = CVPixelBufferGetBytesPerRow(dst)
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let idx = y * width + x
+                let r = Float(src[idx]) * 255.0
+                let g = Float(src[planeSize + idx]) * 255.0
+                let b = Float(src[2 * planeSize + idx]) * 255.0
+                let off = y * dstRowBytes + x * 4
+                dstPtr[off + 0] = UInt8(max(0, min(255, Int(b))))
+                dstPtr[off + 1] = UInt8(max(0, min(255, Int(g))))
+                dstPtr[off + 2] = UInt8(max(0, min(255, Int(r))))
+                dstPtr[off + 3] = 255
+            }
+        }
+        return dst
     }
 }
