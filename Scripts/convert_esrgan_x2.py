@@ -1,7 +1,3 @@
-"""
-RealESRGAN_x2plus → Core ML 模型转换脚本（官方标准版）
-"""
-
 import os
 import copy
 import argparse
@@ -15,7 +11,7 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ==================== 配置 ====================
-# 官方 x2plus 权重地址（GitHub Release）
+# ⚠️ 必须使用官方 GitHub Release 链接（纯正 3 通道 x2 模型）
 MODEL_PTH_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
 INPUT_WIDTH = 512
 INPUT_HEIGHT = 512
@@ -86,7 +82,6 @@ class RRDBNet(nn.Module):
 
 # ==================== 可选的 PixelShuffle 优化 ====================
 def upsample_conv_to_pixelshuffle(conv: nn.Conv2d, r: int = 2) -> nn.Conv2d:
-    """将 Upsample+Conv 等价转换为 Conv+PixelShuffle，用于提升 ANE 性能"""
     C_out, C_in, k, _ = conv.weight.shape
     assert k == 3
     pad = 1
@@ -139,11 +134,13 @@ def apply_pixelshuffle(model: RRDBNet) -> RRDBNet:
 
 # ==================== 下载 / 加载 ====================
 def download_model_weights() -> str:
-    pth_path = os.path.join(SCRIPT_DIR, "RealESRGAN_x2plus.pth")
+    # ⚠️ 换了个新名字，避免读到之前缓存的错误文件
+    pth_path = os.path.join(SCRIPT_DIR, "RealESRGAN_x2plus_official.pth")
     if os.path.exists(pth_path):
-        print(f"📦 已存在: {pth_path}")
-        return pth_path
-    print("⬇️  下载 RealESRGAN_x2plus.pth ...")
+        print(f"📦 已存在: {pth_path}，将重新下载以确保纯净...")
+        os.remove(pth_path)  # 强制删除旧文件
+        
+    print("⬇️  下载官方 RealESRGAN_x2plus.pth ...")
     urllib.request.urlretrieve(MODEL_PTH_URL, pth_path)
     print(f"✅ 大小: {os.path.getsize(pth_path) / 1024 / 1024:.1f} MB")
     return pth_path
@@ -151,17 +148,19 @@ def download_model_weights() -> str:
 def load_model_official(pth_path: str) -> RRDBNet:
     print("🔧 加载官方 3 通道模型 (x2plus)...")
     model = RRDBNet(in_nc=3, out_nc=3, nf=64, nb=23, gc=32, scale=SCALE)
-    checkpoint = torch.load(pth_path, map_location='cpu', weights_only=False)
-
-    # 修复：正确解包官方权重（优先 params_ema，推理效果更好）
+    
+    # 兼容 torch 2.4 的 load 方式
+    checkpoint = torch.load(pth_path, map_location='cpu', weights_only=True)
+    
+    # 官方权重通常在 params_ema 里
     if 'params_ema' in checkpoint:
         state_dict = checkpoint['params_ema']
     elif 'params' in checkpoint:
         state_dict = checkpoint['params']
     else:
         state_dict = checkpoint
-    
-    # 严格加载，结构必须与官方完全一致
+        
+    # 严格加载，确保我们的代码与官方完全一致
     model.load_state_dict(state_dict, strict=True)
     model.eval()
     param_count = sum(p.numel() for p in model.parameters())
@@ -188,7 +187,7 @@ def convert_to_coreml(model: RRDBNet, in_channels: int) -> ct.models.MLModel:
 # ==================== 主流程 ====================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pixel-shuffle", action="store_true", help="启用 PixelShuffle 改写（默认关闭，保持官方原始结构）")
+    parser.add_argument("--pixel-shuffle", action="store_true", help="启用 PixelShuffle 改写")
     args = parser.parse_args()
 
     print("=" * 60)
