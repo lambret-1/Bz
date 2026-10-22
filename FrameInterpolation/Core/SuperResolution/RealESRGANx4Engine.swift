@@ -38,7 +38,7 @@ final class RealESRGANx4Engine: SuperResolutionEngine {
         }
         let loadTime = CFAbsoluteTimeGetCurrent() - loadStart
         self.model = model
-        logger.info("[帧?] 初始化成功: 输入 \(inputWidth)x\(inputHeight), 输出 \(inputWidth*scaleFactor)x\(inputHeight*scaleFactor), 加载耗时 \(String(format: "%.2f", loadTime))s")
+        logger.info("[帧?] 初始化成功: 输入 512x512, 输出 2048x2048, 加载耗时 \(String(format: "%.2f", loadTime))s")
     }
 
     func upscale(_ pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
