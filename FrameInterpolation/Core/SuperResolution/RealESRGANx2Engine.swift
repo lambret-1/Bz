@@ -21,7 +21,7 @@ final class RealESRGANx2Engine: SuperResolutionEngine {
     init?() {
         guard let modelURL = Bundle.main.url(
             forResource: "RealESRGAN_x2",
-            withExtension: "mlpackage"
+            withExtension: "mlmodelc"
         ) else {
             logger.error("找不到 RealESRGAN_x2 模型文件")
             return nil
