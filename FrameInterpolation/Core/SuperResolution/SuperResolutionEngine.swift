@@ -39,12 +39,8 @@ enum SuperResolutionEngineFactory {
     /// - Returns: 引擎实例，模型文件缺失或初始化失败时返回 nil
     static func makeEngine(type: SuperResolutionEngineType) -> SuperResolutionEngine? {
         switch type {
-        case .fastSRGAN:
-            return FastSRGANEngine()
         case .realESRGAN:
             return RealESRGANEngine()
-        case .realESRGANx4:
-            return RealESRGANx4Engine()
         }
     }
 }
