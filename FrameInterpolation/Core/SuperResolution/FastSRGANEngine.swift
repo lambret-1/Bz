@@ -223,8 +223,7 @@ final class FastSRGANEngine: SuperResolutionEngine {
             kCVImageBufferChromaLocationTopFieldKey
         ]
         for key in colorKeys {
-            if let unmanagedValue = CVBufferGetAttachment(src, key, nil) {
-                let value = unmanagedValue.takeUnretainedValue()
+            if let value = CVBufferCopyAttachment(src, key, nil) {
                 CVBufferSetAttachment(dst, key, value, .shouldPropagate)
             }
         }
